@@ -57,6 +57,20 @@ pub enum NewgitError {
     #[error("`{command}` failed: {stderr}")]
     SourceCommand { command: String, stderr: String },
 
+    /// The newgit remote answered with an error. `message` is the remote's
+    /// own explanation, which says why (a refused credential names the rule).
+    #[error("the newgit remote refused ({status}): {message}")]
+    Remote { status: u16, message: String },
+
+    #[error("could not reach the newgit remote at {url}: {detail}")]
+    RemoteUnreachable { url: String, detail: String },
+
+    #[error("not logged in to {0}; run `newgit login`")]
+    NotLoggedIn(String),
+
+    #[error("this project has no [remote] in .newgit/config.toml; run `newgit remote add`")]
+    NoRemote,
+
     #[error("{kind} `{name}` is invalid: {reason}")]
     InvalidDefinition {
         kind: &'static str,
@@ -64,7 +78,9 @@ pub enum NewgitError {
         reason: String,
     },
 
-    #[error("trackers `{left}` and `{right}` both own `{path}`; content lanes must be disjoint")]
+    #[error(
+        "trackers `{left}` and `{right}` both own `{path}`; give one of them a more specific path, or give both the same `role` if they are alternatives"
+    )]
     TrackerPathConflict {
         left: String,
         right: String,
@@ -232,6 +248,11 @@ pub enum NewgitError {
 
     #[error("{0}")]
     Unsupported(String),
+
+    /// Work that may not leave this machine as it is: a secret tracker's
+    /// file committed, or a path whose tracker the instance has not bound.
+    #[error("refusing to send this work anywhere: {0}")]
+    SplitRefused(String),
 
     #[error("path is not valid UTF-8: {0}")]
     NonUtf8Path(String),

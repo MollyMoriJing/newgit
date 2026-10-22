@@ -267,19 +267,22 @@ impl GitSource {
     }
 
     /// Make the outbox's branches and tags exactly what `url` has now.
-    pub fn sync_outbox(outbox: &Utf8Path, url: &str) -> Result<()> {
-        run_git(&[
-            "-C",
-            outbox.as_str(),
-            "fetch",
-            "--quiet",
-            "--prune",
-            "--no-write-fetch-head",
-            "--",
-            url,
-            "+refs/heads/*:refs/heads/*",
-            "+refs/tags/*:refs/tags/*",
-        ])
+    pub fn sync_outbox(outbox: &Utf8Path, url: &str, auth: Option<&str>) -> Result<()> {
+        run_git_env(
+            &[
+                "-C",
+                outbox.as_str(),
+                "fetch",
+                "--quiet",
+                "--prune",
+                "--no-write-fetch-head",
+                "--",
+                url,
+                "+refs/heads/*:refs/heads/*",
+                "+refs/tags/*:refs/tags/*",
+            ],
+            &auth_env(auth),
+        )
         .map(|_| ())
     }
 
@@ -301,6 +304,7 @@ impl GitSource {
     pub fn forward_push(
         outbox: &Utf8Path,
         url: &str,
+        auth: Option<&str>,
         updates: &[RefUpdate],
         admitting: Option<&Utf8Path>,
     ) -> Result<()> {
@@ -322,6 +326,7 @@ impl GitSource {
         let status = Command::new("git")
             .args(&args)
             .envs(admitting.map(|dir| ("GIT_ALTERNATE_OBJECT_DIRECTORIES", dir.as_str())))
+            .envs(auth_env(auth))
             .status()
             .map_err(|source| {
                 spawn_error(
@@ -358,6 +363,60 @@ impl GitSource {
         }
         config("remote.origin.pushurl", outbox.as_str())?;
         config("remote.origin.receivepack", receive_pack)
+    }
+
+    /// Have Git ask `helper` for passwords to these remotes. Only http(s)
+    /// URLs get it — a local path needs no password. `useHttpPath` is what
+    /// makes Git pass the repo path, which says which repo to mint for.
+    pub fn workspace_use_credential_helper(
+        workspace: &Utf8Path,
+        urls: &[&str],
+        helper: &str,
+    ) -> Result<()> {
+        let mut hosts: Vec<String> = urls
+            .iter()
+            .filter_map(|url| {
+                let rest = url
+                    .strip_prefix("https://")
+                    .or_else(|| url.strip_prefix("http://"))?;
+                let scheme = &url[..url.len() - rest.len()];
+                Some(format!("{scheme}{}", rest.split('/').next()?))
+            })
+            .collect();
+        hosts.sort();
+        hosts.dedup();
+        for host in hosts {
+            let config = |key: &str, value: &str| {
+                run_git(&[
+                    "-C",
+                    workspace.as_str(),
+                    "config",
+                    &format!("credential.{host}.{key}"),
+                    value,
+                ])
+                .map(|_| ())
+            };
+            // An empty entry first clears helpers configured elsewhere (a
+            // global osxkeychain would otherwise cache minted passwords).
+            run_git(&[
+                "-C",
+                workspace.as_str(),
+                "config",
+                "--replace-all",
+                &format!("credential.{host}.helper"),
+                "",
+            ])?;
+            run_git(&[
+                "-C",
+                workspace.as_str(),
+                "config",
+                "--add",
+                &format!("credential.{host}.helper"),
+                helper,
+            ])?;
+            config("useHttpPath", "true")?;
+        }
+        Ok(())
     }
 
     /// Live HEAD of a workspace clone, short form.
@@ -672,6 +731,85 @@ impl RefUpdate {
     }
 }
 
+impl GitSource {
+    /// `git <location> push <url> <refspecs>`, authenticated with `auth` (an
+    /// `Authorization` header). `location` is `-C <repo>` or `--git-dir=…`.
+    pub fn push_refs(
+        location: &[&str],
+        url: &str,
+        refspecs: &[String],
+        auth: Option<&str>,
+    ) -> Result<()> {
+        let mut args: Vec<&str> = location.to_vec();
+        args.extend(["push", "--quiet", "--", url]);
+        args.extend(refspecs.iter().map(String::as_str));
+        run_git_env(&args, &auth_env(auth)).map(|_| ())
+    }
+
+    /// Push `commit` to `branch` at `url`, moving it only if it is still
+    /// `expected` (or creating it, with `None`) — or if it is `commit`
+    /// already, which a retry finds.
+    pub fn push_leased(
+        location: &[&str],
+        url: &str,
+        commit: &str,
+        branch: &str,
+        expected: Option<&str>,
+        auth: Option<&str>,
+    ) -> Result<()> {
+        let refspec = format!("{commit}:{branch}");
+        let attempt = |lease: &str| {
+            let lease = format!("--force-with-lease={branch}:{lease}");
+            let mut args: Vec<&str> = location.to_vec();
+            args.extend([
+                "push",
+                "--quiet",
+                lease.as_str(),
+                "--",
+                url,
+                refspec.as_str(),
+            ]);
+            run_git_env(&args, &auth_env(auth)).map(|_| ())
+        };
+        match attempt(expected.unwrap_or("")) {
+            Ok(()) => Ok(()),
+            Err(error) => attempt(commit).map_err(|_| error),
+        }
+    }
+
+    /// `git <location> fetch <url> <refspecs>`, authenticated like [`Self::push_refs`].
+    pub fn fetch_refs(
+        location: &[&str],
+        url: &str,
+        refspecs: &[String],
+        auth: Option<&str>,
+    ) -> Result<()> {
+        let mut args: Vec<&str> = location.to_vec();
+        args.extend(["fetch", "--quiet", "--no-write-fetch-head", "--", url]);
+        args.extend(refspecs.iter().map(String::as_str));
+        run_git_env(&args, &auth_env(auth)).map(|_| ())
+    }
+}
+
+/// Git config for one command, carrying an `Authorization` header. Passed in
+/// the environment rather than as `-c` so the password never appears in the
+/// process list; the credential helper is cleared so nothing caches it.
+pub fn auth_env(auth: Option<&str>) -> Vec<(String, String)> {
+    let Some(header) = auth else {
+        return Vec::new();
+    };
+    vec![
+        ("GIT_CONFIG_COUNT".to_owned(), "2".to_owned()),
+        ("GIT_CONFIG_KEY_0".to_owned(), "http.extraHeader".to_owned()),
+        ("GIT_CONFIG_VALUE_0".to_owned(), header.to_owned()),
+        (
+            "GIT_CONFIG_KEY_1".to_owned(),
+            "credential.helper".to_owned(),
+        ),
+        ("GIT_CONFIG_VALUE_1".to_owned(), String::new()),
+    ]
+}
+
 fn run_git(args: &[&str]) -> Result<String> {
     run_git_env(args, &[])
 }
@@ -714,7 +852,7 @@ fn export_identity(destination: &Utf8Path) -> Vec<(String, String)> {
         .collect()
 }
 
-fn run_git_env(args: &[&str], env: &[(String, String)]) -> Result<String> {
+pub fn run_git_env(args: &[&str], env: &[(String, String)]) -> Result<String> {
     let output = Command::new("git")
         .args(args)
         .envs(env.iter().map(|(key, value)| (key, value)))

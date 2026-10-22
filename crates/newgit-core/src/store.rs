@@ -9,13 +9,12 @@ use crate::error::{NewgitError, Result};
 use crate::installs::InstallStore;
 use crate::materializer::{WorkspaceMarker, create_dir_all};
 use crate::resource::ResourceDefinition;
-use crate::tracker::{TrackerDefinition, validate_disjoint};
+use crate::tracker::{TrackerDefinition, resolve_ownership};
 
 const LOCAL_GITIGNORE: &str = "\
 # newgit local state — never committed
 /local/
 /branches/
-/snapshots/
 /logs/
 /state/
 /checkpoints/
@@ -70,7 +69,12 @@ pub struct NewgitPaths {
     /// rather than a workspace. Part of the committed control plane.
     pub scripts: Utf8PathBuf,
     pub local: Utf8PathBuf,
-    pub snapshots: Utf8PathBuf,
+    /// Every tracker's history: a bare Git repo of tracker branches. Under `local/`,
+    /// which every project's `.newgit/.gitignore` already ignores — lane
+    /// content can be secrets and must never be committable.
+    pub tracker_store: Utf8PathBuf,
+    /// Tracker revs materialized for commands that take a path. A cache.
+    pub tracker_checkouts: Utf8PathBuf,
     pub logs: Utf8PathBuf,
     pub state: Utf8PathBuf,
     pub checkpoints: Utf8PathBuf,
@@ -106,7 +110,64 @@ impl MetadataStore {
         store.create_layout()?;
         let config = ProjectConfig::new(project_name, source);
         store.write_toml(&store.paths.config, "project config", &config)?;
+        store.init_root()?;
         Ok(store)
+    }
+
+    /// Take up a `.newgit/` that arrived with the project's history (a clone):
+    /// its committed definitions are kept, and only the local state around
+    /// them is made.
+    pub fn adopt(project_root: impl Into<Utf8PathBuf>) -> Result<Self> {
+        let store = Self::at(project_root);
+        store.ensure_initialized()?;
+        store.create_layout()?;
+        Ok(store)
+    }
+
+    /// Write the root tracker's definition and give it the project's history
+    /// as its `main`: a copy of the repository's current branch. A repository
+    /// with no commits yet gives root no history.
+    fn init_root(&self) -> Result<()> {
+        let root = TrackerDefinition::root();
+        self.create_tracker_definition(&root)?;
+        self.create_tracker_definition(&TrackerDefinition::project())?;
+        self.create_tracker_definition(&TrackerDefinition::access())?;
+        let project = self.paths.project_root.as_str();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(project)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        };
+        if git(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]).is_none() {
+            return Ok(());
+        }
+        // The project root is the instance `main`, and this is its branch:
+        // what it has checked out later (a feature branch, an old tag) is
+        // not its history.
+        if let Some(branch) = git(&["symbolic-ref", "--short", "-q", "HEAD"]) {
+            let file = self.paths.project_branch_file();
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|source| NewgitError::io(parent, source))?;
+            }
+            std::fs::write(&file, format!("{branch}\n"))
+                .map_err(|source| NewgitError::io(&file, source))?;
+        }
+        crate::tracker_repo::import_history(
+            &self.paths.tracker_store,
+            &self.paths.project_root,
+            "HEAD",
+            &root.name,
+        )?;
+        // The history newgit adopted: published already, wherever it went,
+        // so the secret gate never holds it against a push.
+        git(&["update-ref", crate::manager::ADOPTED_REF, "HEAD"]);
+        Ok(())
     }
 
     /// Walk upward from `cwd` to find the governing metadata. A workspace is
@@ -155,7 +216,15 @@ impl MetadataStore {
     }
 
     pub fn load_config(&self) -> Result<ProjectConfig> {
-        read_toml_at(&self.paths.config)
+        let config: ProjectConfig = read_toml_at(&self.paths.config)?;
+        if let Some(problem) = config.remote.as_ref().and_then(|remote| remote.problem()) {
+            return Err(NewgitError::InvalidDefinition {
+                kind: "config section",
+                name: "[remote]".to_owned(),
+                reason: problem,
+            });
+        }
+        Ok(config)
     }
 
     pub fn write_config(&self, config: &ProjectConfig) -> Result<()> {
@@ -189,7 +258,8 @@ impl MetadataStore {
     }
 
     /// Tracker definitions, one per file in `.newgit/trackers/`; the name
-    /// comes from the filename. Lanes are validated as disjoint.
+    /// comes from the filename. Ownership is resolved across all of them: a
+    /// path belongs to its most specific claimant.
     pub fn load_tracker_definitions(&self) -> Result<Vec<TrackerDefinition>> {
         self.ensure_initialized()?;
         let mut definitions = Vec::new();
@@ -202,7 +272,7 @@ impl MetadataStore {
             };
             definitions.push(TrackerDefinition::from_file(name, &entry)?);
         }
-        validate_disjoint(&definitions)?;
+        resolve_ownership(&mut definitions)?;
         Ok(definitions)
     }
 
@@ -477,7 +547,6 @@ impl MetadataStore {
             &self.paths.resources,
             &self.paths.scripts,
             &self.paths.local,
-            &self.paths.snapshots,
             &self.paths.logs,
             &self.paths.state,
             &self.paths.checkpoints,
@@ -511,6 +580,12 @@ impl MetadataStore {
 }
 
 impl NewgitPaths {
+    /// Names the project root's own branch (the instance `main`), written at
+    /// `newgit init`.
+    pub fn project_branch_file(&self) -> Utf8PathBuf {
+        self.local.join("project-branch")
+    }
+
     pub fn new(project_root: Utf8PathBuf) -> Self {
         let metadata_root = project_root.join(".newgit");
         Self {
@@ -522,7 +597,8 @@ impl NewgitPaths {
             resources: metadata_root.join("resources"),
             scripts: metadata_root.join("scripts"),
             local: metadata_root.join("local"),
-            snapshots: metadata_root.join("snapshots"),
+            tracker_store: metadata_root.join("local/trackers.git"),
+            tracker_checkouts: metadata_root.join("local/tracker-checkouts"),
             logs: metadata_root.join("logs"),
             state: metadata_root.join("state"),
             checkpoints: metadata_root.join("checkpoints"),
@@ -565,8 +641,7 @@ where
 }
 
 /// Immediate subdirectories, sorted. The dir-shaped counterpart to
-/// [`read_dir_sorted`], for walking per-instance checkpoint dirs and lane
-/// rev dirs.
+/// [`read_dir_sorted`], for walking per-instance checkpoint dirs.
 pub(crate) fn read_subdirs_sorted(path: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
     if !path.exists() {
         return Ok(Vec::new());

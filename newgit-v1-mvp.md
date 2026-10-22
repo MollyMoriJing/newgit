@@ -34,7 +34,7 @@ The dividing line:
 
 ### Trackers
 
-There is no fixed set of trackers and no limit on how many a project defines. `source` is just the default tracker. A user should be able to create a tracker called `jack-env`, set its audience to a single user, and (in a later version) push it to a remote and pull it from another authenticated machine.
+There is no fixed set of trackers and no limit on how many a project defines. `root` holds whatever no other tracker claims, and its history is the project's Git history (see *Root, Project, and Code Trackers* below). A user should be able to create a tracker called `jack-env`, set its audience to a single user, and (in a later version) push it to a remote and pull it from another authenticated machine.
 
 Every tracker carries three settings:
 
@@ -186,7 +186,7 @@ The test for the design is simple:
 
 ### No Native Remote
 
-v1 should not implement a new remote protocol. It can push and pull through the project's existing Git remote — and does push through it: a `git push` from a workspace publishes to the store's `origin` (see *`git push` Publishes*). Tracker `storage = "remote"` is declared in the model but not implemented.
+v1 should not implement a new remote protocol. It can push and pull through the project's existing Git remote — and does push through it: a `git push` from a workspace publishes to the store's `origin` (see *`git push` Publishes*). Tracker `storage = "remote"` is declared in the model but not implemented. The native remote is being built on Cloudflare (see `newgit-cloudflare.md`); so far a project can name it in `config.toml` (`[remote] url = "https://..."`, optional `project`), and `tracker create --storage remote` is refused until one is configured, rather than quietly behaving as local.
 
 ### No Hunk-Level Privacy
 
@@ -278,6 +278,7 @@ TrackerDefinition {
   storage       # local | remote (v1: local only)
   merge_with_source # true | false
   paths         # workspace paths this tracker owns
+  secret        # true (default): content stays out of Git | false: a code tracker
 }
 ```
 
@@ -286,7 +287,9 @@ understand or change which paths a tracker owns.
 
 ### Capture, Merge, Pull, And Checkout
 
-Tracker capture is always the same operation: snapshot the tracker's content into the store and bind the current branch instance to that rev. In v1 the "store" is a content lane per tracker at `.newgit/snapshots/<tracker>/<rev>/`, where `<rev>` is a content hash — identical captures dedupe, and M5's checkpoints simply reference these revs. Each lane keeps a `LATEST` pointer marking the lane head/default for future instances and explicit pulls.
+Tracker capture is always the same operation: snapshot the tracker's content into the store and bind the current branch instance to that rev. The "store" is each tracker's history in a bare Git repo at `.newgit/local/trackers.git`, under `refs/trackers/<tracker>/`: `main` is the lane head/default for future instances and explicit pulls, `instances/<instance>` holds each instance's captures as ordinary commits (parent, author, message), and `pins/<rev>` keeps every rev a binding or checkpoint names alive. `<rev>` is a 12-hex prefix of the commit id; capturing content identical to the parent's makes no commit. (*Lane* is the v1 word for a tracker's history; `newgit-trackers.md` retires it in favor of "the tracker's repo".)
+
+The lanes repo is deliberately *not* the store repo. Lane content includes secrets, and the store repo is the one a `git push --mirror` publishes and a local `git clone` hardlinks wholesale into every workspace's object store. It lives under `local/`, which every project's `.newgit/.gitignore` already ignores. Lanes being Git is also what lets a tracker sync to a remote (see `newgit-cloudflare.md`).
 
 Capture alone is branch-local. `newgit tracker merge` promotes the current instance's bound tracker rev to the lane head. `newgit tracker pull` checks the lane head into the current instance. `newgit tracker checkout --rev <rev>` checks out a specific captured rev. Checkout clears owned paths first so it reproduces the captured state exactly; before overwriting, the current content is auto-captured, so checkout is always undoable.
 
@@ -314,12 +317,12 @@ a path does not invent content for it.
 Non-source tracker paths live inside a Git clone, so an agent could `git add`
 them into source history. The rule:
 
-> **A path owned by a non-source tracker must be ignored by Git**, unless the
-> path is deliberately followed by two trackers.
+> **A path owned by a secret tracker must be ignored by Git.**
 
-`newgit tracker track` checks this and appends to `.gitignore`, loudly. The
-config loader validates the invariant — content lanes must be disjoint, so no
-two trackers fight over the same path at projection/restore time.
+`newgit tracker track` checks this and appends to `.gitignore`, loudly.
+Ownership nests: the most specific claim wins, so `root` owns `.` while
+`runtime-env` owns `.env.local`. Two trackers claiming the identical path is a
+config error, refused at load.
 
 The `.gitignore` append is not sufficient on its own: it is an *uncommitted*
 edit in the store worktree, so a workspace clone does not inherit the rule
@@ -341,13 +344,22 @@ concrete. It is not enforcement against a hostile agent force-adding a file;
 v1 does not claim that, and a v2 `git commit` shim is the natural place to
 catch it.
 
-**Open decision (M2):** dual-tracked paths need a defined precedence — whose
-content wins at materialize time, and which capture is authoritative at
-checkpoint.
+### Root, Project, and Code Trackers
 
-### Source Is the Default Tracker
+v1 shipped with `source` as an implicit default tracker. `newgit-trackers.md`
+replaces it, and the code now follows that design:
 
-`source` is a tracker with audience = everyone, storage = Git/`jj`, mechanism = Git/`jj`. It is the one tracker whose history engine is external and non-negotiable (see *Source Tracker* below). Every other tracker uses newgit's capture/merge/pull/checkout policy.
+- **`root`** owns `.` — everything no more specific tracker claims. `newgit
+  init` writes `trackers/root.toml` and copies the project's Git history into
+  root's `main`. Its history engine is Git (see *Source Tracker* below).
+- **`project`** owns `.newgit`, so the definitions travel as their own
+  tracker.
+- **Code trackers** (`secret = false`) are committed content with their own
+  history: `newgit tracker create electron --code --path apps/electron`
+  carves those paths, history included, out of whichever tracker owned them.
+  You commit to them with Git; `capture` refuses them.
+- **Secret trackers** (the default, `secret = true`) are the lanes this
+  section describes: captured, never committed.
 
 ---
 
@@ -770,8 +782,7 @@ Git, capture reverses the substitution, and hand edits round-trip.
 - A render path that no tracker owns must be tracked by Git. A path that is
   neither tracked nor tracker-owned has no committed content to render *from*,
   which the purity rule above makes a contradiction, not an edge case.
-- Two resources rendering the same path is a config error, refused at load —
-  the same disjointness check tracker paths get.
+- Two resources rendering the same path is a config error, refused at load.
 - A `find` that matches zero times, or more times than `count` declares, fails
   the bind rather than rendering partially. The resource is marked `failed`
   and its dependents `blocked`, exactly as a failed `prepare` would.
@@ -870,11 +881,12 @@ v1 can use a simple `.newgit/` directory in the project root:
     postgres-db.toml
   scripts/                 # committed scripts resource commands call
     db-up.sh               #   as {{scripts}}/db-up.sh
-  local/                   # gitignored local overrides
+  local/                   # gitignored local state
+    trackers.git/          #   every tracker's history (bare Git repo)
+    tracker-checkouts/     #   tracker revs materialized for commands; a cache
   branches/                # gitignored branch bindings
     feature-a.toml
     feature-b.toml
-  snapshots/               # gitignored captured tracker content
   installs/                # gitignored built trees, keyed by identity
   logs/                    # gitignored action logs
   state/                   # gitignored runtime state
@@ -1001,7 +1013,7 @@ This keeps the upgrade path clean:
 Resource state references should likewise avoid assuming a local file path:
 
 ```text
-local:snapshots/ckpt_017/runtime-env
+local:lanes/runtime-env@3bd17e8ba807
 external:op://Team/myapp-dev-env
 remote:newgit://project/runtime-env/ckpt_017
 ```
@@ -1069,6 +1081,14 @@ newgit tracker create dev-db --audience project-devs
 newgit tracker create generated-sdk --merge-with-source
 ```
 
+`--code --path <path>` (repeatable) creates a code tracker instead: committed
+content carved, history included, out of whichever tracker owns those paths
+now. Its paths are fixed at creation.
+
+```sh
+newgit tracker create electron --code --path apps/electron
+```
+
 ### `newgit tracker track <tracker> <path>...`
 
 Adds workspace paths to a tracker lane and appends those paths to `.gitignore`
@@ -1079,6 +1099,18 @@ newgit tracker track runtime-env .env.local
 newgit tracker track dev-db data/dev.sqlite
 newgit tracker track generated-sdk src/generated
 ```
+
+### Remote commands
+
+Beyond v1, newgit talks to the hosted remote described in
+`newgit-cloudflare.md`: `newgit login` / `logout` / `whoami` (GitHub device
+flow), `newgit remote add [--url <url>] [--project <owner>/<name>]` /
+`remote show`, `newgit members add|remove <github-login>` / `members list`,
+`newgit clone <owner>/<name>`, `newgit merge [instance] [--into <branch>]`,
+`newgit tracker use|drop <tracker>` (binding, newgit-trackers.md),
+and `newgit spawn --from-checkpoint <instance>/<checkpoint>`, which brings
+up someone else's checkpoint locally — source, uncommitted work, your own
+copy of their trackers, and resources restored.
 
 ### `newgit resource add <name> --template <template>`
 
@@ -1577,8 +1609,10 @@ Garbage collection across everything; `remove` targets one instance. Takes
   is reported and left alone.
 - **Clears dead process state**: PID files whose process group has exited,
   and state directories belonging to no live instance.
-- **Prunes tracker lane revs nothing references**, plus staging directories a
-  crashed capture left behind. Roots are the surviving instances' bindings,
+- **Prunes tracker lane revs nothing references**: their refs in the lanes
+  repo are deleted and the repo is garbage-collected at once, so pruned
+  content (which may be a secret) is gone rather than merely unreachable.
+  Roots are the surviving instances' bindings,
   every checkpoint record (including archived instances'), and each lane's
   head. It never deletes a checkpoint record, and never a rev a checkpoint
   still points at — the count of revs retained for that reason is reported,
@@ -1667,7 +1701,7 @@ Shims are a post-MVP milestone (see *What To Defer Until v2*), but `newgit run` 
 
 ## Source Tracker
 
-Source is the one special tracker in v1 because Git compatibility is non-negotiable.
+Source is the one special tracker in v1 because Git compatibility is non-negotiable. (`root` and the code trackers are what it became; their histories are Git's.)
 
 v1 should prefer `jj` if available, because its working-copy model and operation log match the project.
 
@@ -2186,7 +2220,7 @@ store_ref = "refs/newgit/checkpoints/feature-a/ckpt_017"
 [[tracker_states]]
 name = "runtime-env"
 definition_rev = "sha256:..."
-content_rev = "3bd17e8ba807"         # lane rev under .newgit/snapshots/runtime-env/
+content_rev = "3bd17e8ba807"         # rev: refs/trackers/runtime-env/pins/3bd17e8ba807
 
 [[resource_states]]
 name = "deps"
@@ -2200,14 +2234,15 @@ name = "postgres-db"
 definition_rev = "sha256:..."
 mode = "command"
 state_ref = "tracker:db-snapshots@77e10b2c4451"
-state_path = ".../.newgit/snapshots/db-snapshots/77e10b2c4451/db.sql"
+state_path = ".../.newgit/local/tracker-checkouts/db-snapshots/77e10b2c4451/db.sql"
 was_running = false
 ```
 
 `state_path` is how the seam closes at restore time: when a checkpoint
 command deposited into a tracker and echoed a path under `{{snapshot.path}}`,
-that path is rebased onto the lane rev directory, and the restore command's
-`{{state_ref}}` renders to it.
+that path is rebased onto the rev's directory in the lane checkout cache, and
+the restore command's `{{state_ref}}` renders to it. The cache is disposable:
+restore re-materializes the rev from the lanes repo before rendering.
 
 Checkpoint refs keep the commits alive and checkpoints reference lane revs,
 so lane pruning (a `cleanup`/M6 concern) must never delete a rev a
@@ -2285,7 +2320,8 @@ This keeps the "repositories are outputs" idea alive without making it the first
 
 Definitions live one per file, not inlined in `config.toml`:
 
-- `config.toml` holds only `[project]` and (optionally) `[workspace]`.
+- `config.toml` holds only `[project]` and (optionally) `[workspace]` and
+  `[remote]`.
 - Each tracker is a file in `.newgit/trackers/`; each resource is a file in
   `.newgit/resources/`. The definition's name comes from the filename.
 

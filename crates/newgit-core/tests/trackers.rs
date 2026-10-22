@@ -315,12 +315,14 @@ fn dual_tracked_paths_warn_loudly() {
 }
 
 #[test]
-fn disjoint_lanes_and_empty_pull_are_enforced() {
+fn identical_claims_and_empty_pull_are_enforced() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
     let repo = store.paths().project_root.clone();
 
-    for (name, path) in [("a", "src/generated"), ("b", "src/generated/sdk")] {
+    // Nesting is fine (the most specific owner wins); claiming the very same
+    // path twice is not.
+    for (name, path) in [("a", "src/generated"), ("b", "src/generated")] {
         std::fs::write(
             store.paths().trackers.join(format!("{name}.toml")),
             format!(
@@ -621,13 +623,16 @@ fn remove_tracker_reverses_the_definition_and_gitignore_and_leaves_snapshots_for
         .capture_tracker("feature-a", "runtime-env")
         .expect("capture");
     m.merge_tracker("feature-a", "runtime-env").expect("merge");
-    let snapshot_dir = m
-        .store()
-        .paths()
-        .snapshots
-        .join("runtime-env")
-        .join(&captured.rev);
-    assert!(snapshot_dir.is_dir(), "captured content exists on disk");
+    let paths = m.store().paths().clone();
+    let lane = newgit_core::tracker_repo::TrackerRepo::new(
+        &paths.tracker_store,
+        &paths.tracker_checkouts,
+        "runtime-env",
+    );
+    assert!(
+        lane.has_rev(&captured.rev),
+        "captured content exists in the lanes repo"
+    );
 
     // Not removable while the instance is still bound to it.
     assert!(m.remove_tracker("runtime-env").is_err());
@@ -656,14 +661,14 @@ fn remove_tracker_reverses_the_definition_and_gitignore_and_leaves_snapshots_for
 
     // The captured content is untouched — it is `newgit cleanup`'s job, not
     // `tracker remove`'s, to reclaim it once nothing pins it.
-    assert!(snapshot_dir.is_dir());
+    assert!(lane.has_rev(&captured.rev));
     let cleaned = m
         .cleanup(false, ArchivedCheckpoints::Keep)
         .expect("cleanup");
     assert_eq!(cleaned.pruned.len(), 1);
     assert_eq!(cleaned.pruned[0].tracker, "runtime-env");
     assert!(
-        !snapshot_dir.is_dir(),
+        !lane.has_rev(&captured.rev),
         "a removed tracker's head is no longer pinned once nothing else claims it"
     );
 }

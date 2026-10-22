@@ -41,8 +41,36 @@ pub struct BranchInstance {
     pub trackers: BTreeMap<String, TrackerBinding>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub resources: BTreeMap<String, ResourceBinding>,
+    /// Trackers this instance does not bind (`newgit tracker drop`); every
+    /// other is bound. A dropped code tracker stays in the instance's history
+    /// — which is composed from everything its user may read — but not in its
+    /// working tree (sparse checkout), and its work is out of scope: nothing
+    /// splits into it, and a merge leaves it at the branch's commit. A dropped
+    /// secret tracker keeps its binding's content for when it is used again.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub dropped: std::collections::BTreeSet<String>,
+    /// Where this instance lives on the project's remote, once registered.
+    /// `None` for a project without a remote, or when registration has not
+    /// succeeded yet (it is retried at the next checkpoint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteBinding>,
+    /// On the remote, only its owner sees it — its record, checkpoints, and
+    /// forks — until its work is merged (`newgit spawn --private`): an
+    /// embargo, for work the rest of the project must not see yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub private: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// An instance's place on the remote. Nothing is forked when it is
+/// registered: it forks a code tracker the first time it changes it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteBinding {
+    /// `<owner>/<name>`.
+    pub project: String,
+    /// The project's Git endpoint — what this workspace's `origin` fetches.
+    pub endpoint: String,
 }
 
 /// Which concrete instance of a resource this branch instance is bound to:
@@ -126,7 +154,10 @@ impl BranchInstance {
             status: InstanceStatus::Active,
             trackers: BTreeMap::new(),
             resources: BTreeMap::new(),
+            dropped: Default::default(),
+            private: false,
             created_at: now,
+            remote: None,
             updated_at: now,
         })
     }

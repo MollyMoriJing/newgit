@@ -35,6 +35,48 @@ newgit export auth-refactor --to ../public-export
 newgit cleanup
 ```
 
+With a remote (the hosted one is `https://newgit.dev`), the same checkpoint
+travels: a teammate, or a cloud agent's checkpoint, comes up on your machine
+with its source, uncommitted work, your own copy of its trackers, and its
+resources restored.
+
+```sh
+newgit login                      # GitHub device flow
+newgit remote add                 # create <you>/<project>: a repo per code tracker
+newgit members add octocat
+newgit spawn --from-checkpoint auth-refactor/ckpt_003
+newgit merge auth-refactor        # into main, tracker by tracker, all at once
+
+# a teammate
+newgit clone jack/widget          # or plain: git clone https://newgit.dev/jack/widget.git
+```
+
+Plain `git clone` works too: the remote composes each branch from the code
+trackers you may read, so two people can read different parts of one
+project.
+
+Every tracker is its own history. `root` owns `.` — whatever no more specific
+tracker claims — and starts as your project's Git history; `project` owns
+`.newgit` (resources, scripts, config), and `access` owns `.newgit/trackers/`,
+who may read what, which only the project's owner changes by default
+(`maintainers = "owner"`). Carve out a code tracker, history included, with
+`newgit tracker create electron --code --path apps/electron`. Trackers are
+secret by default: captured, never committed.
+
+An instance works on what it binds:
+
+```sh
+newgit spawn fix-db --use staging-db --drop electron   # one per role; the rest as you say
+newgit tracker drop electron --stash   # out of the working tree, history untouched
+newgit tracker use electron            # back, with the stashed work
+newgit status                          # ready / not ready, and why
+```
+
+Trackers sharing a `role` are alternatives (`dev-db`, `staging-db`); a spawn
+picks one by `--use`, then your own default in `~/.newgit/config.toml`, then
+`priority`. A tracker can bring resources (they run only while it is bound) and
+`require` others.
+
 ## Install
 
 Prebuilt binaries for macOS and Linux (arm64 and x86_64) are attached to each
@@ -135,22 +177,28 @@ tests by nature.
 
 ## Workspace Layout
 
-- `crates/newgit-core` holds the MVP domain model: branch instances, tracker
-  definitions and content lanes, resource definitions and lifecycle hooks,
-  metadata storage, real-directory materialization, source tracker
-  boundaries, checkpoints and undo, export, and cleanup.
+- `crates/newgit-core` holds the domain model: branch instances, tracker
+  definitions and their histories, the compose/split engine that turns
+  tracker histories into one workspace history and back, resource
+  definitions and lifecycle hooks, metadata storage, real-directory
+  materialization, checkpoints and undo, export, cleanup, and the remote
+  client.
 - `crates/newgit` is the CLI, published as the `newgit` crate.
+- `remote/` is the hosted remote: a Cloudflare Worker with Durable Objects
+  over Artifacts repos, deployed at `https://newgit.dev`.
 - `.newgit/` is created by `newgit init`. Committed: `config.toml`,
   `trackers/`, `resources/`, `scripts/`. Gitignored local state: `branches/`,
-  `snapshots/`, `checkpoints/`, `logs/`, `state/`, `local/`.
+  `checkpoints/`, `logs/`, `state/`, `installs/`, and `local/` — which holds
+  `trackers.git`, every tracker's history (bare repo).
 
 ## Commands
 
 Branch-instance lifecycle (top-level verbs; `[instance]` is inferred when run
 inside a workspace):
 
-- `newgit init` / `spawn <name>` / `status [name]` / `remove <name> [--purge]
-  [--keep-branch | --delete-branch]`
+- `newgit init` / `spawn <name> [--use <tracker>] [--drop <tracker>] [--private]` /
+  `status [name]` / `remove <name> [--purge] [--keep-branch | --delete-branch]` —
+  `status` says whether each instance is ready, and why not
 - `newgit status <instance> --path` — just the workspace path, for scripts
 - `newgit reference` — the definition format, every key and default
 - `newgit run [instance] -- <command>` — run with exports and ports loaded
@@ -169,12 +217,30 @@ Definition management (noun subcommands):
 
 - `newgit tracker create <name> [--audience <a>] [--storage <s>]
   [--merge-with-source]`
+- `newgit tracker create <name> --code --path <path>...` — a committed code
+  tracker, carved with its history out of whichever tracker owns the paths
 - `newgit tracker track <tracker> <path>...`
 - `newgit tracker capture|merge|pull|checkout <tracker> [instance]`
 - `newgit tracker capture <tracker> --from-store` — seed a lane from the store
   repo's working tree, so the first `spawn` comes up with the content
-- `newgit tracker list`
+- `newgit tracker list` — a tree by ownership: kind, role, priority,
+  maintainers, and (inside a workspace) what is bound
+- `newgit tracker use <tracker> [instance]` / `newgit tracker drop <tracker>
+  [instance] [--stash | --discard]`
+- `newgit log <tracker> [instance] [-- <git log args>]` — one tracker's
+  history: an instance's branch as of its last checkpoint, or the project
+  root's
 - `newgit resource add <name> --template <template>` / `list` / `templates`
+
+Remote:
+
+- `newgit login` / `logout` / `whoami`
+- `newgit remote add [--url <url>] [--project <owner>/<name>]` / `remote show`
+- `newgit clone <owner>/<name> [dir]`
+- `newgit merge [instance] [--into <branch>]` — `newgit merge main` merges
+  the project root
+- `newgit members add|remove <github-login>` / `members list`
+- `newgit spawn <name> --from-checkpoint <instance>/<checkpoint>`
 
 Resource templates: `process`, `pnpm`, `install`, `command-snapshot`,
 `command-snapshot-migrations`, `supabase`, `external`. `newgit resource

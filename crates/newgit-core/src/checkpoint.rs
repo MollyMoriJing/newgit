@@ -35,6 +35,30 @@ pub struct CheckpointRecord {
     pub tracker_states: Vec<TrackerState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resource_states: Vec<ResourceState>,
+    /// The checkpoint as a list: one commit per code tracker, for the
+    /// committed work (`head`) and with the uncommitted work too (`tip`).
+    /// Filled in when the checkpoint syncs to a remote; another machine
+    /// composes its source from these.
+    #[serde(default, skip_serializing_if = "CodeState::is_empty")]
+    pub code: CodeState,
+    /// The trackers the instance did not bind at the checkpoint: undo puts
+    /// the binding back along with everything else.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub dropped: std::collections::BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodeState {
+    #[serde(default)]
+    pub head: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub tip: std::collections::BTreeMap<String, String>,
+}
+
+impl CodeState {
+    pub fn is_empty(&self) -> bool {
+        self.head.is_empty() && self.tip.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -273,6 +297,8 @@ mod tests {
             },
             tracker_states: vec![],
             resource_states: vec![],
+            code: CodeState::default(),
+            dropped: Default::default(),
         };
         log.save(&record).expect("save");
 

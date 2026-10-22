@@ -18,8 +18,10 @@ use newgit_core::source::{RefUpdate, find_repo_root};
 use newgit_core::store::Context;
 use newgit_core::supervisor::StopOutcome;
 use newgit_core::templates::{RESOURCE_TEMPLATES, resource_template, resource_template_names};
-use newgit_core::tracker::Storage;
+use newgit_core::tracker::{Storage, TrackerDefinition};
 use newgit_core::{MetadataStore, ProjectConfig};
+
+mod remote_cmd;
 
 /// `0.1.0 (a1b2c3d4e5f6)` — the release plus the commit it was built from.
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("NEWGIT_BUILD"), ")");
@@ -133,6 +135,17 @@ enum Command {
         #[arg(long)]
         force_recompute: bool,
     },
+    /// Show one tracker's history: an instance's branch (as of its last
+    /// checkpoint), or with no instance, the project root's. Arguments after
+    /// `--` go to `git log`
+    Log {
+        tracker: String,
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+        /// Extra `git log` arguments
+        #[arg(last = true)]
+        git_args: Vec<String>,
+    },
     /// List an instance's checkpoints
     Checkpoints {
         /// Instance (inferred when run inside a workspace)
@@ -191,6 +204,65 @@ enum Command {
         /// The repository Git asked to receive into (the outbox)
         repository: Utf8PathBuf,
     },
+    /// Log in to a newgit remote with your GitHub account
+    Login {
+        /// The remote (default: this project's, else https://newgit.dev)
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Log out of a newgit remote and revoke the saved token
+    Logout {
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Show who you are logged in as
+    Whoami {
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Merge an instance's committed work into a branch, tracker by tracker:
+    /// every tracker moves together, or none does
+    Merge {
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+        /// The branch to merge into
+        #[arg(long, default_value = "main")]
+        into: String,
+    },
+    /// Clone a project from a newgit remote: its default branch composed from
+    /// the code trackers you may read, set up for newgit
+    Clone {
+        /// The project, `<owner>/<name>`
+        project: String,
+        /// Where to put it (default: the project's name)
+        dir: Option<Utf8PathBuf>,
+        /// The remote (default: https://newgit.dev)
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// The Git endpoint's composer, run inside its container: reads a plan
+    /// (JSON) on stdin, prints the bare repository it composed
+    #[command(hide = true)]
+    EndpointCompose,
+    /// Link this project to a newgit remote
+    Remote {
+        #[command(subcommand)]
+        command: remote_cmd::RemoteCommand,
+    },
+    /// Manage who can use this project on its remote
+    Members {
+        #[command(subcommand)]
+        command: remote_cmd::MembersCommand,
+    },
+    /// Git credential helper for the newgit remote, never run by hand: Git
+    /// calls `newgit credential get` and reads a short-lived repo password
+    #[command(hide = true)]
+    Credential {
+        /// get, store, or erase (only get does anything)
+        operation: String,
+    },
     /// The outbox's `pre-receive` hook, never run by hand: reads the ref
     /// updates on stdin, checkpoints the instance, and forwards the push to
     /// the store's `origin`
@@ -203,10 +275,10 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum TrackerCommand {
-    /// Create an empty Git-like content lane
+    /// Create a tracker: secret (captured, never committed) unless --code
     Create {
         name: String,
-        /// Who may read this lane's content
+        /// Who may read this tracker's content
         #[arg(long, default_value = "project-devs")]
         audience: String,
         /// Carry this tracker when source changes are merged
@@ -215,8 +287,15 @@ enum TrackerCommand {
         /// Where synced state lives: local or remote
         #[arg(long, default_value = "local")]
         storage: String,
+        /// A code tracker: committed content with its own history, carved out
+        /// of whichever tracker owns its paths now (usually root)
+        #[arg(long, requires = "path")]
+        code: bool,
+        /// A path a code tracker owns (repeatable; set at creation)
+        #[arg(long = "path", value_name = "PATH")]
+        path: Vec<Utf8PathBuf>,
     },
-    /// Add workspace paths to a tracker lane
+    /// Add workspace paths to a secret tracker
     Track {
         tracker: String,
         paths: Vec<Utf8PathBuf>,
@@ -230,12 +309,13 @@ enum TrackerCommand {
         tracker: String,
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
-        /// Seed the lane from the store repo's working tree instead, and make
-        /// it the lane head — how you carry existing files into a new lane
+        /// Seed the tracker from the store repo's working tree instead, and
+        /// make that its `main` — how you carry existing files into a new
+        /// tracker
         #[arg(long, conflicts_with = "instance")]
         from_store: bool,
     },
-    /// Promote this instance's tracker revision to the lane head/default
+    /// Promote this instance's tracker revision to the tracker's `main`
     Merge {
         tracker: String,
         /// Instance (inferred when run inside a workspace)
@@ -250,11 +330,33 @@ enum TrackerCommand {
         #[arg(long)]
         rev: Option<String>,
     },
-    /// Pull the latest lane head into an existing tracker binding
+    /// Pull the tracker's `main` into an existing tracker binding
     Pull {
         tracker: String,
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
+    },
+    /// Bind a tracker in an instance again: its files come back (a code
+    /// tracker's history never left), with any work a drop stashed
+    Use {
+        tracker: String,
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+    },
+    /// Stop binding a tracker in an instance: its files leave the working
+    /// tree and its work leaves the instance's scope. Refused while it has
+    /// uncommitted changes, unless told what to do with them
+    Drop {
+        tracker: String,
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+        /// Stash its uncommitted work; `newgit tracker use` brings it back
+        #[arg(long, conflicts_with = "discard")]
+        stash: bool,
+        /// Throw its uncommitted work away, after a checkpoint (`newgit undo`
+        /// gets it back)
+        #[arg(long)]
+        discard: bool,
     },
 }
 
@@ -269,8 +371,28 @@ struct InitArgs {
 struct SpawnArgs {
     name: String,
     /// Base revision when creating a new source branch (defaults to HEAD)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "from_checkpoint")]
     from: Option<String>,
+    /// Spawn a checkpoint from the project's remote, `<instance>/<checkpoint>`
+    /// (the id `newgit checkpoints` shows where it was made): source, trackers
+    /// you may read, and resource state, with your own per-user tracker content
+    #[arg(long, value_name = "INSTANCE/CHECKPOINT")]
+    from_checkpoint: Option<String>,
+    /// Bind this tracker (repeatable): over its role's default, or one that
+    /// is only bound when asked for
+    #[arg(long = "use", value_name = "TRACKER")]
+    uses: Vec<String>,
+    /// Do not bind this tracker (repeatable)
+    #[arg(long = "drop", value_name = "TRACKER")]
+    drops: Vec<String>,
+    /// On the remote, only you see this instance — its checkpoints and its
+    /// forks of the code trackers — until `newgit merge` publishes its work:
+    /// an embargo, for a fix the rest of the project must not see yet
+    #[arg(long, conflicts_with = "from_checkpoint")]
+    private: bool,
+    /// Print what happened as JSON
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -382,6 +504,11 @@ fn main() -> Result<()> {
                 force_recompute,
             },
         ),
+        Command::Log {
+            tracker,
+            instance,
+            git_args,
+        } => tracker_log(&tracker, instance, &git_args),
         Command::Checkpoints { instance } => checkpoints(instance),
         Command::Export(args) => export(args),
         Command::Cleanup {
@@ -397,6 +524,20 @@ fn main() -> Result<()> {
             repository,
         } => push_receive_pack(&store, &instance, &repository),
         Command::PushPreReceive { instance } => push_pre_receive(&instance),
+        Command::Login { url } => remote_cmd::login(url),
+        Command::Logout { url } => remote_cmd::logout(url),
+        Command::Whoami { url, json } => remote_cmd::whoami(url, json),
+        Command::Remote { command } => remote_cmd::remote_command(command),
+        Command::Clone { project, dir, url } => remote_cmd::clone(&project, dir, url),
+        Command::Merge { instance, into } => merge(instance, &into),
+        Command::EndpointCompose => {
+            let plan: newgit_core::endpoint::Plan = serde_json::from_reader(std::io::stdin())
+                .context("the plan on stdin is not JSON newgit can read")?;
+            println!("{}", newgit_core::endpoint::compose_view(&plan)?);
+            Ok(())
+        }
+        Command::Members { command } => remote_cmd::members(command),
+        Command::Credential { operation } => remote_cmd::credential(&operation),
     }
 }
 
@@ -625,7 +766,7 @@ fn init(args: InitArgs) -> Result<()> {
     println!("  .newgit/scripts/      scripts your resources call, as {{{{scripts}}}}/<name>");
     println!(
         "Everything else under .newgit/ is local state and is already ignored: branches/, \
-         snapshots/, checkpoints/, logs/, state/, local/."
+         checkpoints/, logs/, state/, installs/, local/ (tracker history lives in local/trackers.git)."
     );
     println!("\nNext: newgit tracker create <name> [--audience user]");
     println!(
@@ -636,10 +777,93 @@ fn init(args: InitArgs) -> Result<()> {
     Ok(())
 }
 
+fn spawn_from_checkpoint(
+    manager: &BranchManager,
+    name: &str,
+    spec: &str,
+    json: bool,
+) -> Result<()> {
+    let (instance, checkpoint) = spec.split_once('/').with_context(|| {
+        format!("`{spec}` is not `<instance>/<checkpoint>`, e.g. `fix-login/ckpt_003`")
+    })?;
+    let outcome = manager.spawn_from_checkpoint(name, instance, checkpoint)?;
+    let by = match &outcome.agent {
+        Some(agent) => format!("{} (agent {agent})", outcome.author),
+        None => outcome.author.clone(),
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "name": outcome.branch.name,
+                "workspace": outcome.branch.workspace_path,
+                "from": spec,
+                "author": outcome.author,
+                "agent": outcome.agent,
+                "trackers": outcome.undo.trackers.iter().map(|tracker| serde_json::json!({
+                    "name": tracker.name, "rev": tracker.rev, "files": tracker.files,
+                })).collect::<Vec<_>>(),
+                "resources": outcome.undo.resources.iter().map(|resource| serde_json::json!({
+                    "name": resource.name, "ok": resource.ok, "action": resource.action,
+                })).collect::<Vec<_>>(),
+                "warnings": outcome.warnings,
+            })
+        );
+        return Ok(());
+    }
+    println!(
+        "Spawned `{}` from {spec}, taken by {by}",
+        outcome.branch.name
+    );
+    println!("  workspace: {}", outcome.branch.workspace_path);
+    for tracker in &outcome.undo.trackers {
+        match &tracker.rev {
+            Some(rev) => println!(
+                "  tracker:   {} @ {rev} ({})",
+                tracker.name,
+                files_label(tracker.files)
+            ),
+            None => println!("  tracker:   {} (empty)", tracker.name),
+        }
+    }
+    for resource in &outcome.undo.resources {
+        println!("  resource:  {} {}", resource.name, resource.action);
+    }
+    print_warnings(&outcome.warnings);
+    Ok(())
+}
+
 fn spawn(args: SpawnArgs) -> Result<()> {
     let manager = manager_here()?;
     warn_gitignore(&manager);
-    let outcome = manager.spawn(&args.name, args.from.as_deref())?;
+    if let Some(spec) = &args.from_checkpoint {
+        return spawn_from_checkpoint(&manager, &args.name, spec, args.json);
+    }
+    let outcome = manager.spawn_binding(
+        &args.name,
+        args.from.as_deref(),
+        &newgit_core::manager::BindingChoice {
+            uses: args.uses.clone(),
+            drops: args.drops.clone(),
+            private: args.private,
+        },
+    )?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "name": outcome.branch.name,
+                "workspace": outcome.branch.workspace_path,
+                "source_rev": outcome.branch.source_rev,
+                "remote": outcome.branch.remote.as_ref().map(|remote| &remote.project),
+                "private": outcome.branch.private,
+                "endpoint": outcome.branch.remote.as_ref().map(|remote| &remote.endpoint),
+                "remote_warning": outcome.remote_warning,
+                "projection_warning": outcome.projection_warning,
+            })
+        );
+        return Ok(());
+    }
     let branch = &outcome.branch;
 
     let branch_note = if outcome.created_source_branch {
@@ -651,7 +875,20 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         "(existing branch)".to_owned()
     };
 
-    println!("Spawned branch instance `{}`", branch.name);
+    let failed = outcome.failed_resources();
+    if failed.is_empty() {
+        println!("Spawned branch instance `{}`", branch.name);
+    } else {
+        println!(
+            "Spawned branch instance `{}` — but {} did not come up (see below)",
+            branch.name,
+            failed
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     println!(
         "  source:    {} @ {} {branch_note}",
         branch.source_ref,
@@ -659,14 +896,44 @@ fn spawn(args: SpawnArgs) -> Result<()> {
     );
     println!("  workspace: {}", branch.workspace_path);
     println!("  record:    {}", outcome.record_path);
+    if let Some(warning) = &outcome.projection_warning {
+        println!("  trackers:  the project root's commits were not split ({warning})");
+    }
     // The workspace's `origin` is the store, a local path. An agent reaching
     // for `git push` should know before it does where that push will go.
-    match manager.publish_url()? {
-        Some(url) => println!("  push:      `git push` checkpoints, then publishes to {url}"),
-        None => println!(
-            "  push:      the store has no `origin` remote, so `git push` from this workspace \
-             will be refused"
-        ),
+    match (&branch.remote, &outcome.remote_warning) {
+        (Some(remote), _) => {
+            println!(
+                "  remote:    {} (token in the workspace's .git/; `origin` fetches {})",
+                remote.project, remote.endpoint
+            );
+            println!(
+                "  push:      nothing leaves this machine until you `git push` or checkpoint; \
+                 then each changed tracker goes to this instance's fork of it"
+            );
+            if branch.private {
+                println!(
+                    "  private:   only you see this instance on {} until `newgit merge` \
+                     publishes its work",
+                    remote.project
+                );
+            }
+        }
+        (None, Some(warning)) => {
+            println!(
+                "  remote:    not on the remote yet ({warning}); retried at the next checkpoint"
+            );
+        }
+        (None, None) => match manager.publish_url()? {
+            Some(url) => println!(
+                "  push:      nothing leaves this machine until you `git push`; that checkpoints, \
+                 then publishes to {url}"
+            ),
+            None => println!(
+                "  push:      the store has no `origin` remote, so `git push` from this workspace \
+                 will be refused"
+            ),
+        },
     }
     // Everything else `remove` touched — workspace, containers, volumes — was
     // destroyed and rebuilt, so checkpoint numbering carrying over is the one
@@ -710,8 +977,13 @@ fn spawn(args: SpawnArgs) -> Result<()> {
             (None, None) => match &resource.prepare {
                 Some((true, _)) => " prepare: ok".to_owned(),
                 Some((false, log)) => {
+                    // The hook ran quietly; its last lines are usually the why.
+                    let tail = newgit_core::supervisor::log_tail(log, 8)
+                        .into_iter()
+                        .map(|line| format!("\n               | {line}"))
+                        .collect::<String>();
                     format!(
-                        " prepare: FAILED (log: {log}; re-run with `newgit action {}.prepare`)",
+                        " prepare: FAILED (log: {log}; re-run with `newgit action {}.prepare`){tail}",
                         resource.name
                     )
                 }
@@ -772,6 +1044,15 @@ fn spawn(args: SpawnArgs) -> Result<()> {
             branch.name
         );
         std::process::exit(1);
+    }
+    let readiness = manager.readiness(branch);
+    if readiness.is_ready() {
+        println!("ready: `{}`", branch.name);
+    } else {
+        println!("not ready: `{}`", branch.name);
+        for problem in &readiness.problems {
+            println!("  - {problem}");
+        }
     }
     Ok(())
 }
@@ -1149,8 +1430,33 @@ fn tracker(command: TrackerCommand) -> Result<()> {
         TrackerCommand::Create {
             name,
             audience,
+            code: true,
+            path,
+            ..
+        } => {
+            let manager = manager_here()?;
+            let outcome = manager.create_code_tracker(&name, &audience, &path)?;
+            let root = manager.store().paths().project_root.clone();
+            println!(
+                "Created code tracker `{name}` at {}",
+                display_path(&root, &outcome.path)
+            );
+            println!(
+                "  history:   {} carved out of `{}` (each marked with its source, so nothing is rewritten)",
+                plural(outcome.commits as usize, "commit"),
+                outcome.source
+            );
+            println!(
+                "  commit to it with Git; newgit splits your commits into it when work leaves the machine"
+            );
+            Ok(())
+        }
+        TrackerCommand::Create {
+            name,
+            audience,
             merge_with_source,
             storage,
+            ..
         } => {
             let manager = manager_here()?;
             let root = manager.store().paths().project_root.clone();
@@ -1201,7 +1507,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             }
             if outcome.seedable {
                 println!(
-                    "  seed the lane from what is already here: \
+                    "  seed it from what is already here: \
                      newgit tracker capture {tracker} --from-store"
                 );
             } else {
@@ -1236,57 +1542,146 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 );
             }
             println!(
-                "  snapshots: content under .newgit/snapshots/{name}/ is left in place and is \
+                "  content: its history in .newgit/local/trackers.git is left in place and is \
                  now unreferenced; `newgit cleanup` reclaims it once nothing else (a checkpoint \
                  that captured it) still pins a rev"
             );
             Ok(())
         }
         TrackerCommand::List => {
-            let manager = manager_here()?;
+            let context = context_here()?;
+            let current = context.current_branch.clone();
+            let manager = BranchManager::open(context.store)?;
             warn_gitignore(&manager);
             warn_graph(&manager);
-            let definitions = manager.tracker_definitions();
-            if definitions.is_empty() {
-                println!("No trackers defined. Create one with `newgit tracker create <name>`.");
-                return Ok(());
+            let dropped = current
+                .as_deref()
+                .and_then(|name| manager.store().find_branch(name).ok())
+                .map(|branch| branch.dropped);
+            let definitions: Vec<&TrackerDefinition> = std::iter::once(manager.root_tracker())
+                .chain(manager.code_trackers())
+                .chain(manager.tracker_definitions())
+                .collect();
+            // A tree by ownership: each tracker under the tracker whose paths
+            // hold its own — root at the top, carved trackers and secret ones
+            // beneath whatever they were carved from.
+            let parent_of = |child: &TrackerDefinition| -> Option<String> {
+                if child.owns_everything() {
+                    return None;
+                }
+                let path = child.paths.first()?;
+                definitions
+                    .iter()
+                    .filter(|other| other.name != child.name)
+                    .filter_map(|other| {
+                        other
+                            .paths
+                            .iter()
+                            .filter(|owned| {
+                                owned.as_str() == "."
+                                    || (*owned != path && path.starts_with(owned.as_str()))
+                            })
+                            .map(|owned| {
+                                if owned.as_str() == "." {
+                                    0
+                                } else {
+                                    owned.as_str().len()
+                                }
+                            })
+                            .max()
+                            .map(|depth| (depth, other.name.clone()))
+                    })
+                    .max()
+                    .map(|(_, name)| name)
+                    .or_else(|| Some(manager.root_tracker().name.clone()))
+            };
+            let mut ordered: Vec<(usize, &TrackerDefinition)> = Vec::new();
+            fn walk<'a>(
+                name: &str,
+                depth: usize,
+                definitions: &[&'a TrackerDefinition],
+                parent_of: &dyn Fn(&TrackerDefinition) -> Option<String>,
+                out: &mut Vec<(usize, &'a TrackerDefinition)>,
+            ) {
+                let Some(definition) = definitions.iter().find(|d| d.name == name) else {
+                    return;
+                };
+                out.push((depth, definition));
+                let mut children: Vec<&&TrackerDefinition> = definitions
+                    .iter()
+                    .filter(|child| parent_of(child).as_deref() == Some(name))
+                    .collect();
+                children.sort_by_key(|child| (child.secret, child.name.clone()));
+                for child in children {
+                    walk(&child.name, depth + 1, definitions, parent_of, out);
+                }
             }
-            // Same reasoning as `resource list`: compute widths from every
-            // row plus the header, so a long AUDIENCE value can't push PATHS
-            // out of alignment.
-            let rows: Vec<_> = definitions
+            walk(
+                &manager.root_tracker().name,
+                0,
+                &definitions,
+                &parent_of,
+                &mut ordered,
+            );
+            let rows: Vec<_> = ordered
                 .iter()
-                .map(|definition| {
-                    let paths = definition
-                        .paths
-                        .iter()
-                        .map(|path| path.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                .map(|(depth, definition)| {
+                    let mark = match &dropped {
+                        Some(dropped) if dropped.contains(&definition.name) => "- ",
+                        Some(_) => "* ",
+                        None => "",
+                    };
+                    let name = format!("{mark}{}{}", "  ".repeat(*depth), definition.name);
+                    let kind = if definition.secret { "secret" } else { "code" };
+                    let mut role = definition.role.clone().unwrap_or_else(|| "-".to_owned());
+                    if definition.priority != 0 {
+                        role.push_str(&format!(" ({})", definition.priority));
+                    }
+                    let audience = match &definition.maintainers {
+                        Some(maintainers) if maintainers != &definition.audience => {
+                            format!("{} (maintained by {maintainers})", definition.audience)
+                        }
+                        _ => definition.audience.clone(),
+                    };
+                    let paths = if definition.owns_everything() {
+                        "(everything no other tracker claims)".to_owned()
+                    } else if definition.paths.is_empty() {
+                        "-".to_owned()
+                    } else {
+                        definition
+                            .paths
+                            .iter()
+                            .map(|path| path.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
                     (
-                        definition.name.clone(),
-                        definition.merge_with_source.to_string(),
+                        name,
+                        kind.to_owned(),
+                        role,
                         format!("{:?}", definition.storage).to_lowercase(),
-                        definition.audience.clone(),
-                        if paths.is_empty() {
-                            "-".to_owned()
-                        } else {
-                            paths
-                        },
+                        audience,
+                        paths,
                     )
                 })
                 .collect();
             let name_width = column_width(rows.iter().map(|r| r.0.len()), "NAME");
-            let merge_width = column_width(rows.iter().map(|r| r.1.len()), "MERGE_WITH_SOURCE");
-            let storage_width = column_width(rows.iter().map(|r| r.2.len()), "STORAGE");
-            let audience_width = column_width(rows.iter().map(|r| r.3.len()), "AUDIENCE");
+            let kind_width = column_width(rows.iter().map(|r| r.1.len()), "KIND");
+            let role_width = column_width(rows.iter().map(|r| r.2.len()), "ROLE");
+            let storage_width = column_width(rows.iter().map(|r| r.3.len()), "STORAGE");
+            let audience_width = column_width(rows.iter().map(|r| r.4.len()), "AUDIENCE");
             println!(
-                "{:<name_width$} {:<merge_width$} {:<storage_width$} {:<audience_width$} PATHS",
-                "NAME", "MERGE_WITH_SOURCE", "STORAGE", "AUDIENCE"
+                "{:<name_width$} {:<kind_width$} {:<role_width$} {:<storage_width$} {:<audience_width$} PATHS",
+                "NAME", "KIND", "ROLE", "STORAGE", "AUDIENCE"
             );
-            for (name, merge_with_source, storage, audience, paths) in &rows {
+            for (name, kind, role, storage, audience, paths) in &rows {
                 println!(
-                    "{name:<name_width$} {merge_with_source:<merge_width$} {storage:<storage_width$} {audience:<audience_width$} {paths}"
+                    "{name:<name_width$} {kind:<kind_width$} {role:<role_width$} {storage:<storage_width$} {audience:<audience_width$} {paths}"
+                );
+            }
+            if let Some(current) = &current {
+                println!(
+                    "\n* = bound in `{current}`, - = dropped (`newgit tracker use|drop <tracker>`)"
                 );
             }
             Ok(())
@@ -1302,7 +1697,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             let note = if report.changed {
                 ""
             } else {
-                " (lane head unchanged)"
+                " (its `main` unchanged)"
             };
             println!(
                 "Seeded `{tracker}` @ {} ({}) from the store repo{note}",
@@ -1333,7 +1728,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             let (manager, instance) = manager_and_instance(instance)?;
             let outcome = manager.merge_tracker(&instance, &tracker)?;
             println!(
-                "Merged `{}` @ {} from `{instance}` into the lane head",
+                "Merged `{}` @ {} from `{instance}` into its `main`",
                 outcome.tracker, outcome.rev
             );
             Ok(())
@@ -1352,6 +1747,70 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             );
             if let Some(safety) = report.safety_rev {
                 println!("  previous content saved @ {safety}; check it out with --rev");
+            }
+            Ok(())
+        }
+        TrackerCommand::Use { tracker, instance } => {
+            let (manager, instance) = manager_and_instance(instance)?;
+            let change = manager.use_tracker(&instance, &tracker)?;
+            if change.already {
+                println!("`{tracker}` is already bound in `{instance}`");
+                return Ok(());
+            }
+            println!("Bound `{tracker}` in `{instance}`");
+            for other in &change.replaced {
+                println!("  dropped `{other}`, which filled the same role");
+            }
+            for other in &change.brought {
+                println!("  bound `{other}` too: `{tracker}` requires it");
+            }
+            if !change.started.is_empty() {
+                println!("  started what it brings: {}", change.started.join(", "));
+            }
+            if change.restored_stash {
+                println!("  its uncommitted work, stashed when it was dropped, is back");
+            }
+            if change.files > 0 {
+                println!("  {} restored", plural(change.files, "file"));
+            }
+            Ok(())
+        }
+        TrackerCommand::Drop {
+            tracker,
+            instance,
+            stash,
+            discard,
+        } => {
+            use newgit_core::manager::Uncommitted;
+            let (manager, instance) = manager_and_instance(instance)?;
+            let how = match (stash, discard) {
+                (true, _) => Uncommitted::Stash,
+                (_, true) => Uncommitted::Discard,
+                _ => Uncommitted::Refuse,
+            };
+            let change = manager.drop_tracker(&instance, &tracker, how)?;
+            if change.already {
+                println!("`{tracker}` is already dropped from `{instance}`");
+                return Ok(());
+            }
+            println!("Dropped `{tracker}` from `{instance}`");
+            if !change.stopped.is_empty() {
+                println!("  stopped what it brought: {}", change.stopped.join(", "));
+            }
+            if change.stashed {
+                println!(
+                    "  its uncommitted work is stashed; `newgit tracker use {tracker}` brings it back"
+                );
+            }
+            if let Some(checkpoint) = &change.checkpoint {
+                println!(
+                    "  its uncommitted work was discarded after checkpoint {checkpoint} (`newgit undo` gets it back)"
+                );
+            }
+            if let Some(rev) = &change.captured {
+                println!(
+                    "  its content was captured first ({rev}); `newgit tracker use {tracker}` brings it back"
+                );
             }
             Ok(())
         }
@@ -1424,14 +1883,23 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
             width = name_width - 2,
         );
     }
+    for report in reports
+        .iter()
+        .filter(|report| report.workspace_exists && !report.readiness.is_ready())
+    {
+        println!("\n`{}` is not ready:", report.branch.name);
+        for problem in &report.readiness.problems {
+            println!("  - {problem}");
+        }
+    }
     if any_never_pulled {
         println!(
-            "\n^ = lane has content this instance never pulled; catch up with `newgit tracker pull <tracker> [instance]`"
+            "\n^ = its `main` has content this instance never pulled; catch up with `newgit tracker pull <tracker> [instance]`"
         );
     }
     if any_diverged {
         println!(
-            "\n~ = differs from lane head; `newgit tracker pull` takes the head (auto-saves current), `newgit tracker merge` makes this instance the head"
+            "\n~ = differs from its `main`; `newgit tracker pull` takes `main` (auto-saves current), `newgit tracker merge` makes this instance's content `main`"
         );
     }
     if any_base_drift {
@@ -1449,9 +1917,21 @@ fn status_column(report: &InstanceReport) -> String {
     if !report.workspace_exists {
         return "ws-missing".to_owned();
     }
+    let health = if report.readiness.is_ready() {
+        "ready"
+    } else {
+        "not ready"
+    };
+    let health = if report.branch.private {
+        format!("{health}, private")
+    } else {
+        health.to_owned()
+    };
     match &report.base {
-        Some(BaseReport { base_ref, ahead }) if *ahead > 0 => format!("ok, {base_ref} +{ahead}"),
-        _ => "ok".to_owned(),
+        Some(BaseReport { base_ref, ahead }) if *ahead > 0 => {
+            format!("{health}, {base_ref} +{ahead}")
+        }
+        _ => health,
     }
 }
 
@@ -1521,6 +2001,23 @@ fn checkpoint(instance: Option<String>, message: Option<&str>) -> Result<()> {
             resource.name, resource.mode
         );
     }
+    if !outcome.degraded.is_empty() {
+        println!(
+            "  degraded: {} not captured (not up); an undo to this checkpoint leaves them as they are",
+            outcome
+                .degraded
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if let Some(link) = manager.remote_link() {
+        match &outcome.sync_error {
+            None => println!("  remote:   synced to {}", link.project),
+            Some(_) => println!("  remote:   not synced (the warning above says why)"),
+        }
+    }
     println!("  undo with: newgit undo {instance}");
     Ok(())
 }
@@ -1531,7 +2028,7 @@ fn push_receive_pack(store: &Utf8Path, instance: &str, repository: &Utf8Path) ->
     use std::os::unix::process::CommandExt as _;
 
     let manager = BranchManager::open(MetadataStore::at(store))?;
-    let outbox = manager.serve_push()?;
+    let outbox = manager.serve_push(instance)?;
     if outbox != repository {
         bail!("asked to receive into {repository}, but this workspace's outbox is {outbox}");
     }
@@ -2282,6 +2779,18 @@ fn remove(name: &str, purge: bool, source_branch: SourceBranchPolicy) -> Result<
         );
     }
     println!("  record:    archived at {}", outcome.archived_record);
+    match (&outcome.branch.remote, &outcome.remote_warning) {
+        (Some(remote), None) => println!(
+            "  remote:    removed from {}; its forks deleted and its token revoked",
+            remote.project
+        ),
+        (Some(remote), Some(warning)) => println!(
+            "  remote:    could not remove it from {} ({warning}); its forks and token remain \
+             until removed there",
+            remote.project
+        ),
+        (None, _) => {}
+    }
     match &outcome.purged_checkpoints {
         Some(purged) => {
             println!(
@@ -2378,7 +2887,7 @@ fn bind_line(outcome: &TrackerBindOutcome, deposit_only: bool) -> String {
                 files_label(outcome.files)
             };
             format!(
-                "`{}` @ {} ({count}, from lane head)",
+                "`{}` @ {} ({count}, from its `main`)",
                 outcome.name,
                 outcome.content_rev.as_deref().unwrap_or("-"),
             )
@@ -2496,6 +3005,72 @@ fn context_here() -> Result<Context> {
 
 fn manager_here() -> Result<BranchManager> {
     Ok(BranchManager::open(context_here()?.store)?)
+}
+
+fn merge(instance: Option<String>, into: &str) -> Result<()> {
+    use newgit_core::manager::TrackerMergeAction;
+    let (manager, instance) = manager_and_instance(instance)?;
+    let outcome = manager.merge(&instance, into)?;
+    let moved = outcome
+        .trackers
+        .iter()
+        .filter(|merge| merge.action != TrackerMergeAction::Unchanged)
+        .count();
+    if moved == 0 {
+        println!(
+            "Nothing to merge: `{}` has nothing `{into}` does not (checkpoint {})",
+            outcome.instance, outcome.checkpoint
+        );
+        return Ok(());
+    }
+    let place = outcome
+        .remote
+        .as_deref()
+        .map(|project| format!(" on {project}"))
+        .unwrap_or_default();
+    let checkpoint = if outcome.checkpoint.is_empty() {
+        String::new()
+    } else {
+        format!(" (checkpoint {})", outcome.checkpoint)
+    };
+    println!(
+        "Merged `{}` into `{into}`{place}{checkpoint}",
+        outcome.instance
+    );
+    for merge in &outcome.trackers {
+        let what = match merge.action {
+            TrackerMergeAction::Unchanged => "unchanged",
+            TrackerMergeAction::FastForward => "fast-forward",
+            TrackerMergeAction::Merged => "merged",
+            TrackerMergeAction::New => "new",
+        };
+        println!(
+            "  {:<12} {what:<12} {}",
+            merge.tracker,
+            &merge.commit[..merge.commit.len().min(12)]
+        );
+    }
+    if let Some(note) = &outcome.project_root {
+        println!("  {note}");
+    }
+    Ok(())
+}
+
+fn tracker_log(tracker: &str, instance: Option<String>, git_args: &[String]) -> Result<()> {
+    let context = context_here()?;
+    let instance = instance.or_else(|| context.current_branch.clone());
+    let manager = BranchManager::open(context.store)?;
+    let (store, reference) = manager.tracker_log_target(tracker, instance.as_deref())?;
+    let status = std::process::Command::new("git")
+        .arg(format!("--git-dir={store}"))
+        .args(["log", &reference])
+        .args(git_args)
+        .status()
+        .context("could not run git log")?;
+    if !status.success() {
+        bail!("`{tracker}` has no history here yet");
+    }
+    Ok(())
 }
 
 fn manager_and_instance(instance: Option<String>) -> Result<(BranchManager, String)> {

@@ -1,16 +1,18 @@
 pub mod branch;
 pub mod checkpoint;
 pub mod cleanup;
+pub mod compose;
 pub mod config;
 pub mod deposit_diff;
+pub mod endpoint;
 pub mod error;
 pub mod export;
 pub mod exports;
 pub mod installs;
-pub mod lane;
 pub mod manager;
 pub mod materializer;
 pub mod ports;
+pub mod remote;
 pub mod render;
 pub mod resource;
 pub mod source;
@@ -18,6 +20,7 @@ pub mod store;
 pub mod supervisor;
 pub mod templates;
 pub mod tracker;
+pub mod tracker_repo;
 
 pub use branch::{BranchInstance, InstanceStatus, ResourceBinding, TrackerBinding};
 pub use config::{ProjectConfig, SourceSubstrate};
