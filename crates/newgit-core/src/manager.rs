@@ -7135,6 +7135,10 @@ impl BranchManager {
 
     /// Start the definition's long-running action again after an undo.
     /// `Ok(false)` when the definition has none.
+    ///
+    /// Invoked exactly as `newgit action <resource>.<action>` would invoke
+    /// it, `workdir` included: the same process must not come back in a
+    /// different directory depending on which path started it (#109).
     fn restart_long_running(
         &self,
         branch: &BranchInstance,
@@ -7150,15 +7154,10 @@ impl BranchManager {
         let log = self
             .store
             .action_log_path(&branch.slug, &format!("{}.{action_name}", definition.name));
-        let command = self.rendered_command(branch, definition, action)?;
+        let (command, cwd) = self.action_invocation(branch, definition, action, action_name)?;
         let env = self.assemble_env(branch)?;
-        self.supervisor(branch).start(
-            &definition.name,
-            &command,
-            &branch.workspace_path,
-            &env,
-            &log,
-        )?;
+        self.supervisor(branch)
+            .start(&definition.name, &command, &cwd, &env, &log)?;
         Ok(true)
     }
 
