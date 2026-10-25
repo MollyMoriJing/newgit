@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Parser, Subcommand};
-use newgit_core::branch::branch_slug;
+use newgit_core::branch::{ResourceBinding, ResourceStatus, branch_slug};
 use newgit_core::checkpoint::CheckpointReason;
 use newgit_core::cleanup::{ArchivedCheckpoints, HookDetail, HookOutcome};
 use newgit_core::deposit_diff::{DepositDiff, FileChange, escape_control};
@@ -10,8 +10,8 @@ use newgit_core::exports::unresolved_placeholder;
 use newgit_core::installs::InstallReport;
 use newgit_core::manager::{
     ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, DiffPair, InstanceReport,
-    KeptBranch, MismatchCause, RemoveOutcome, SourceBranchOutcome, SourceBranchPolicy,
-    TrackerBindOutcome, UndoOptions, VerifyResource,
+    KeptBranch, MismatchCause, RemoveOutcome, ResourceBindOutcome, SourceBranchOutcome,
+    SourceBranchPolicy, TrackerBindOutcome, UndoOptions, VerifyResource,
 };
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
 use newgit_core::source::{RefUpdate, find_repo_root};
@@ -777,6 +777,44 @@ fn init(args: InitArgs) -> Result<()> {
     Ok(())
 }
 
+/// One resource of a spawned instance, as `spawn --json` reports it: its
+/// status in the words its human-readable `resource:` line uses, and the
+/// fields behind that line's verdict, so a script can tell which resource
+/// did not come up and why without parsing the line.
+///
+/// The status and ports are the record's; the rest comes from `bound`, the
+/// spawn's bind of it. After `--from-checkpoint` the two can differ, since
+/// the restore runs after the bind, and a resource only the restore bound
+/// has no `bound`.
+fn resource_json(
+    name: &str,
+    binding: &ResourceBinding,
+    bound: Option<&ResourceBindOutcome>,
+) -> serde_json::Value {
+    let blocked_by = bound
+        .map(|bound| bound.blocked_by.as_slice())
+        .unwrap_or_default();
+    // `blocked` is not a stored status — it is derived from the dependencies
+    // so that it cannot go stale (see `ResourceStatus::Pending`) — but it is
+    // what the human-readable line calls this, and a script should not have
+    // to derive it.
+    let status = match binding.status {
+        ResourceStatus::Ready => "ready",
+        ResourceStatus::Failed => "failed",
+        ResourceStatus::Pending if !blocked_by.is_empty() => "blocked",
+        ResourceStatus::Pending => "pending",
+    };
+    serde_json::json!({
+        "name": name,
+        "status": status,
+        "ports": binding.resolved_ports,
+        "prepare_log": bound.and_then(|bound| bound.prepare.as_ref()).map(|(_, log)| log),
+        "blocked_by": blocked_by,
+        "render_error": bound.and_then(|bound| bound.render_error.as_ref()),
+        "export_error": bound.and_then(|bound| bound.export_error.as_ref()),
+    })
+}
+
 fn spawn_from_checkpoint(
     manager: &BranchManager,
     name: &str,
@@ -792,6 +830,30 @@ fn spawn_from_checkpoint(
         None => outcome.author.clone(),
     };
     if json {
+        // Each resource the instance ended up with, as `spawn --json` reports
+        // it, and what the restore did to it: `action` and `ok` are null for
+        // one the checkpoint held no state for.
+        let resources = outcome
+            .branch
+            .resources
+            .iter()
+            .map(|(name, binding)| {
+                let bound = outcome
+                    .spawned
+                    .resources
+                    .iter()
+                    .find(|resource| &resource.name == name);
+                let restored = outcome
+                    .undo
+                    .resources
+                    .iter()
+                    .find(|resource| &resource.name == name);
+                let mut resource = resource_json(name, binding, bound);
+                resource["action"] = serde_json::json!(restored.map(|restored| &restored.action));
+                resource["ok"] = serde_json::json!(restored.map(|restored| restored.ok));
+                resource
+            })
+            .collect::<Vec<_>>();
         println!(
             "{}",
             serde_json::json!({
@@ -803,12 +865,16 @@ fn spawn_from_checkpoint(
                 "trackers": outcome.undo.trackers.iter().map(|tracker| serde_json::json!({
                     "name": tracker.name, "rev": tracker.rev, "files": tracker.files,
                 })).collect::<Vec<_>>(),
-                "resources": outcome.undo.resources.iter().map(|resource| serde_json::json!({
-                    "name": resource.name, "ok": resource.ok, "action": resource.action,
-                })).collect::<Vec<_>>(),
+                "resources": resources,
+                "recovery_record": outcome.undo.recovery_record,
                 "warnings": outcome.warnings,
             })
         );
+        // Exits 1 for the reason `spawn --json` below does, and the same way:
+        // after printing, leaving the instance and its record in place.
+        if !outcome.is_complete() {
+            std::process::exit(1);
+        }
         return Ok(());
     }
     println!(
@@ -849,6 +915,18 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         },
     )?;
     if args.json {
+        let resources = outcome
+            .branch
+            .resources
+            .iter()
+            .map(|(name, binding)| {
+                let bound = outcome
+                    .resources
+                    .iter()
+                    .find(|resource| &resource.name == name);
+                resource_json(name, binding, bound)
+            })
+            .collect::<Vec<_>>();
         println!(
             "{}",
             serde_json::json!({
@@ -860,8 +938,17 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                 "endpoint": outcome.branch.remote.as_ref().map(|remote| &remote.endpoint),
                 "remote_warning": outcome.remote_warning,
                 "projection_warning": outcome.projection_warning,
+                "resources": resources,
             })
         );
+        // The exit the human-readable summary below gives, for the same
+        // reason (#86): a script is the caller most likely to ask for JSON,
+        // and the one that goes by the exit code. As there, exit 1 reports
+        // the instance's state rather than undoing it — the instance and its
+        // record stay, and the JSON above is all of stdout.
+        if !outcome.is_complete() {
+            std::process::exit(1);
+        }
         return Ok(());
     }
     let branch = &outcome.branch;

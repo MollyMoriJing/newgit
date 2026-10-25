@@ -96,6 +96,25 @@ pub struct SpawnFromCheckpointOutcome {
     pub warnings: Vec<String>,
 }
 
+impl SpawnFromCheckpointOutcome {
+    /// Complete when the restore was, and every resource the instance ended
+    /// up with is ready. Asked of the record the restore left rather than of
+    /// `spawned`, because the restore runs after the bind: it can bring back
+    /// a resource the bind failed, fail one the bind brought up, or bind one
+    /// for a tracker the checkpoint had and the spawn did not — and a
+    /// resource the checkpoint holds no state for keeps what the bind left.
+    /// The question `SpawnOutcome::is_complete` and `UndoOutcome::is_complete`
+    /// each ask, asked of both steps together.
+    pub fn is_complete(&self) -> bool {
+        self.undo.is_complete()
+            && self
+                .branch
+                .resources
+                .values()
+                .all(|binding| binding.status == ResourceStatus::Ready)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnOutcome {
     pub branch: BranchInstance,
