@@ -86,7 +86,7 @@ put `newgit` on your `PATH`:
 
 ```sh
 TARGET=aarch64-apple-darwin   # or x86_64-apple-darwin, {x86_64,aarch64}-unknown-linux-gnu
-VERSION=v0.5.0
+VERSION=v0.6.0
 BASE=https://github.com/Spheroman/newgit/releases/download/$VERSION
 curl -fsSLO $BASE/newgit-$TARGET.tar.gz -O $BASE/newgit-$TARGET.tar.gz.sha256
 shasum -a 256 -c newgit-$TARGET.tar.gz.sha256
@@ -108,7 +108,7 @@ Check what you installed. The commit is part of the version because `0.x`
 moves fast, and `-dirty` means the binary does not match any commit:
 
 ```sh
-newgit --version   # newgit 0.5.0 (ba40d59d8f4f)
+newgit --version   # newgit 0.6.0 (ba40d59d8f4f)
 ```
 
 ## Adopting it in a project
@@ -160,6 +160,44 @@ tree is the thing that would be wrong. If you run many instances of a large
 repository, a package manager with a content-addressed store is worth more
 here than it is on plain Git.
 
+## Using it with T3 Code
+
+[T3 Code](https://github.com/pingdotgg/t3code) gives each agent thread its
+own Git worktree. A fork,
+[`Spheroman/t3code`](https://github.com/Spheroman/t3code), gives it a
+newgit instance instead. In a project with `.newgit/config.toml` at its
+root, "New worktree" runs `newgit spawn <branch> --from <base> --json` and
+opens the thread in that workspace, with its trackers bound and its
+resources prepared. Deleting the thread runs `newgit remove`. Every other
+project gets plain worktrees, as before.
+
+On macOS it installs as "T3 Code (newgit)", beside upstream T3 Code: its
+own app ID, state in `~/.t3-newgit`, and no auto-update.
+
+```sh
+git clone https://github.com/Spheroman/t3code && cd t3code
+scripts/fork/install-mac.sh
+```
+
+- `T3CODE_NEWGIT=0` turns it off; `T3CODE_NEWGIT_BIN` names a `newgit`
+  that is not on the T3 Code server's `PATH`. If `newgit` cannot run, the
+  thread falls back to a Git worktree and the server logs why.
+- Threads keep their temporary `t3code/<hex>` branch name. T3 Code renames
+  a worktree's branch after the first message, and an instance cannot be
+  renamed.
+- T3 Code's storage cleanup leaves newgit workspaces alone; `newgit cleanup`
+  owns them.
+- An agent in a thread pushes and opens pull requests the usual way, `git
+  push` then `gh pr create`. On a newgit remote, `origin` is the newgit
+  endpoint, which `gh` cannot read, so give the project an export target
+  with `branches = true` (`newgit reference export`): each push then lands
+  the branch there too, and the workspace's remote for it is the one `gh`
+  uses.
+
+The fork is a small patch stack rebased onto a fast-moving upstream; its
+[`FORK.md`](https://github.com/Spheroman/t3code/blob/newgit/FORK.md) lists
+every change, its limits, and how to rebase.
+
 ## Development
 
 This repository uses [`mise`](https://mise.jdx.dev/) to pin Rust.
@@ -210,6 +248,9 @@ inside a workspace):
 - `newgit checkpoint [instance] [-m <msg>]` / `undo [instance] [--to <id>]` /
   `checkpoints [instance]`
 - `newgit export [instance] --to <dir> [--include <path>] [--exclude <path>]`
+- `newgit export --remote <name> [--dry-run] [--force]` — push the trackers'
+  `main`s, history and all, to the target in `.newgit/exports/<name>.toml`
+  (a GitHub mirror, say); `public` trackers plus the ones it names
 - `newgit cleanup [--dry-run] [--purge-archived]`
 - `newgit ports [--check]` — claimed ports, or detect a listening one nothing
   claims
@@ -254,6 +295,18 @@ trackers whose audience is `public`. Anything narrower is withheld and
 reported; `--include <path>` overrides. It writes one commit, not history,
 because exporting the branch's commits would carry any file they contain —
 including withheld ones. This is a path-level filter, not concealment.
+
+**GitHub stays where it is.** `newgit export --remote github` pushes a
+composed history to an ordinary repository defined in
+`.newgit/exports/github.toml` (`url = "acme/widget"`, `trackers =
+["root"]`). Only `public` trackers and the ones a target names ship, so a
+public mirror and a private one can show different views, and a history that
+ever committed a secret tracker's file is refused. Exporting again
+fast-forwards, and the push uses your own Git credentials, so `gh`, GitHub
+Actions, and anyone cloning from GitHub keep working. With `branches =
+true`, every push from a workspace exports its branch there too, and on a
+newgit remote the workspace gets the target as the remote `gh` resolves, so
+an agent's `git push` then `gh pr create` opens a real pull request.
 
 **`[[render]]` puts this instance's ports in the config file your tool
 actually reads.** Most tools take a port from a committed config file rather
