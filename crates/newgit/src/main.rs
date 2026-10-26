@@ -778,9 +778,9 @@ fn init(args: InitArgs) -> Result<()> {
             for line in &done {
                 println!("  {line}");
             }
-            println!(
-                "  commit .newgit/trackers/ if it changed: the remote reads audiences from it"
-            );
+            if done.iter().any(|line| line.starts_with("wrote ")) {
+                println!("  commit .newgit/trackers/: the remote reads audiences from it");
+            }
         }
         return Ok(());
     }
