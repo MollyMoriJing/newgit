@@ -121,3 +121,54 @@ command = "exit 1"
     );
     assert_eq!(spawned.json["recovery_record"], Value::Null);
 }
+
+/// What blocks a resource is read from the instance the restore leaves, as
+/// its status is, not from the bind before it. Here the bind fails `base`
+/// and blocks `dep` behind it, then the restore brings `base` back: `dep`
+/// is still not up, since its `prepare` never ran, but nothing blocks it.
+#[test]
+fn a_dependency_the_restore_brought_back_no_longer_blocks() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    // Prepares for the checkpoint's author, not for `review`; restored by a
+    // command that succeeds for both.
+    std::fs::write(
+        fixture.store.join(".newgit/resources/base.toml"),
+        r#"ownership = "branch"
+
+[actions.prepare]
+command = "test {{branch.slug}} != review"
+
+[restore]
+mode = "command"
+command = "true"
+"#,
+    )
+    .expect("resource");
+    checkpointed(&fixture);
+    // Defined after the checkpoint, so the restore leaves it as bound.
+    std::fs::write(
+        fixture.store.join(".newgit/resources/dep.toml"),
+        r#"ownership = "branch"
+depends_on = ["base"]
+
+[actions.prepare]
+command = "true"
+"#,
+    )
+    .expect("resource");
+
+    let spawned = spawn_review(&fixture);
+    let base = spawned.resource("base");
+    assert_eq!(base["status"], "ready", "{}", spawned.stdout);
+    assert_eq!(base["ok"], true, "{}", spawned.stdout);
+    let dep = spawned.resource("dep");
+    assert_eq!(dep["status"], "pending", "{}", spawned.stdout);
+    assert_eq!(dep["blocked_by"], json!([]), "{}", spawned.stdout);
+    assert_eq!(
+        spawned.status.code(),
+        Some(1),
+        "`dep` never came up:\n{}",
+        spawned.stdout
+    );
+}

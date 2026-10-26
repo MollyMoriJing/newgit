@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Parser, Subcommand};
-use newgit_core::branch::{ResourceBinding, ResourceStatus, branch_slug};
+use newgit_core::branch::{BranchInstance, ResourceBinding, ResourceStatus, branch_slug};
 use newgit_core::checkpoint::CheckpointReason;
 use newgit_core::cleanup::{ArchivedCheckpoints, HookDetail, HookOutcome};
 use newgit_core::deposit_diff::{DepositDiff, FileChange, escape_control};
@@ -802,26 +802,38 @@ fn init(args: InitArgs) -> Result<()> {
 }
 
 /// One resource of a spawned instance, as `spawn --json` reports it: its
-/// status in the words its human-readable `resource:` line uses, and the
-/// fields behind that line's verdict, so a script can tell which resource
-/// did not come up and why without parsing the line.
+/// status, and the fields that say why a resource is not `ready`, so a
+/// script can tell which resource did not come up and why without parsing
+/// the human-readable `resource:` line.
 ///
-/// The status and ports are the record's; the rest comes from `bound`, the
-/// spawn's bind of it. After `--from-checkpoint` the two can differ, since
-/// the restore runs after the bind, and a resource only the restore bound
-/// has no `bound`.
+/// The status, ports and `blocked_by` are read from `branch`, the record;
+/// the rest comes from `bound`, the spawn's bind of the resource. After
+/// `--from-checkpoint` the two can differ, since the restore runs after the
+/// bind, and a resource only the restore bound has no `bound`.
 fn resource_json(
+    manager: &BranchManager,
+    branch: &BranchInstance,
     name: &str,
     binding: &ResourceBinding,
     bound: Option<&ResourceBindOutcome>,
 ) -> serde_json::Value {
-    let blocked_by = bound
-        .map(|bound| bound.blocked_by.as_slice())
-        .unwrap_or_default();
+    // Read from the record, like the status, and not from the bind: the
+    // restore after a bind can bring a failed dependency back. A `ready`
+    // resource is blocked by nothing, however its dependencies fared — one
+    // with no runnable `prepare` had nothing to withhold — and a failed
+    // dependency is reported on its own entry.
+    let blocked_by = match binding.status {
+        ResourceStatus::Ready => Vec::new(),
+        ResourceStatus::Failed | ResourceStatus::Pending => manager
+            .resource_definitions()
+            .iter()
+            .find(|definition| definition.name == name)
+            .map(|definition| manager.blocked_dependencies(branch, definition))
+            .unwrap_or_default(),
+    };
     // `blocked` is not a stored status — it is derived from the dependencies
-    // so that it cannot go stale (see `ResourceStatus::Pending`) — but it is
-    // what the human-readable line calls this, and a script should not have
-    // to derive it.
+    // so that it cannot go stale (see `ResourceStatus::Pending`) — but a
+    // script should not have to derive it.
     let status = match binding.status {
         ResourceStatus::Ready => "ready",
         ResourceStatus::Failed => "failed",
@@ -872,7 +884,7 @@ fn spawn_from_checkpoint(
                     .resources
                     .iter()
                     .find(|resource| &resource.name == name);
-                let mut resource = resource_json(name, binding, bound);
+                let mut resource = resource_json(manager, &outcome.branch, name, binding, bound);
                 resource["action"] = serde_json::json!(restored.map(|restored| &restored.action));
                 resource["ok"] = serde_json::json!(restored.map(|restored| restored.ok));
                 resource
@@ -948,7 +960,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                     .resources
                     .iter()
                     .find(|resource| &resource.name == name);
-                resource_json(name, binding, bound)
+                resource_json(&manager, &outcome.branch, name, binding, bound)
             })
             .collect::<Vec<_>>();
         println!(

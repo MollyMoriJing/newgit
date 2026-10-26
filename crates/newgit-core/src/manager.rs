@@ -3521,7 +3521,10 @@ impl BranchManager {
         Supervisor::new(self.store.instance_state_dir(&branch.slug))
     }
 
-    fn blocked_dependencies(
+    /// The dependencies of `definition` that are not `Ready` in `branch`'s
+    /// record as it stands. Worked out on every call rather than stored, so
+    /// it cannot go stale (see `ResourceStatus::Pending`).
+    pub fn blocked_dependencies(
         &self,
         branch: &BranchInstance,
         definition: &ResourceDefinition,
