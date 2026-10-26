@@ -4,3 +4,4 @@ source = "git"
 
 [remote]
 url = "https://newgit.dev"
+project = "spheroman/newgit"
