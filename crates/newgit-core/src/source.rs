@@ -569,9 +569,9 @@ impl GitSource {
     /// Put a workspace back to a checkpointed source state: HEAD hard-reset
     /// to `head_rev`, untracked (non-ignored) files removed, then — when the
     /// checkpoint carried uncommitted state — that state reapplied to the
-    /// worktree as uncommitted changes again. Ignored files (tracker paths,
-    /// node_modules) are deliberately left alone; trackers and resources own
-    /// their restoration.
+    /// worktree as uncommitted changes again, deletions included. Ignored
+    /// files (tracker paths, node_modules) are deliberately left alone;
+    /// trackers and resources own their restoration.
     pub fn workspace_restore_to(
         workspace: &Utf8Path,
         head_rev: &str,
@@ -581,10 +581,44 @@ impl GitSource {
         run_git(&["-C", ws, "reset", "--quiet", "--hard", head_rev])?;
         run_git(&["-C", ws, "clean", "-fdq"])?;
         if let Some(dirty) = dirty_rev {
-            run_git(&["-C", ws, "checkout", "--quiet", dirty, "--", "."])?;
+            // `--no-overlay`, so a tracked path the snapshot lacks is removed:
+            // it was deleted when the checkpoint was taken, and the reset
+            // above has just brought it back. The default overlay mode only
+            // writes the paths the snapshot has — and fails outright when it
+            // has none, as after deleting every tracked file. Removal reaches
+            // only index entries that are not skip-worktree, so ignored
+            // files, rendered files and sparse paths are left alone.
+            run_git(&[
+                "-C",
+                ws,
+                "checkout",
+                "--quiet",
+                "--no-overlay",
+                dirty,
+                "--",
+                ".",
+            ])?;
+            // That checkout removes and writes path by path in index order,
+            // so on a case-insensitive file system a removal can take a file
+            // written just before it. A checkpoint made where case matters —
+            // `spawn --from-checkpoint` brings those in — can rename
+            // `readme.md` to `README.md`: one file here, written under the
+            // new name and then removed under the old. Write back whatever
+            // the snapshot has that the disk now lacks; `--deleted` skips
+            // skip-worktree entries, so sparse paths stay out.
+            let missing = run_git(&["-C", ws, "ls-files", "--deleted", "-z"])?;
+            let missing: Vec<&str> = missing
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .collect();
+            if !missing.is_empty() {
+                let mut args = vec!["-C", ws, "checkout-index", "--quiet", "--"];
+                args.extend(missing);
+                run_git(&args)?;
+            }
             // Mixed reset: index back to head_rev, so the dirty snapshot
-            // shows as uncommitted modifications/untracked files — exactly
-            // how it looked when the checkpoint was taken.
+            // shows as uncommitted modifications, deletions and untracked
+            // files — exactly how it looked when the checkpoint was taken.
             run_git(&["-C", ws, "reset", "--quiet", head_rev])?;
         }
         Ok(())
