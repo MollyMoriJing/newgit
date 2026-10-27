@@ -2942,6 +2942,11 @@ impl BranchManager {
     /// A recompute that fails (the committed content moved under the
     /// definition) is not drift and is not reported here; the re-render that
     /// follows reports it.
+    ///
+    /// Nor is a file holding exactly its committed content: a re-render
+    /// loses none of it. That is what a tracker restore leaves — undo,
+    /// `tracker checkout` and `tracker pull` write lane content, then
+    /// re-render — so counting it would name an edit nobody made.
     fn render_drift(&self, branch: &BranchInstance) -> Vec<String> {
         let mut drifted = Vec::new();
         for (resource, binding) in &branch.resources {
@@ -2960,7 +2965,7 @@ impl BranchManager {
                 else {
                     continue;
                 };
-                if actual != expected {
+                if actual != expected && actual != committed {
                     drifted.push(format!(
                         "`{}` has changes that render will discard: it is rendered by resource \
                          `{resource}`, so newgit rewrites it from committed content and this \
@@ -3563,7 +3568,9 @@ impl BranchManager {
         let lane = self.lane(&definition.name);
         let workspace = branch.workspace_path.clone();
 
-        // Safety net when re-materializing over existing content.
+        // Safety net when re-materializing over existing content — with
+        // renders reversed, as in `checkout_tracker`, so the safety rev is a
+        // lane rev like any other rather than one instance's ports.
         if refresh && !definition.paths.is_empty() {
             let existing = collect_owned_files(&workspace, definition)?;
             if !existing.is_empty() {
@@ -3571,7 +3578,8 @@ impl BranchManager {
                     .trackers
                     .get(&definition.name)
                     .and_then(|binding| binding.content_rev.clone());
-                lane.capture(
+                let reversed = self.unrender_for_capture(branch, definition)?;
+                let safety = lane.capture(
                     &workspace,
                     definition,
                     CaptureAt {
@@ -3582,7 +3590,9 @@ impl BranchManager {
                             definition.name, branch.name
                         ),
                     },
-                )?;
+                );
+                reversed.restore()?;
+                safety?;
             }
         }
 
@@ -6157,22 +6167,22 @@ impl BranchManager {
                         .trackers
                         .get(&definition.name)
                         .and_then(|binding| binding.content_rev.clone());
-                    Some(
-                        self.lane(&definition.name)
-                            .capture(
-                                &workspace,
-                                definition,
-                                CaptureAt {
-                                    parent: bound.as_deref(),
-                                    branch: Branch::Instance(&branch.slug),
-                                    message: &format!(
-                                        "{} in `{}` at {id}",
-                                        definition.name, branch.name
-                                    ),
-                                },
-                            )?
-                            .rev,
-                    )
+                    // Renders reversed, as in `capture_tracker`: the lane is
+                    // shared, and the rev recorded here is what an undo
+                    // re-renders on top of, so it has to hold the committed
+                    // values a render's `find` matches.
+                    let reversed = self.unrender_for_capture(branch, definition)?;
+                    let capture = self.lane(&definition.name).capture(
+                        &workspace,
+                        definition,
+                        CaptureAt {
+                            parent: bound.as_deref(),
+                            branch: Branch::Instance(&branch.slug),
+                            message: &format!("{} in `{}` at {id}", definition.name, branch.name),
+                        },
+                    );
+                    reversed.restore()?;
+                    Some(capture?.rev)
                 };
             branch.trackers.insert(
                 definition.name.clone(),
