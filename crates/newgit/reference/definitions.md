@@ -781,6 +781,17 @@ as much an input as the lockfile it reads, so editing `npm ci` to `npm ci
 entries built before it. That is the right way to be wrong: a stale entry
 costs one reinstall and `newgit cleanup` reclaims it.
 
+**So are the trackers the instance binds.** A shared lockfile lists every
+member, bound or not, and its install builds the bound ones: named by
+`{{bound.paths}}`, or found on disk, where a dropped tracker's files are not
+checked out (an unfiltered `npm ci` links a workspace member only when it is
+there). So what `{{bound.trackers}}` and `{{bound.paths}}` render to is in
+every resource's key, whether its commands mention them or not, and the store
+never fills an instance that drops a tracker with the tree built for one that
+binds it. The cost is the same trade again: instances whose bindings differ
+never share a tree, even one the binding cannot change, so each binding
+installs once.
+
 **An undo is filled from it too.** The rebuild a `recompute` restore triggers
 is the expensive one — a full reinstall in the middle of an operation someone
 is waiting on. Undo restores source first, so by the time the resource is

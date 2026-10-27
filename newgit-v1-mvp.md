@@ -2015,13 +2015,19 @@ tree is published to `.newgit/installs/<resource>/<key>/`; every later
 instance at that key is filled from it with a copy-on-write clone and does not
 run `prepare` at all.
 
-The key is the content of `paths`, the stdout of `key_command`, and the
-definition file itself. The first is what the resource declares it is derived
-from. The second is what that cannot see — a lockfile hash describes what was
-*asked for*, and install scripts compile against a platform and a toolchain it
-never names. The third is because the *command* is an input to the tree as
-much as its inputs are: edit `prepare` and the next instance must rebuild
-rather than be handed what the old command built.
+The key is the content of `paths`, the stdout of `key_command`, the trackers
+the instance binds, and the definition file itself. The first is what the
+resource declares it is derived from. The second is what that cannot see — a
+lockfile hash describes what was *asked for*, and install scripts compile
+against a platform and a toolchain it never names. The third is something
+else a lockfile does not record: a shared lockfile lists every member, bound
+or not, and an install builds the bound ones, whether `{{bound.paths}}` names
+them or it finds them on disk, where a dropped tracker's files are not checked
+out. It is in every resource's key, so instances that bind differently never
+share a tree, even one the binding cannot change. The fourth is because the
+*command* is an input to the tree as much as its inputs are: edit `prepare`
+and the next instance must rebuild rather than be handed what the old command
+built.
 
 Three properties make this safe rather than the shared-tree bug the design
 exists to prevent:
