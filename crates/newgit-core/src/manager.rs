@@ -2536,6 +2536,7 @@ impl BranchManager {
         Some(Ok(crate::installs::identity_key(
             &rev,
             material.as_deref(),
+            &self.bound_vars(branch),
             &definition.definition_rev,
         )))
     }
