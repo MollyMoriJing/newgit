@@ -1908,6 +1908,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             if !change.started.is_empty() {
                 println!("  started what it brings: {}", change.started.join(", "));
             }
+            print_rebuilt(&change.rebuilt);
             if change.restored_stash {
                 println!("  its uncommitted work, stashed when it was dropped, is back");
             }
@@ -1938,6 +1939,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             if !change.stopped.is_empty() {
                 println!("  stopped what it brought: {}", change.stopped.join(", "));
             }
+            print_rebuilt(&change.rebuilt);
             if change.stashed {
                 println!(
                     "  its uncommitted work is stashed; `newgit tracker use {tracker}` brings it back"
@@ -3229,6 +3231,39 @@ fn parse_storage(value: &str) -> Result<Storage> {
         "local" => Ok(Storage::Local),
         "remote" => Ok(Storage::Remote),
         _ => bail!("invalid storage `{value}`; expected local or remote"),
+    }
+}
+
+/// The installs a `tracker use` or `drop` rebuilt, because the binding is
+/// part of their identity. The binding has changed either way; a failed or
+/// blocked rebuild says what to run once the cause is fixed.
+fn print_rebuilt(rebuilt: &[newgit_core::manager::RebuiltInstall]) {
+    for install in rebuilt {
+        let name = &install.name;
+        let retry = format!("`newgit action {name}.prepare`");
+        let line = if !install.blocked_by.is_empty() {
+            format!(
+                "  {name} for the new binding: not rebuilt, waiting on {}; then {retry}",
+                install.blocked_by.join(", ")
+            )
+        } else if let Some(error) = &install.error {
+            format!("  {name} for the new binding: rebuild failed: {error}; retry with {retry}")
+        } else {
+            let verdict = if install.ok {
+                "rebuilt"
+            } else {
+                "rebuild failed"
+            };
+            let mut line = format!("  {name} for the new binding: {verdict}");
+            if let Some(report) = &install.install {
+                line.push_str(&format!(", {}", report.summary()));
+            }
+            if let (false, Some(log)) = (install.ok, &install.log) {
+                line.push_str(&format!("; see {log}, then {retry}"));
+            }
+            line
+        };
+        println!("{line}");
     }
 }
 
