@@ -17,3 +17,10 @@
   that is still spawning, and one whose spawn failed or was killed after
   that point keeps its record, and with it its ports, until `newgit
   remove`.
+
+  A resource is `Pending` in that record while its `prepare` runs, so
+  readiness no longer assumes a `Pending` resource is waiting on a
+  dependency, where it said it "never came up (a dependency of it did
+  not)": with no dependency blocking it, it says the resource "has not
+  been prepared" and to run `newgit action <resource>.prepare` unless
+  newgit is still preparing it.
