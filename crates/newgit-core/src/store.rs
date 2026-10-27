@@ -78,6 +78,9 @@ pub struct NewgitPaths {
     pub tracker_store: Utf8PathBuf,
     /// Tracker revs materialized for commands that take a path. A cache.
     pub tracker_checkouts: Utf8PathBuf,
+    /// The file [`MetadataStore::lock_ports`] locks. Always empty: only the
+    /// lock on it means anything.
+    pub ports_lock: Utf8PathBuf,
     pub logs: Utf8PathBuf,
     pub state: Utf8PathBuf,
     pub checkpoints: Utf8PathBuf,
@@ -314,6 +317,35 @@ impl MetadataStore {
         let path = self.branch_record_path(&branch.slug);
         self.write_toml(&path, &format!("branch `{}`", branch.name), branch)?;
         Ok(path)
+    }
+
+    /// Take the store's port lock, held until the returned file is dropped.
+    ///
+    /// It covers one thing: choosing a resource's ports and writing them into
+    /// the instance's binding record (`BranchManager::claim_ports`, the only
+    /// caller). The records are the only claim on a port, so two processes
+    /// that each read them before the other had written would both be handed
+    /// the same one. Every other write of a binding record, and the id
+    /// `CheckpointLog::next_id` picks, is as unserialized as before.
+    ///
+    /// On Linux and macOS `File::lock` is `flock(2)`, which locks the open
+    /// file rather than the process: two managers in one process exclude
+    /// each other the way two processes do, and the kernel drops the lock
+    /// with the last descriptor. A newgit that crashes or is killed while
+    /// holding it lets go as it dies, and the file it leaves behind locks
+    /// nothing.
+    pub fn lock_ports(&self) -> Result<std::fs::File> {
+        let path = &self.paths.ports_lock;
+        create_dir_all(&self.paths.local)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .map_err(|source| NewgitError::io(path, source))?;
+        file.lock()
+            .map_err(|source| NewgitError::io(path, source))?;
+        Ok(file)
     }
 
     /// Tracker definitions, one per file in `.newgit/trackers/`; the name
@@ -675,6 +707,7 @@ impl NewgitPaths {
             local: metadata_root.join("local"),
             tracker_store: metadata_root.join("local/trackers.git"),
             tracker_checkouts: metadata_root.join("local/tracker-checkouts"),
+            ports_lock: metadata_root.join("local/ports.lock"),
             logs: metadata_root.join("logs"),
             state: metadata_root.join("state"),
             checkpoints: metadata_root.join("checkpoints"),

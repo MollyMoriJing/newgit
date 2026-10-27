@@ -1621,6 +1621,19 @@ impl BranchManager {
                     ));
                     continue;
                 }
+                // Not always a dependency's doing: ports are claimed in the
+                // record before `prepare` runs, so a resource is `Pending`
+                // while that runs and after a spawn that died during it, and
+                // it stays so once a dependency that failed comes up.
+                ResourceStatus::Pending
+                    if self.blocked_dependencies(branch, definition).is_empty() =>
+                {
+                    problems.push(format!(
+                        "`{name}` has not been prepared — unless newgit is still preparing it, \
+                         run `newgit action {name}.prepare`"
+                    ));
+                    continue;
+                }
                 ResourceStatus::Pending => {
                     problems.push(format!(
                         "`{name}` never came up (a dependency of it did not)"
@@ -1792,8 +1805,6 @@ impl BranchManager {
             tracker_outcomes.push(outcome);
         }
 
-        let resource_outcomes = self.bind_resources(&mut branch)?;
-
         // Read before the record is written, so this reflects what was on
         // disk *before* this instance existed: anything found here was left
         // by a previous instance of the same name.
@@ -1808,7 +1819,12 @@ impl BranchManager {
             None
         };
 
+        // Written before the resources bind, not after: the ports they are
+        // given are claimed by writing them into this record, before their
+        // `prepare` runs (see `claim_ports`).
         let record_path = self.store.create_branch_record(&branch)?;
+        let resource_outcomes = self.bind_resources(&mut branch)?;
+        self.store.save_branch_record(&branch)?;
 
         // The instance exists locally whatever the remote says: a failure to
         // register is reported, not fatal, and retried at the next checkpoint.
@@ -2102,7 +2118,6 @@ impl BranchManager {
     /// order. Prepare failures are loud but leave the instance spawned —
     /// re-run with `newgit action <resource>.prepare`.
     fn bind_resources(&self, branch: &mut BranchInstance) -> Result<Vec<ResourceBindOutcome>> {
-        let mut used = ports::used_ports(&self.store.load_branches()?);
         let mut outcomes = Vec::new();
 
         for name in &self.graph.bind_order {
@@ -2114,13 +2129,7 @@ impl BranchManager {
             }
             let definition = self.resource_definition(name)?;
 
-            let mut resolved_ports = BTreeMap::new();
-            for (port_name, request) in &definition.ports {
-                resolved_ports.insert(
-                    port_name.clone(),
-                    ports::allocate(request.start, &mut used)?,
-                );
-            }
+            let resolved_ports = self.claim_ports(branch, definition)?;
 
             // An export may compose a dependency's export, the same way a
             // `[[render]]` already can. Bindings happen in dependency order,
@@ -2326,6 +2335,57 @@ impl BranchManager {
         }
         branch.updated_at = Utc::now();
         Ok(outcomes)
+    }
+
+    /// Allocate `definition`'s ports for `branch`, and write them into its
+    /// binding record before anyone else can allocate.
+    ///
+    /// The records are the only claim on a port ([`ports::used_ports`]), and
+    /// `prepare` runs long before the caller saves the finished binding. Two
+    /// spawns overlapping there, the ordinary case with one per agent, would
+    /// each read records the other had not written yet, and the bind probe
+    /// finds nothing listening on a port whose service is not up yet, so
+    /// both would be handed it. So the claim is written here, before
+    /// `prepare`, and reading the records, allocating and writing it are one
+    /// step under the store's port lock ([`MetadataStore::lock_ports`]). The
+    /// lock is let go before `prepare` runs: a spawn waits while another
+    /// chooses its ports, never for its install.
+    ///
+    /// The record is saved as the instance stands, plus this resource bound
+    /// `Pending` on the ports just chosen. The caller's own save replaces it
+    /// with the finished binding.
+    fn claim_ports(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+    ) -> Result<BTreeMap<String, u16>> {
+        if definition.ports.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let _lock = self.store.lock_ports()?;
+        let mut used = ports::used_ports(&self.store.load_branches()?);
+        let mut resolved_ports = BTreeMap::new();
+        for (port_name, request) in &definition.ports {
+            resolved_ports.insert(
+                port_name.clone(),
+                ports::allocate(request.start, &mut used)?,
+            );
+        }
+        let mut claim = branch.clone();
+        claim.resources.insert(
+            definition.name.clone(),
+            ResourceBinding {
+                definition_rev: definition.definition_rev.clone(),
+                resolved_ports: resolved_ports.clone(),
+                resolved_exports: BTreeMap::new(),
+                rendered: Vec::new(),
+                status: ResourceStatus::Pending,
+                restore_proven: false,
+            },
+        );
+        claim.updated_at = Utc::now();
+        self.store.save_branch_record(&claim)?;
+        Ok(resolved_ports)
     }
 
     /// Write this workspace's local-ignore rules: tracker-owned paths and
