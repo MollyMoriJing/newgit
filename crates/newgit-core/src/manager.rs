@@ -37,7 +37,9 @@ use crate::source::{GitSource, RefUpdate};
 use crate::store::MetadataStore;
 use crate::supervisor::{StopOutcome, Supervisor, run_captured, run_foreground};
 use crate::templates::{instantiate, resource_template};
-use crate::tracker::{Storage, TrackerDefinition, collect_files, collect_owned_files, content_rev};
+use crate::tracker::{
+    Storage, TrackerDefinition, collect_files, collect_owned_files, content_rev, normalize_path,
+};
 use crate::tracker_repo::{
     Branch, CaptureAt, TrackerRepo, clear_owned_paths, copy_file, parse_tracker_state_ref,
     pinned_revs, prune_unreferenced,
@@ -1066,19 +1068,12 @@ impl BranchManager {
                  --code --path <path>`"
             )));
         }
-        let mut definition = TrackerDefinition::new(
-            name,
-            audience.to_owned(),
-            Storage::Local,
-            true,
-            paths.to_vec(),
-        )?;
-        definition.secret = false;
+        let definition = TrackerDefinition::code(name, audience.to_owned(), paths)?;
 
         // Who owns these paths now: one tracker, so there is one history to
         // carve from.
         let mut owners = BTreeSet::new();
-        for path in paths {
+        for path in &definition.paths {
             let owner = self
                 .code
                 .iter()
@@ -4384,15 +4379,18 @@ impl BranchManager {
     }
 
     pub fn track_paths(&self, tracker: &str, paths: &[Utf8PathBuf]) -> Result<TrackPathsOutcome> {
+        // As the definition spells them: Git reads the ignore line `/./.env`
+        // as no file at all, so `./.env` has to become `/.env`.
+        let paths: Vec<Utf8PathBuf> = paths.iter().map(|path| normalize_path(path)).collect();
         let definition = self.definition_or_load(tracker)?;
-        let updated = definition.with_added_paths(paths)?;
+        let updated = definition.with_added_paths(&paths)?;
         let mut all = self.trackers.clone();
         all.push(self.root.clone());
         validate_ownership_with_replacement(&all, &updated)?;
         let path = self.store.save_tracker_definition(&updated)?;
 
         let mut patterns = Vec::new();
-        for owned in paths {
+        for owned in &paths {
             if !self.source.is_ignored(owned.as_str())? {
                 patterns.push(format!("/{owned}"));
             }
@@ -4406,7 +4404,7 @@ impl BranchManager {
 
         Ok(TrackPathsOutcome {
             path,
-            added_paths: paths.to_vec(),
+            added_paths: paths,
             ignored_patterns: patterns,
             seedable,
         })
