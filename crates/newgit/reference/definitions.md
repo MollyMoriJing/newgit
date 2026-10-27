@@ -451,7 +451,7 @@ against an instance you can afford to spend, not one you are mid-task on.
 | --- | --- | --- | --- | --- |
 | `command` | string | no | none | tears the concrete resource down. Runs at `newgit remove`, and at `newgit cleanup` for an instance whose workspace is gone, dependents before dependencies. A `[cleanup]` section without one means there is nothing to do, and teardown says so. |
 
-Two rules constrain it, both deliberately:
+Three rules constrain it, all deliberately:
 
 - **Ownership decides whether it runs at all.** A `project`- or `user`-owned
   resource is shared beyond the instance, so per-branch teardown skips its
@@ -463,6 +463,15 @@ Two rules constrain it, both deliberately:
   `[identity] paths`, which says whether the inputs moved and never names a
   concrete thing to tear down, so `{{state_ref}}` stays unresolved and the
   hook is refused rather than handed `hash:0fa284b468`.
+- **A name with two values refuses.** Teardown is the way out of a resource
+  graph that does not resolve, so it runs on one, and its hooks get the
+  environment layered in whatever order the graph has. The exception is a
+  name two declarations claim, when both reach the instance with different
+  values, as when a port's `env` is renamed onto a name another of its
+  resources sets: the hook would get whichever is layered last, so
+  `newgit remove` and `newgit cleanup` refuse to tear the instance down,
+  naming the collision. A collision that does not reach the instance, such
+  as one with a resource added after the spawn, does not block it.
 
 ### `[exports]`
 

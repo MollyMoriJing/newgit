@@ -999,10 +999,6 @@ impl BranchManager {
         &self.graph.data_edges
     }
 
-    /// The gate for commands that act on the graph — `spawn`, `run`, `action`,
-    /// `checkpoint`, `undo`, `remove`. Commands that *build* the graph
-    /// (`tracker create`, `tracker track`, `resource add`) must not call this:
-    /// they are how an incomplete graph gets completed.
     /// Use `link` as the project's remote instead of the one `[remote]`
     /// names — how tests stand in a fake.
     pub fn with_remote(mut self, link: RemoteLink) -> Self {
@@ -1014,6 +1010,11 @@ impl BranchManager {
         self.remote.as_ref()
     }
 
+    /// The gate for commands that act on the graph — `spawn`, `run`, `action`,
+    /// `checkpoint`, `undo`. Commands that *build* the graph
+    /// (`tracker create`, `tracker track`, `resource add`) must not call this:
+    /// they are how an incomplete graph gets completed. Nor may teardown,
+    /// which is the way out of one — see [`Self::remove`].
     pub fn require_resolvable_graph(&self) -> Result<()> {
         match self.graph.problems.first() {
             Some(problem) => Err(problem.clone().into_error()),
@@ -3292,7 +3293,19 @@ impl BranchManager {
     pub fn command_env(&self, branch: &BranchInstance) -> Result<Vec<EnvVar>> {
         // Layering depends on dependency order, so the order has to be real.
         self.require_resolvable_graph()?;
+        Ok(self.layered_env(branch).0)
+    }
+
+    /// [`Self::command_env`] without the gate: the same layers, in whatever
+    /// order the graph has, and the names a layer gave a different value
+    /// than one before it did. Only teardown may skip the gate — see
+    /// [`Self::run_cleanup_hooks`].
+    fn layered_env(&self, branch: &BranchInstance) -> (Vec<EnvVar>, BTreeSet<String>) {
         let mut env: BTreeMap<String, (String, EnvSource)> = BTreeMap::new();
+        // Where one declaration overwrote another's different value, the
+        // order chose what a command sees. newgit's own context vars are not
+        // counted: they win by design, not by order.
+        let mut clashing = BTreeSet::new();
 
         // Layer 1: resource exports, dependency order (dependents win).
         for name in &self.graph.bind_order {
@@ -3300,7 +3313,11 @@ impl BranchManager {
                 let definition = self.resource_definition(name).ok();
                 for (key, value) in &binding.resolved_exports {
                     let source = export_source(name, definition, key);
-                    env.insert(key.clone(), (value.clone(), source));
+                    if let Some((previous, _)) = env.insert(key.clone(), (value.clone(), source))
+                        && previous != *value
+                    {
+                        clashing.insert(key.clone());
+                    }
                 }
             }
         }
@@ -3321,7 +3338,13 @@ impl BranchManager {
                         resource: name.clone(),
                         port: port_name.clone(),
                     };
-                    env.insert(env_name.clone(), (port.to_string(), source));
+                    let port = port.to_string();
+                    if let Some((previous, _)) =
+                        env.insert(env_name.clone(), (port.clone(), source))
+                        && previous != port
+                    {
+                        clashing.insert(env_name.clone());
+                    }
                 }
             }
         }
@@ -3336,14 +3359,15 @@ impl BranchManager {
             (branch.workspace_path.to_string(), EnvSource::Newgit),
         );
 
-        Ok(env
+        let vars = env
             .into_iter()
             .map(|(name, (value, source))| EnvVar {
                 name,
                 value,
                 source,
             })
-            .collect())
+            .collect();
+        (vars, clashing)
     }
 
     pub fn add_resource(&self, name: &str, template_name: &str) -> Result<AddResourceOutcome> {
@@ -4607,6 +4631,9 @@ impl BranchManager {
     /// Deliberately not gated on [`Self::require_resolvable_graph`]: teardown
     /// must stay reachable from a broken graph, and cleanup hooks run for every
     /// bound resource regardless of how they are ordered relative to each other.
+    /// The one graph problem it refuses is a name declared twice that reaches
+    /// this instance's environment with two values, which a hook could act
+    /// on either of — see `run_cleanup_hooks`.
     ///
     /// Checkpoints outlive removal by default — they pin the lane revs their
     /// undo would need, and the instance may be re-created. `checkpoints =
@@ -4633,6 +4660,10 @@ impl BranchManager {
                 branch.name
             )));
         }
+        // Whatever would make the cleanup hooks refuse refuses here, before
+        // anything is stopped or deleted: a dry run checks each hook and runs
+        // none.
+        self.run_cleanup_hooks(&branch, true)?;
 
         let policy = source_branch;
         let (mut source_branch, via_outbox) = self.decide_source_branch(&branch, policy)?;
@@ -5023,6 +5054,37 @@ impl BranchManager {
                 continue;
             }
 
+            // Not `assemble_env`: it refuses a graph that does not resolve,
+            // and teardown is the way out of one. An edge that does not is
+            // skipped rather than fatal, so every bound resource is still
+            // layered and the hook gets every variable. The order decides
+            // only a name two declarations claim, which a resolvable graph
+            // refuses. Where both reach this instance with different values,
+            // the hook would get whichever is layered last and could tear
+            // down the wrong thing with it, so it is refused, in a dry run
+            // too. Every hook gets the same environment, so the first one to
+            // get here refuses before any has run.
+            let (env, clashing) = self.layered_env(branch);
+            let collision = self
+                .graph
+                .problems
+                .iter()
+                .find_map(|problem| match problem {
+                    GraphProblem::EnvNameCollision { name: variable, .. }
+                        if clashing.contains(variable) =>
+                    {
+                        Some((variable, problem))
+                    }
+                    _ => None,
+                });
+            if let Some((variable, problem)) = collision {
+                return Err(NewgitError::Unsupported(format!(
+                    "refusing to tear down `{}`, whose `[cleanup]` hooks would get either of two \
+                     values for `{variable}`: {problem}",
+                    branch.name
+                )));
+            }
+
             if dry_run {
                 outcomes.push(HookOutcome {
                     resource: name.clone(),
@@ -5051,7 +5113,8 @@ impl BranchManager {
             let log = self
                 .store
                 .action_log_path(&branch.slug, &format!("{name}.cleanup"));
-            let env = self.assemble_env(branch)?;
+            let env: Vec<(String, String)> =
+                env.into_iter().map(|var| (var.name, var.value)).collect();
             let (code, _) = run_captured(&command, &cwd, &env, &log)?;
             outcomes.push(HookOutcome {
                 resource: name.clone(),
