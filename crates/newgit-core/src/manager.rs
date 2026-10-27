@@ -179,13 +179,15 @@ pub struct InheritedCheckpoints {
 impl SpawnOutcome {
     /// Resources that did not come up ready: `Failed` (export, render, or
     /// prepare itself failed) and `Pending` (prepare never ran because a
-    /// dependency blocked it) both count. A blocked prepare is not a milder
-    /// case than a failed one — the resource is equally unusable either way,
-    /// it just failed for a reason one step upstream.
+    /// dependency blocked it) both count, and so does a `Ready` resource with
+    /// a non-empty `blocked_by` — one with no `prepare` to withhold, whose
+    /// command actions are refused all the same (#209). A blocked resource
+    /// is not a milder case than a failed one — it is equally unusable either
+    /// way, it just failed for a reason one step upstream.
     pub fn failed_resources(&self) -> Vec<&str> {
         self.resources
             .iter()
-            .filter(|resource| resource.status != ResourceStatus::Ready)
+            .filter(|resource| resource.status != ResourceStatus::Ready || resource.is_blocked())
             .map(|resource| resource.name.as_str())
             .collect()
     }
@@ -206,8 +208,16 @@ pub struct ResourceBindOutcome {
     pub status: ResourceStatus,
     /// Present when a `prepare` action ran: (succeeded, log path).
     pub prepare: Option<(bool, Utf8PathBuf)>,
-    /// Resource dependencies that prevented `prepare` from running.
+    /// Resource dependencies that were not ready when this resource was
+    /// bound. They withheld `prepare` if there was one to run, and
+    /// `newgit action` refuses this resource's command actions until they
+    /// are repaired — so a resource with any is blocked whatever its own
+    /// `status` says, and counts as not bound (#209).
     pub blocked_by: Vec<String>,
+    /// Whether `blocked_by` withheld a runnable `prepare`. False for a
+    /// blocked resource with no `prepare` to run, which is blocked all the
+    /// same but not *at* `prepare`.
+    pub prepare_withheld: bool,
     /// Export names `prepare` published through `captures`.
     pub captured: Vec<String>,
     /// One warning per declared capture `prepare` never emitted.
@@ -225,6 +235,17 @@ pub struct ResourceBindOutcome {
     /// What the install store did, when this resource declares a tree it
     /// produces. `None` means the resource is not eligible for it.
     pub install: Option<InstallReport>,
+}
+
+impl ResourceBindOutcome {
+    /// Whether a dependency kept this resource from coming up. Its own
+    /// `status` can still be `Ready` — a resource with no runnable `prepare`
+    /// is bound `Ready` because nothing was withheld from it — but every
+    /// surface that reports on it (`status`, `action`, `spawn`) says
+    /// blocked, and so does this.
+    pub fn is_blocked(&self) -> bool {
+        !self.blocked_by.is_empty()
+    }
 }
 
 /// Rendered files temporarily reverted to committed values, and the content
@@ -2297,6 +2318,7 @@ impl BranchManager {
                     status: ResourceStatus::Failed,
                     prepare: None,
                     blocked_by: std::mem::take(&mut blocked_by),
+                    prepare_withheld: false,
                     captured: Vec::new(),
                     missing_captures: Vec::new(),
                     rendered: Vec::new(),
@@ -2321,10 +2343,13 @@ impl BranchManager {
             // unready) is what keeps `admin`/`mobile`-style dependents from
             // getting stuck the moment their one blocker clears: nothing
             // ever reruns to move them off `Pending`, but nothing needs to.
-            let runnable_prepare = match definition.actions.get("prepare") {
-                Some(action) if action.command.is_some() && !action.long_running => Some(action),
-                _ => None,
-            };
+            //
+            // That `Ready` is the record's own fact about this resource, not
+            // the last word on it: `blocked_by` is derived from the graph at
+            // read time by every surface that reports on the resource, so
+            // `status`, `action`, `spawn` and `spawn --json` all call it
+            // blocked while a dependency is down (#209).
+            let runnable_prepare = definition.runnable_prepare();
             let mut captured_names = Vec::new();
             let mut missing_captures = Vec::new();
             let mut install = None;
@@ -2412,6 +2437,7 @@ impl BranchManager {
                 ports: resolved_ports,
                 status,
                 prepare,
+                prepare_withheld: runnable_prepare.is_some() && !blocked_by.is_empty(),
                 blocked_by,
                 captured: captured_names,
                 missing_captures,
@@ -4887,16 +4913,20 @@ impl BranchManager {
                                     // action), so this can't and doesn't claim
                                     // more than "it ran, and isn't running now."
                                     "stopped".to_owned()
+                                } else if binding.status == ResourceStatus::Failed {
+                                    // Its own failure (export, render or
+                                    // prepare) comes first, as it does in
+                                    // `spawn` and `spawn --json`: repairing a
+                                    // dependency would not fix it.
+                                    "failed".to_owned()
                                 } else {
                                     let blocked_by = self.blocked_dependencies(&branch, definition);
                                     if !blocked_by.is_empty() {
                                         format!("blocked({})", blocked_by.join(","))
+                                    } else if binding.status == ResourceStatus::Pending {
+                                        "pending".to_owned()
                                     } else {
-                                        match binding.status {
-                                            ResourceStatus::Pending => "pending".to_owned(),
-                                            ResourceStatus::Ready => "ready".to_owned(),
-                                            ResourceStatus::Failed => "failed".to_owned(),
-                                        }
+                                        "ready".to_owned()
                                     }
                                 }
                             }
