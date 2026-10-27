@@ -6046,18 +6046,12 @@ impl BranchManager {
             let was_running = self.supervisor(branch).running_pid(name).is_some();
             // A safety checkpoint minted ahead of an undo captures whatever
             // is there so redo has something to restore to. But a resource
-            // whose last restore already failed is known-broken, not merely
-            // unobserved — running its checkpoint command (a `pg_dump`, say)
-            // against it spends real time and I/O dumping rubble nobody is
-            // likely to ask to go back to. Explicit checkpoints still run
-            // it: a person asked for that one on purpose (#58).
-            // A safety checkpoint minted ahead of an undo captures whatever
-            // is there so redo has something to restore to. But a resource
-            // whose last restore already failed is known-broken, not merely
-            // unobserved — running its checkpoint command (a `pg_dump`, say)
-            // against it spends real time and I/O dumping rubble nobody is
-            // likely to ask to go back to. Explicit checkpoints still run
-            // it: a person asked for that one on purpose (#58).
+            // that is already failed — its last prepare or restore did not
+            // succeed — is known-broken, not merely unobserved: running its
+            // checkpoint command (a `pg_dump`, say) against it spends real
+            // time and I/O dumping rubble nobody is likely to ask to go back
+            // to. Explicit checkpoints still run it: a person asked for that
+            // one on purpose (#58).
             //
             // But a resource that is not up — its prepare or last restore
             // failed, or a dependency of it did — must not take the whole
@@ -6069,9 +6063,9 @@ impl BranchManager {
                 && binding.status == ResourceStatus::Failed
             {
                 warnings.push(format!(
-                    "resource `{name}` is in a failed state from its last restore; skipped its \
-                     checkpoint capture rather than run an expensive command against \
-                     known-broken state"
+                    "resource `{name}` is in a failed state (its last prepare or restore did not \
+                     succeed); skipped its checkpoint capture rather than run an expensive \
+                     command against known-broken state"
                 ));
                 degraded.push(name.clone());
                 CapturedResource::none()
@@ -7351,11 +7345,17 @@ impl BranchManager {
                 &mut warnings,
             )?;
             if let Some(binding) = branch.resources.get_mut(name) {
-                binding.status = if ok {
-                    ResourceStatus::Ready
-                } else {
-                    ResourceStatus::Failed
-                };
+                // Only a restore that ran something can have brought the
+                // resource up. One that ran nothing — `none`, `external`, no
+                // `[restore]`, a recompute skipped on unchanged identity —
+                // left it as it found it, so it keeps the status it came in
+                // with: a `prepare` that failed, or never ran behind a failed
+                // dependency, has still not succeeded.
+                if !ok {
+                    binding.status = ResourceStatus::Failed;
+                } else if exercised {
+                    binding.status = ResourceStatus::Ready;
+                }
                 // Sticky once true: this answers "has restore ever
                 // completed", not "would it complete right now". A skip (no
                 // command ran) or a later failure must not erase a proof
