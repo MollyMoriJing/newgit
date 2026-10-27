@@ -833,7 +833,8 @@ pub struct UndoTrackerOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UndoResourceOutcome {
     /// What the restore did, for display: `none`, `recompute(prepare)`,
-    /// `command`, `external (no-op)`; `+ restarted` when a process came back.
+    /// `command`, `external (no-op)`, `not restored` for one whose checkpoint
+    /// holds no state for it; `+ restarted` when a process came back.
     pub action: String,
     pub name: String,
     /// Whether the restore action itself succeeded. A restore that runs
@@ -7594,57 +7595,48 @@ impl BranchManager {
                 continue;
             }
             let definition = self.resource_definition(name)?;
-            if left_alone.contains(name.as_str()) {
-                let mut note = format!(
+            let was_left_alone = left_alone.contains(name.as_str());
+            let (mut action_label, ok, exercised) = if was_left_alone {
+                warnings.push(format!(
                     "checkpoint {} holds no state for resource `{name}`, so this undo left it as \
                      it is",
                     restored.id
-                );
-                // Its process, though, was stopped above with everything
-                // else, and comes back as it was found: here, after its
-                // dependencies, so it starts on the config just re-rendered
-                // and against their restored state.
-                if stopped.contains(name.as_str()) {
-                    match self.restart_long_running(&branch, definition) {
-                        Ok(true) => note.push_str(", restarting what it was running"),
-                        Ok(false) => note.push_str(
-                            "; it was running, but has no long-running action to restart",
-                        ),
-                        Err(error) => failures.push(RestoreFailure {
-                            resource: name.clone(),
-                            detail: format!("restart failed: {error}"),
-                            log: None,
-                            retry_with: format!("newgit action {name}.start {}", branch.name),
-                        }),
-                    }
-                }
-                warnings.push(note);
-                continue;
-            }
-            if definition.definition_rev != state.definition_rev {
-                warnings.push(format!(
-                    "resource `{name}` definition changed since the checkpoint; restored with \
-                     the current definition"
                 ));
-            }
+                // Its process, though, was stopped above with everything
+                // else, and comes back as it was found: below, after its
+                // dependencies, so it starts on the config just re-rendered
+                // and against their restored state. One this undo did not
+                // stop, it did not touch, and does not report.
+                if !stopped.contains(name.as_str()) {
+                    continue;
+                }
+                ("not restored".to_owned(), true, false)
+            } else {
+                if definition.definition_rev != state.definition_rev {
+                    warnings.push(format!(
+                        "resource `{name}` definition changed since the checkpoint; restored \
+                         with the current definition"
+                    ));
+                }
 
-            let pre_undo = safety
-                .record
-                .resource_states
-                .iter()
-                .find(|pre| &pre.name == name)
-                .and_then(|pre| pre.state_ref.as_deref());
-            let (mut action_label, ok, exercised) = self.restore_resource(
-                &mut branch,
-                definition,
-                state,
-                RestoreContext {
-                    pre_undo_state_ref: pre_undo,
-                    force_recompute: options.force_recompute,
-                },
-                &mut failures,
-                &mut warnings,
-            )?;
+                let pre_undo = safety
+                    .record
+                    .resource_states
+                    .iter()
+                    .find(|pre| &pre.name == name)
+                    .and_then(|pre| pre.state_ref.as_deref());
+                self.restore_resource(
+                    &mut branch,
+                    definition,
+                    state,
+                    RestoreContext {
+                        pre_undo_state_ref: pre_undo,
+                        force_recompute: options.force_recompute,
+                    },
+                    &mut failures,
+                    &mut warnings,
+                )?
+            };
             if let Some(binding) = branch.resources.get_mut(name) {
                 // Only a restore that ran something can have brought the
                 // resource up. One that ran nothing — `none`, `external`, no
@@ -7667,12 +7659,17 @@ impl BranchManager {
             }
 
             let mut restart_failed = false;
-            if ok && state.was_running {
+            if was_left_alone || (ok && state.was_running) {
+                let when = if was_left_alone {
+                    "before this undo"
+                } else {
+                    "at checkpoint time"
+                };
                 match self.restart_long_running(&branch, definition) {
                     Ok(true) => action_label.push_str(" + restarted"),
                     Ok(false) => warnings.push(format!(
-                        "resource `{name}` was running at checkpoint time but has no \
-                         long-running action to restart"
+                        "resource `{name}` was running {when} but has no long-running action to \
+                         restart"
                     )),
                     Err(error) => {
                         restart_failed = true;

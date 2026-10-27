@@ -16,12 +16,13 @@
   the checkpoint is `command` or `external` and the restore is a `command`,
   the undo now leaves that restore out: the resource keeps its state and
   status, and a warning names it. A process it was running is still
-  stopped with the rest and started again after its dependencies, and a
-  restart that fails is reported like any other. That holds for
-  checkpoints taken before this fix too. A `recompute` restore still
-  rebuilds such a resource, since it ignores the ref. `newgit undo` prints
-  no `resource:` line for a restore it leaves out, `spawn
-  --from-checkpoint --json` reports that resource's `action` and `ok` as
+  stopped with the rest and started again after its dependencies, and the
+  undo reports the resource as `not restored + restarted`; a restart that
+  fails is reported like any other. That holds for checkpoints taken
+  before this fix too. A `recompute` restore still rebuilds such a
+  resource, since it ignores the ref. `newgit undo` prints no `resource:`
+  line for a resource it leaves out and did not stop, `spawn
+  --from-checkpoint --json` reports such a resource's `action` and `ok` as
   null, and `checkpoint --verify` reports a resource it could not capture
   as `NOT CAPTURED` when its restore runs something, and does not call the
   instance verified.

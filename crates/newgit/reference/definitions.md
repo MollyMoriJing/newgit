@@ -378,8 +378,9 @@ resource's restore when it is a `command` reading what a `command` or
 `external` checkpoint records, since there is no dump or handle to read: the
 resource keeps its state and status. A process it was running is still
 stopped with the others while content changes, and started again after its
-dependencies. Any other restore runs as usual and misses nothing it needs: a
-`recompute` rebuilds from the restored source and ignores the ref.
+dependencies; the undo then reports it as `not restored + restarted`. Any
+other restore runs as usual and misses nothing it needs: a `recompute`
+rebuilds from the restored source and ignores the ref.
 
 A `recompute` restore skips when this resource's `[identity]` hash is the same
 now as at the checkpoint: the tree was already built from those inputs, so the

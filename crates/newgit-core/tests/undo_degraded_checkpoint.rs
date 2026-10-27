@@ -194,7 +194,8 @@ fn an_undo_to_a_degraded_checkpoint_leaves_the_resource_as_it_is() {
 
 /// Left alone is not left running: nothing may run while the undo rewinds
 /// content and re-renders config underneath it. Its process is stopped with
-/// everyone else's and started again, as it was found, without its restore.
+/// everyone else's and started again, as it was found, without its restore,
+/// and the undo reports it like any resource it restarted.
 #[test]
 fn an_undo_restarts_what_a_left_alone_resource_was_running() {
     let (_guard, temp) = tempdir();
@@ -241,6 +242,78 @@ signal = "term"
     assert_eq!(runs(&restored), "", "the restore still never runs");
     assert_eq!(status_of(&m, "feature-a", "db"), ResourceStatus::Failed);
     assert!(undo.is_complete(), "{:?}", undo.resources);
+    let db = undo
+        .resources
+        .iter()
+        .find(|resource| resource.name == "db")
+        .expect("reported, since the undo stopped it");
+    assert_eq!(db.action, "not restored + restarted");
+    assert!(db.ok && !db.restart_failed, "{db:?}");
+    assert_eq!(db.status, ResourceStatus::Failed, "as it was found: {db:?}");
+}
+
+/// A restart that fails is one like any other: the resource is marked failed
+/// where it happens, and the undo is not complete. Here the database came up
+/// after the checkpoint went ahead without it, so it is `Ready` going in.
+#[test]
+fn a_left_alone_resource_whose_restart_fails_is_marked_failed() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let restored = temp.join("restored.txt");
+    let up = temp.join("database-up");
+    let db = |workdir: &str| {
+        format!(
+            r#"ownership = "branch"
+
+[actions.prepare]
+command = "test -f {up}"
+
+[actions.start]
+command = "sleep 30"
+long_running = true
+workdir = "{workdir}"
+
+[actions.stop]
+signal = "term"
+
+[checkpoint]
+mode = "command"
+command = "test -f {up} && echo dump"
+
+[restore]
+mode = "command"
+command = "echo state_ref={{{{state_ref}}}} >> {restored}"
+"#
+        )
+    };
+    write_resource(&store, "db", &db("."));
+    let resources = store.paths().resources.clone();
+    let m = manager(store);
+    m.spawn("feature-a", None).expect("spawn");
+    let checkpoint = m.checkpoint("feature-a", None).expect("checkpoint");
+    assert_eq!(checkpoint.degraded, vec!["db"]);
+    std::fs::write(&up, "").expect("up");
+    m.run_action("feature-a", "db.prepare").expect("prepare");
+    m.run_action("feature-a", "db.start").expect("start");
+    assert_eq!(status_of(&m, "feature-a", "db"), ResourceStatus::Ready);
+
+    // Point the start at a workdir that does not exist, so the restart the
+    // undo attempts fails before anything runs.
+    std::fs::write(resources.join("db.toml"), db("missing")).expect("rewrite");
+    let m = BranchManager::open(m.store().clone()).expect("reopen");
+    let undo = m.undo("feature-a", &UndoOptions::default()).expect("undo");
+
+    assert_eq!(runs(&restored), "", "the restore still never runs");
+    let db = undo
+        .resources
+        .iter()
+        .find(|resource| resource.name == "db")
+        .expect("reported");
+    assert!(db.ok && db.restart_failed, "{db:?}");
+    assert_eq!(db.status, ResourceStatus::Failed, "{db:?}");
+    assert!(!undo.is_complete());
+    assert!(undo.recovery_record.is_some());
+    assert_eq!(status_of(&m, "feature-a", "db"), ResourceStatus::Failed);
 }
 
 /// `checkpoint --verify` restores with a real undo, so it leaves the resource

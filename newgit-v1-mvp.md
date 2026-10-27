@@ -1434,10 +1434,11 @@ checkpoint` said when it named the resource `degraded`. It would have
 nothing to restore from, and the bundled database restores drop or reset
 the database before they read the dump. A process the resource was running
 is still stopped with the others, and started again after its
-dependencies. Any other restore runs as usual: a `recompute` rebuilds from
-the restored source and ignores the ref. A `command` restore whose
-`{{state_ref}}` has no value in the checkpoint is not run either, and counts
-as a failed restore.
+dependencies, and the undo reports it as `not restored + restarted`. Any
+other restore runs as usual: a `recompute` rebuilds from the restored
+source and ignores the ref. A `command` restore whose `{{state_ref}}` has
+no value in the checkpoint is not run either, and counts as a failed
+restore.
 
 Source restore is pure Git in v1; `jj` delegation can come with the jj
 substrate work.
