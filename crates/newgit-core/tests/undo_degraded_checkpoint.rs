@@ -10,6 +10,7 @@
 //! conventions, rather than appended to an existing integration test file.
 
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::SourceSubstrate;
@@ -123,6 +124,19 @@ fn runs(path: &Utf8Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
+/// What `path` holds once it has `lines` lines, waiting up to five seconds
+/// for a process that has only just been started to write its own.
+fn once_it_has(path: &Utf8Path, lines: usize) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let text = runs(path);
+        if text.lines().count() >= lines || Instant::now() >= deadline {
+            return text;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn an_undo_to_a_degraded_checkpoint_leaves_the_resource_as_it_is() {
     let (_guard, temp) = tempdir();
@@ -178,10 +192,11 @@ fn an_undo_to_a_degraded_checkpoint_leaves_the_resource_as_it_is() {
     assert!(redo.is_complete(), "{:?}", redo.resources);
 }
 
-/// "As it is" includes its process: the undo neither stops nor restarts a
-/// resource it is leaving alone.
+/// Left alone is not left running: nothing may run while the undo rewinds
+/// content and re-renders config underneath it. Its process is stopped with
+/// everyone else's and started again, as it was found, without its restore.
 #[test]
-fn an_undo_to_a_degraded_checkpoint_leaves_its_process_running() {
+fn an_undo_restarts_what_a_left_alone_resource_was_running() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
     let restored = temp.join("restored.txt");
@@ -212,14 +227,20 @@ signal = "term"
     let checkpoint = m.checkpoint("feature-a", None).expect("checkpoint");
     assert_eq!(checkpoint.degraded, vec!["db"]);
 
-    m.undo("feature-a", &UndoOptions::default()).expect("undo");
+    let undo = m.undo("feature-a", &UndoOptions::default()).expect("undo");
 
+    let started = once_it_has(&starts, 2);
     let slug = m.store().find_branch("feature-a").expect("instance").slug;
     let running = Supervisor::new(m.store().instance_state_dir(&slug)).running_pid("db");
     m.run_action("feature-a", "db.stop").expect("stop");
-    assert_eq!(running, Some(pid), "the same process, never stopped");
-    assert_eq!(runs(&starts), "started\n", "and never restarted");
-    assert_eq!(runs(&restored), "");
+    assert!(
+        running.is_some_and(|running| running != pid),
+        "stopped and started again: was {pid}, now {running:?}"
+    );
+    assert_eq!(started, "started\nstarted\n");
+    assert_eq!(runs(&restored), "", "the restore still never runs");
+    assert_eq!(status_of(&m, "feature-a", "db"), ResourceStatus::Failed);
+    assert!(undo.is_complete(), "{:?}", undo.resources);
 }
 
 /// `checkpoint --verify` restores with a real undo, so it leaves the resource
@@ -343,4 +364,56 @@ mode = "recompute"
         .expect("restored");
     assert_eq!(deps.action, "recompute(prepare)", "{:?}", redo.resources);
     assert_eq!(runs(&builds), "built\nbuilt\n");
+}
+
+/// The same holds for a `command` checkpoint paired with a `recompute`
+/// restore, which the definition rules allow because a `recompute` ignores
+/// the ref: the checkpoint goes ahead without the resource, and the undo
+/// still rebuilds it from the inputs it puts back.
+#[test]
+fn a_recompute_behind_a_skipped_command_checkpoint_still_rebuilds() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let allowed = temp.join("install-allowed");
+    let builds = temp.join("builds.txt");
+    write_resource(
+        &store,
+        "deps",
+        &format!(
+            r#"ownership = "workspace"
+
+[actions.prepare]
+command = "test -f {allowed} && echo built >> {builds}"
+
+[checkpoint]
+mode = "command"
+command = "test -f {allowed} && echo captured"
+
+[restore]
+mode = "recompute"
+"#
+        ),
+    );
+    let m = manager(store);
+    assert_eq!(
+        m.spawn("feature-a", None)
+            .expect("spawn")
+            .failed_resources(),
+        vec!["deps"]
+    );
+    let checkpoint = m.checkpoint("feature-a", None).expect("checkpoint");
+    assert_eq!(checkpoint.degraded, vec!["deps"]);
+    std::fs::write(&allowed, "").expect("allow");
+
+    let undo = m.undo("feature-a", &UndoOptions::default()).expect("undo");
+
+    let deps = undo
+        .resources
+        .iter()
+        .find(|resource| resource.name == "deps")
+        .expect("restored");
+    assert_eq!(deps.action, "recompute(prepare)", "{:?}", undo.resources);
+    assert!(undo.is_complete(), "{:?}", undo.resources);
+    assert_eq!(runs(&builds), "built\n");
+    assert_eq!(status_of(&m, "feature-a", "deps"), ResourceStatus::Ready);
 }

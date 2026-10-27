@@ -373,11 +373,13 @@ checkpoint that printed nothing, is not something reading the current file can
 predict.
 
 A checkpoint goes ahead without a resource that is not up and whose capture
-fails, and names it on a `degraded:` line. An undo to it leaves that resource
-as it finds it — not stopped, restored, or restarted — when its `[checkpoint]`
-is `command` or `external`, since the checkpoint holds no dump or handle to
-restore it from. Under a `hash` or `none` checkpoint, the restore runs as
-usual: what the checkpoint left out is nothing it needs.
+fails, and names it on a `degraded:` line. An undo to it does not run that
+resource's restore when it is a `command` reading what a `command` or
+`external` checkpoint records, since there is no dump or handle to read: the
+resource keeps its state and status. A process it was running is still
+stopped with the others while content changes, and started again after its
+dependencies. Any other restore runs as usual and misses nothing it needs: a
+`recompute` rebuilds from the restored source and ignores the ref.
 
 A `recompute` restore skips when this resource's `[identity]` hash is the same
 now as at the checkpoint: the tree was already built from those inputs, so the

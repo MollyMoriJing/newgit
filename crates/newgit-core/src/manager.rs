@@ -7210,15 +7210,15 @@ impl BranchManager {
         // A checkpoint that went ahead without a resource that was not up —
         // degraded, see `checkpoint_branch` — records `mode = "none"` for it
         // and says an undo to it leaves that resource as it finds it. For a
-        // resource whose `[checkpoint]` records state, `none` holds nothing
-        // to restore it from, whether it was left out or the definition
-        // captured nothing yet when the checkpoint was taken. Running its
-        // restore anyway can lose the database: a `command` restore is handed
-        // a literal `{{state_ref}}`, and the bundled templates drop or reset
-        // the database before they read the dump. So the undo leaves such a
-        // resource as it finds it — not stopped, restored, or restarted. A
-        // `hash` checkpoint left out loses nothing a restore reads: its
-        // `recompute` rebuilds from the inputs put back below.
+        // resource whose restore reads what its checkpoint records, `none`
+        // holds nothing to restore it from, whether it was left out or the
+        // definition captured nothing yet when the checkpoint was taken.
+        // Running that restore anyway can lose the database: it is handed a
+        // literal `{{state_ref}}`, and the bundled templates drop or reset
+        // the database before they read the dump. So the undo does not run
+        // it, and the resource keeps its state and status. Any other restore
+        // loses nothing by the ref's absence and runs as usual: a `recompute`
+        // rebuilds from the inputs put back below.
         let left_alone: BTreeSet<&str> = restored
             .resource_states
             .iter()
@@ -7226,22 +7226,20 @@ impl BranchManager {
                 state.mode == "none"
                     && self
                         .resource_definition(&state.name)
-                        .is_ok_and(ResourceDefinition::checkpoint_records_state)
+                        .is_ok_and(ResourceDefinition::restore_reads_checkpoint)
             })
             .map(|state| state.name.as_str())
             .collect();
 
         // Nothing may keep running while content changes underneath it. A
         // partial undo leaves every other resource alone, so it must not stop
-        // them either, and no undo stops one it leaves alone above: none of
-        // its own state is restored.
+        // them either.
         let supervisor = self.supervisor(&branch);
+        let mut stopped = BTreeSet::new();
         for definition in &self.resources {
-            if wanted(&definition.name)
-                && !left_alone.contains(definition.name.as_str())
-                && supervisor.running_pid(&definition.name).is_some()
-            {
+            if wanted(&definition.name) && supervisor.running_pid(&definition.name).is_some() {
                 supervisor.stop(&definition.name, &definition.stop_signal())?;
+                stopped.insert(definition.name.as_str());
             }
         }
 
@@ -7377,15 +7375,34 @@ impl BranchManager {
             if !branch.resources.contains_key(name) || !wanted(name) {
                 continue;
             }
+            let definition = self.resource_definition(name)?;
             if left_alone.contains(name.as_str()) {
-                warnings.push(format!(
+                let mut note = format!(
                     "checkpoint {} holds no state for resource `{name}`, so this undo left it as \
                      it is",
                     restored.id
-                ));
+                );
+                // Its process, though, was stopped above with everything
+                // else, and comes back as it was found: here, after its
+                // dependencies, so it starts on the config just re-rendered
+                // and against their restored state.
+                if stopped.contains(name.as_str()) {
+                    match self.restart_long_running(&branch, definition) {
+                        Ok(true) => note.push_str(", restarting what it was running"),
+                        Ok(false) => note.push_str(
+                            "; it was running, but has no long-running action to restart",
+                        ),
+                        Err(error) => failures.push(RestoreFailure {
+                            resource: name.clone(),
+                            detail: format!("restart failed: {error}"),
+                            log: None,
+                            retry_with: format!("newgit action {name}.start {}", branch.name),
+                        }),
+                    }
+                }
+                warnings.push(note);
                 continue;
             }
-            let definition = self.resource_definition(name)?;
             if definition.definition_rev != state.definition_rev {
                 warnings.push(format!(
                     "resource `{name}` definition changed since the checkpoint; restored with \

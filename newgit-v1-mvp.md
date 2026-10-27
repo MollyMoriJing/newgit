@@ -1427,11 +1427,15 @@ checkpoint (`<id>.recovery.toml`) with logs and a retry command, and the
 resource is marked failed.
 
 A resource the checkpoint holds no state for, such as one it went ahead
-without because the resource was not up, is left as the undo finds it when
-its `[checkpoint]` is `command` or `external`: not stopped, restored, or
-restarted, as `newgit checkpoint` said it would be. Its restore has nothing
-to restore from, and the bundled database restores drop or reset the
-database before they read the dump. A `command` restore whose
+without because the resource was not up, keeps its state and status when
+its restore is a `command` reading what a `command` or `external`
+checkpoint records: the undo does not run that restore, as `newgit
+checkpoint` said when it named the resource `degraded`. It would have
+nothing to restore from, and the bundled database restores drop or reset
+the database before they read the dump. A process the resource was running
+is still stopped with the others, and started again after its
+dependencies. Any other restore runs as usual: a `recompute` rebuilds from
+the restored source and ignores the ref. A `command` restore whose
 `{{state_ref}}` has no value in the checkpoint is not run either, and counts
 as a failed restore.
 

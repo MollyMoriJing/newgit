@@ -313,15 +313,19 @@ impl ResourceDefinition {
             .map_or("prepare", |restore| restore.recompute_action())
     }
 
-    /// Whether `[checkpoint]` records state that a restore puts back: a
-    /// `command` checkpoint's dump or ref, an `external` handle. `none`
-    /// records nothing, and a `hash` only identifies the inputs a `recompute`
-    /// rebuilds from.
-    pub fn checkpoint_records_state(&self) -> bool {
+    /// Whether `[restore]` reads back what `[checkpoint]` records: a
+    /// `command` restore, after a `command` checkpoint's dump or ref or an
+    /// `external` handle. A `recompute` rebuilds from the restored inputs
+    /// and ignores the ref, `none` and `external` restores run nothing, and
+    /// a `none` or `hash` checkpoint records nothing a command is handed.
+    pub fn restore_reads_checkpoint(&self) -> bool {
         matches!(
             self.checkpoint_mode(),
             CheckpointMode::Command | CheckpointMode::External
-        )
+        ) && self
+            .restore
+            .as_ref()
+            .is_some_and(|restore| restore.mode == RestoreMode::Command)
     }
 
     fn validate(&self) -> Result<()> {
