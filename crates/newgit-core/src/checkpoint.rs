@@ -141,9 +141,9 @@ impl ResourceState {
     /// resolves to nothing at all: it is the content hash of `[identity]
     /// paths`, which says whether the inputs moved and never identifies a
     /// concrete thing to restore or tear down. Leaving `{{state_ref}}`
-    /// unresolved is what makes that visible — verbatim in a restore command,
-    /// and a refusal in a cleanup hook, which is where handing over a
-    /// meaningless argument would do damage.
+    /// unresolved is what makes that visible: a restore command or a cleanup
+    /// hook that uses it is refused rather than run, since either one handed
+    /// a meaningless argument does damage.
     pub fn consumable_state_ref(&self) -> Option<String> {
         if let Some(path) = &self.state_path {
             return Some(path.to_string());

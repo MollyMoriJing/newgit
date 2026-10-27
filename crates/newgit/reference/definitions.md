@@ -364,10 +364,20 @@ records, and it loads. So do pairings that are merely inert — a `command`
 checkpoint with a `recompute` restore ignores the ref it recorded, but the
 record still reads back in `newgit checkpoints`.
 
-A `[cleanup]` hook is also refused *at teardown* if its `{{state_ref}}` has no
-value — see `[cleanup]`. The load-time rules above cannot catch everything the
-runtime one does: a checkpoint record written under an older definition is not
-something reading the current file can predict.
+A `[restore]` command is also refused *at undo* if its `{{state_ref}}` has no
+value in the checkpoint being restored, and the undo counts that resource as
+not restored; a `[cleanup]` hook is refused *at teardown* the same way — see
+`[cleanup]`. The load-time rules above cannot catch everything the runtime ones
+do: a checkpoint record written under an older definition, or by a `command`
+checkpoint that printed nothing, is not something reading the current file can
+predict.
+
+A checkpoint goes ahead without a resource that is not up and whose capture
+fails, and names it on a `degraded:` line. An undo to it leaves that resource
+as it finds it — not stopped, restored, or restarted — when its `[checkpoint]`
+is `command` or `external`, since the checkpoint holds no dump or handle to
+restore it from. Under a `hash` or `none` checkpoint, the restore runs as
+usual: what the checkpoint left out is nothing it needs.
 
 A `recompute` restore skips when this resource's `[identity]` hash is the same
 now as at the checkpoint: the tree was already built from those inputs, so the

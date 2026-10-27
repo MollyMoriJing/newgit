@@ -313,6 +313,17 @@ impl ResourceDefinition {
             .map_or("prepare", |restore| restore.recompute_action())
     }
 
+    /// Whether `[checkpoint]` records state that a restore puts back: a
+    /// `command` checkpoint's dump or ref, an `external` handle. `none`
+    /// records nothing, and a `hash` only identifies the inputs a `recompute`
+    /// rebuilds from.
+    pub fn checkpoint_records_state(&self) -> bool {
+        matches!(
+            self.checkpoint_mode(),
+            CheckpointMode::Command | CheckpointMode::External
+        )
+    }
+
     fn validate(&self) -> Result<()> {
         self.check_identity_paths()?;
         if let Some(checkpoint) = &self.checkpoint {
@@ -641,10 +652,11 @@ impl ResourceDefinition {
     /// a no-op, it is a wrong argument.
     ///
     /// Both are decidable from the definition alone, so both are refused
-    /// where the mistake was made. The guard that refuses a cleanup hook with
-    /// an unresolved placeholder still stands behind this: it catches the
-    /// same mistake in a record written under an older definition, which no
-    /// amount of reading the current one can predict.
+    /// where the mistake was made. The guards that refuse a cleanup hook with
+    /// an unresolved placeholder, and a restore command whose `{{state_ref}}`
+    /// has no value, still stand behind this: they catch the same mistake in
+    /// a record written under an older definition, which no amount of
+    /// reading the current one can predict.
     fn check_state_ref_is_recordable(&self) -> Result<()> {
         let hint = match self.checkpoint_mode() {
             CheckpointMode::None if self.checkpoint.is_some() => {
