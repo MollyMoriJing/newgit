@@ -445,7 +445,7 @@ struct ExportArgs {
     #[arg(long = "exclude", value_name = "PATH")]
     excludes: Vec<Utf8PathBuf>,
     /// With --remote: replace the target branch even when the export does not
-    /// descend from it
+    /// descend from it, rather than bringing in what the target has first
     #[arg(long, requires = "remote")]
     force: bool,
     /// With --remote: compose and check, but push nothing
@@ -2387,7 +2387,14 @@ fn undo(instance: Option<String>, options: UndoOptions) -> Result<()> {
     // half-failed undo leaves its resource in neither the pre-undo state nor
     // the checkpoint state — saying "Restored" and "FAILED" about the same
     // operation sends you looking at your script instead of at the resource.
-    let failed = outcome.failed_resources();
+    // Not `failed_resources()`, which is restores only: a resource whose
+    // restore was ok but whose restart failed was not brought back either.
+    let failed: Vec<&str> = outcome
+        .resources
+        .iter()
+        .filter(|resource| !resource.ok || resource.restart_failed)
+        .map(|resource| resource.name.as_str())
+        .collect();
     if outcome.partial && outcome.is_complete() {
         // Never says "Restored `<instance>`": no source and no tracker content
         // moved, so the instance as a whole is not at this checkpoint and
@@ -2450,8 +2457,32 @@ fn undo(instance: Option<String>, options: UndoOptions) -> Result<()> {
     }
     for resource in &outcome.resources {
         let verdict = if resource.ok { "ok" } else { "FAILED" };
+        // The verdict is on the restore action, and a restore that runs
+        // nothing (`none`, `external`, no `[restore]`) is always ok — it
+        // does not bring a resource up. Under "Restored" a bare `ok` reads
+        // as the resource being fine, so when it is not, say the status it
+        // is left in, the one `newgit status` will show.
+        let restart = if resource.restart_failed {
+            ", restart FAILED"
+        } else {
+            ""
+        };
+        // Derived the way `status` derives it: a resource behind a
+        // dependency that is not ready reads as blocked, whatever its own
+        // status. A failed restore or restart has already said "failed".
+        let left = if !resource.blocked_by.is_empty() {
+            format!(", left blocked by {}", resource.blocked_by.join(", "))
+        } else if !resource.ok || resource.restart_failed {
+            String::new()
+        } else {
+            match resource.status {
+                ResourceStatus::Ready => String::new(),
+                ResourceStatus::Failed => ", left failed".to_owned(),
+                ResourceStatus::Pending => ", left pending".to_owned(),
+            }
+        };
         println!(
-            "  resource: {} {} {verdict}",
+            "  resource: {} {} {verdict}{restart}{left}",
             resource.name, resource.action
         );
     }
@@ -2634,6 +2665,24 @@ fn export_to_remote(name: &str, options: RemoteExportOptions) -> Result<()> {
     let outcome = manager.export_to_remote(name, options)?;
     let target = &outcome.target;
 
+    if outcome.pulled > 0 {
+        let commits = if outcome.pulled == 1 {
+            "1 commit".to_owned()
+        } else {
+            format!("{} commits", outcome.pulled)
+        };
+        if outcome.pushed {
+            println!(
+                "Brought in {commits} from {} (branch {}) first: merged into `main`",
+                outcome.url, target.branch
+            );
+        } else {
+            println!(
+                "Would bring in {commits} from {} (branch {}) first, merging them into `main` (dry run)",
+                outcome.url, target.branch
+            );
+        }
+    }
     let verb = if outcome.pushed {
         "Exported"
     } else {

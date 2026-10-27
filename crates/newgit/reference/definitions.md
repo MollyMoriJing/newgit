@@ -463,7 +463,7 @@ against an instance you can afford to spend, not one you are mid-task on.
 | --- | --- | --- | --- | --- |
 | `command` | string | no | none | tears the concrete resource down. Runs at `newgit remove`, and at `newgit cleanup` for an instance whose workspace is gone, dependents before dependencies. A `[cleanup]` section without one means there is nothing to do, and teardown says so. |
 
-Two rules constrain it, both deliberately:
+Three rules constrain it, all deliberately:
 
 - **Ownership decides whether it runs at all.** A `project`- or `user`-owned
   resource is shared beyond the instance, so per-branch teardown skips its
@@ -475,6 +475,15 @@ Two rules constrain it, both deliberately:
   `[identity] paths`, which says whether the inputs moved and never names a
   concrete thing to tear down, so `{{state_ref}}` stays unresolved and the
   hook is refused rather than handed `hash:0fa284b468`.
+- **A name with two values refuses.** Teardown is the way out of a resource
+  graph that does not resolve, so it runs on one, and its hooks get the
+  environment layered in whatever order the graph has. The exception is a
+  name two declarations claim, when both reach the instance with different
+  values, as when a port's `env` is renamed onto a name another of its
+  resources sets: the hook would get whichever is layered last, so
+  `newgit remove` and `newgit cleanup` refuse to tear the instance down,
+  naming the collision. A collision that does not reach the instance, such
+  as one with a resource added after the spawn, does not block it.
 
 ### `[exports]`
 
@@ -793,6 +802,17 @@ as much an input as the lockfile it reads, so editing `npm ci` to `npm ci
 entries built before it. That is the right way to be wrong: a stale entry
 costs one reinstall and `newgit cleanup` reclaims it.
 
+**So are the trackers the instance binds.** A shared lockfile lists every
+member, bound or not, and its install builds the bound ones: named by
+`{{bound.paths}}`, or found on disk, where a dropped tracker's files are not
+checked out (an unfiltered `npm ci` links a workspace member only when it is
+there). So what `{{bound.trackers}}` and `{{bound.paths}}` render to is in
+every resource's key, whether its commands mention them or not, and the store
+never fills an instance that drops a tracker with the tree built for one that
+binds it. The cost is the same trade again: instances whose bindings differ
+never share a tree, even one the binding cannot change, so each binding
+installs once.
+
 **An undo is filled from it too.** The rebuild a `recompute` restore triggers
 is the expensive one — a full reinstall in the middle of an operation someone
 is waiting on. Undo restores source first, so by the time the resource is
@@ -1080,6 +1100,16 @@ ships, its id is the original's. Dropping a tracker from the set (or a
 target that already has history of its own) rebuilds commits under new ids,
 and the push is refused until `--force` replaces the branch. `--dry-run`
 composes and checks but pushes nothing.
+
+A pull request merged on the target, or anything else pushed straight to
+its branch, comes back before the push. When the target's branch is ahead
+of the export, the project root's branch fast-forwards to it and merges into
+`main`, as `git pull` then `newgit merge main` there would, and the export
+pushes what results. That works while the target's commits are the
+project's: the project root has no commits of its own, and the target ships
+every tracker those commits touch. Otherwise the export refuses and says how
+to bring them in by hand. `--dry-run` says how many commits would come in;
+`--force` replaces the branch instead.
 
 ### Pull requests from a workspace: `branches = true`
 

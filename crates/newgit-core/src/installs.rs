@@ -12,8 +12,8 @@
 //! Three things keep it honest:
 //!
 //! - **The key is the inputs, never the tree.** `[identity] paths` plus
-//!   whatever `key_command` reports. A tree is only ever handed to an
-//!   instance whose declared inputs hash the same.
+//!   whatever `key_command` reports, and the trackers the instance binds. A
+//!   tree is only ever handed to an instance whose inputs hash the same.
 //! - **Copies fork on write.** Hardlinking *between instances* would be
 //!   faster and is what package managers do, but it is wrong here:
 //!   post-install build output lands inside these trees (`.cxx` caches,
@@ -31,6 +31,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::error::{NewgitError, Result};
+use crate::exports::Bound;
 use crate::materializer::create_dir_all;
 
 /// Names an in-progress publish. Filtered out of [`InstallStore::entries`]
@@ -373,8 +374,8 @@ impl InstallStore {
 }
 
 /// The key a built tree is stored under: the content of the resource's
-/// identity paths, whatever `key_command` reported, and the definition that
-/// built it.
+/// identity paths, whatever `key_command` reported, the trackers the instance
+/// binds, and the definition that built it.
 ///
 /// The definition is in the key because the *command* is an input to the
 /// tree, not just its declared inputs. Edit `npm ci` to `npm ci --omit=dev`
@@ -391,14 +392,40 @@ impl InstallStore {
 /// reclaims it, where a wrongly-reused one hands over a tree that does not
 /// match the command that supposedly built it.
 ///
+/// The binding is in the key because it is an input too, and one a shared
+/// lockfile does not record: the lockfile lists every member, bound or not,
+/// and its install builds the bound ones, named by `{{bound.paths}}` or
+/// found on disk, where a dropped tracker's files are not checked out.
+/// Without it, an instance that drops a member would be filled with the tree
+/// built for one that binds it. What is mixed in is what
+/// `{{bound.trackers}}` and `{{bound.paths}}` render to, so the key moves
+/// whenever either would render differently.
+///
+/// It is in every resource's key, not only those whose commands mention
+/// `{{bound…}}`, because an install can read the binding without naming it:
+/// an unfiltered `npm ci` links a workspace member only when the member is
+/// checked out. So instances that bind differently never share a tree, even
+/// one the binding cannot change, such as a package's own install in its own
+/// tracker. That is the definition's trade again: a miss costs an install,
+/// where a wrong hit hands over the wrong tree.
+///
 /// Everything is mixed rather than concatenated into the path, so adding a
 /// `key_command` later does not collide with entries built before it — the
 /// whole key moves, and the old entries simply stop being found.
-pub fn identity_key(inputs_rev: &str, key_material: Option<&str>, definition_rev: &str) -> String {
+pub fn identity_key(
+    inputs_rev: &str,
+    key_material: Option<&str>,
+    bound: &Bound,
+    definition_rev: &str,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(inputs_rev.as_bytes());
     hasher.update([0]);
     hasher.update(key_material.unwrap_or_default().as_bytes());
+    hasher.update([0]);
+    hasher.update(bound.trackers.as_bytes());
+    hasher.update([0]);
+    hasher.update(bound.paths.as_bytes());
     hasher.update([0]);
     hasher.update(definition_rev.as_bytes());
     let digest = hasher.finalize();
@@ -993,24 +1020,58 @@ mod tests {
     #[test]
     fn the_key_moves_when_any_part_of_it_does() {
         let rev = "sha256:000000000000";
-        let base = identity_key("aaaa", None, rev);
-        assert_eq!(base, identity_key("aaaa", None, rev), "and is stable");
-        assert_ne!(base, identity_key("bbbb", None, rev), "inputs move the key");
+        let both = Bound {
+            trackers: "a b".to_owned(),
+            paths: "apps/a apps/b".to_owned(),
+        };
+        let base = identity_key("aaaa", None, &both, rev);
+        assert_eq!(
+            base,
+            identity_key("aaaa", None, &both, rev),
+            "and is stable"
+        );
         assert_ne!(
             base,
-            identity_key("aaaa", Some("v24.3.0 Darwin arm64"), rev),
+            identity_key("bbbb", None, &both, rev),
+            "inputs move the key"
+        );
+        assert_ne!(
+            base,
+            identity_key("aaaa", Some("v24.3.0 Darwin arm64"), &both, rev),
             "adding key material moves it too, so old entries stop matching"
         );
         assert_ne!(
-            identity_key("aaaa", Some("v24.3.0 Darwin arm64"), rev),
-            identity_key("aaaa", Some("v22.1.0 Darwin arm64"), rev),
+            identity_key("aaaa", Some("v24.3.0 Darwin arm64"), &both, rev),
+            identity_key("aaaa", Some("v22.1.0 Darwin arm64"), &both, rev),
             "a toolchain bump is a different tree"
+        );
+        // A shared lockfile lists every member, bound or not: the same
+        // inputs build less for an instance that binds less.
+        let only_a = Bound {
+            trackers: "a".to_owned(),
+            paths: "apps/a".to_owned(),
+        };
+        assert_ne!(
+            base,
+            identity_key("aaaa", None, &only_a, rev),
+            "binding fewer trackers is a different tree"
+        );
+        // `{{bound.paths}}` can render differently over the same trackers,
+        // when one of them is redefined to own somewhere else.
+        let moved = Bound {
+            trackers: "a b".to_owned(),
+            paths: "apps/a packages/b".to_owned(),
+        };
+        assert_ne!(
+            base,
+            identity_key("aaaa", None, &moved, rev),
+            "a tracker's paths are part of what the install sees"
         );
         // The command that builds the tree is as much an input as the
         // lockfile it reads: same inputs, edited `prepare`, different tree.
         assert_ne!(
             base,
-            identity_key("aaaa", None, "sha256:111111111111"),
+            identity_key("aaaa", None, &both, "sha256:111111111111"),
             "an edited definition must not reuse the tree the old one built"
         );
     }
