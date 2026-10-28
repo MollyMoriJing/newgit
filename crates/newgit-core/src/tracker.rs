@@ -1,4 +1,4 @@
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -13,9 +13,10 @@ pub struct TrackerDefinition {
     pub storage: Storage,
     /// Whether a source merge should carry this tracker binding with it.
     pub merge_with_source: bool,
-    /// Workspace-relative paths this tracker owns. May be empty for lanes
-    /// that only receive deposits (e.g. `db-snapshots`). `.` means everything
-    /// no more specific tracker owns — the `root` tracker.
+    /// Workspace-relative paths this tracker owns, as [`normalize_path`]
+    /// spells them. May be empty for lanes that only receive deposits (e.g.
+    /// `db-snapshots`). `.` means everything no more specific tracker owns —
+    /// the `root` tracker.
     pub paths: Vec<Utf8PathBuf>,
     /// Kept out of Git entirely: excluded in every workspace, never committed,
     /// captured by newgit from the files. True unless a definition says
@@ -115,8 +116,33 @@ impl TrackerDefinition {
             audience,
             storage,
             merge_with_source,
-            paths,
+            paths: paths.iter().map(|path| normalize_path(path)).collect(),
             secret: true,
+            maintainers: None,
+            role: None,
+            priority: 0,
+            requires: Vec::new(),
+            resources: Vec::new(),
+            excluded: Vec::new(),
+            definition_rev: String::new(),
+        };
+        definition.validate()?;
+        definition.definition_rev = definition.compute_definition_rev()?;
+        Ok(definition)
+    }
+
+    /// A code tracker as `newgit tracker create --code` writes it: committed,
+    /// merged with the work that changes it. Checked as one from the start,
+    /// since a code tracker may own what a secret one may not: another
+    /// tracker's definition.
+    pub fn code(name: &str, audience: String, paths: &[Utf8PathBuf]) -> Result<Self> {
+        let mut definition = Self {
+            name: name.to_owned(),
+            audience,
+            storage: Storage::Local,
+            merge_with_source: true,
+            paths: paths.iter().map(|path| normalize_path(path)).collect(),
+            secret: false,
             maintainers: None,
             role: None,
             priority: 0,
@@ -150,7 +176,7 @@ impl TrackerDefinition {
             audience: file.audience,
             storage: file.storage,
             merge_with_source: file.merge_with_source,
-            paths: file.paths,
+            paths: file.paths.iter().map(|path| normalize_path(path)).collect(),
             secret: file.secret,
             maintainers: file.maintainers,
             role: file.role,
@@ -188,14 +214,16 @@ impl TrackerDefinition {
                 "`.` owns everything not claimed elsewhere, so it must be the only path".to_owned(),
             ));
         }
-        // `.newgit` holds the project's own definitions, which only the
-        // project tracker carries; anyone else claiming it would split the
-        // definitions across trackers.
+        // `.newgit` holds the project's own definitions: `project` carries
+        // them, and `access` the tracker definitions among them. Anyone else
+        // claiming part of it would split the definitions across trackers.
         let is_project = (self.name == PROJECT_TRACKER
             && self.paths == [Utf8PathBuf::from(".newgit")])
             || (self.name == ACCESS_TRACKER
                 && self.paths == [Utf8PathBuf::from(".newgit/trackers")]);
 
+        // Every path here is already normalized, so `./.git` meets the
+        // checks as `.git`.
         for path in &self.paths {
             if path.as_str() == "." || is_project {
                 continue;
@@ -206,12 +234,31 @@ impl TrackerDefinition {
             {
                 return Err(self.invalid(format!("path `{path}` must be workspace-relative")));
             }
-            let first = path.components().next().map(|c| c.as_str().to_owned());
-            if matches!(first.as_deref(), Some(".git" | ".newgit")) {
+            // Except a tracker's definition: whoever may change the tracker
+            // owning `web.toml` decides who may read `web`, so governance
+            // layers by owning definitions (newgit-trackers.md, "Who may
+            // change what"). Only a code tracker may: a secret one would
+            // keep the definition out of Git.
+            if is_definition_file(path) {
+                if self.is_code() {
+                    continue;
+                }
                 return Err(self.invalid(format!(
-                    "path `{path}` may not reach into `{}`",
-                    first.unwrap_or_default()
+                    "path `{path}` is a tracker definition, which only a code tracker may own"
                 )));
+            }
+            // Regardless of case: a case-insensitive file system opens `.GIT`
+            // as `.git`, and Git refuses it everywhere.
+            let first = path
+                .components()
+                .next()
+                .map(|c| c.as_str().to_owned())
+                .unwrap_or_default();
+            if [".git", ".newgit"]
+                .iter()
+                .any(|reserved| first.eq_ignore_ascii_case(reserved))
+            {
+                return Err(self.invalid(format!("path `{path}` may not reach into `{first}`")));
             }
         }
         Ok(())
@@ -220,8 +267,9 @@ impl TrackerDefinition {
     pub fn with_added_paths(&self, paths: &[Utf8PathBuf]) -> Result<Self> {
         let mut updated = self.clone();
         for path in paths {
-            if !updated.paths.iter().any(|existing| existing == path) {
-                updated.paths.push(path.clone());
+            let path = normalize_path(path);
+            if !updated.paths.contains(&path) {
+                updated.paths.push(path);
             }
         }
         updated.paths.sort();
@@ -362,6 +410,39 @@ impl TrackerDefinition {
             reason,
         }
     }
+}
+
+/// A tracker path by its components alone, so `./.git`, `.git/` and `.git`
+/// are one path: checked, compared, and written to `.gitignore` as one. `./`
+/// is `.`. A path that is not workspace-relative (absolute, or with `..`) is
+/// returned as written, for validation to refuse.
+pub fn normalize_path(path: &Utf8Path) -> Utf8PathBuf {
+    let mut normal = Utf8PathBuf::new();
+    for component in path.components() {
+        match component {
+            Utf8Component::CurDir => {}
+            Utf8Component::Normal(part) => normal.push(part),
+            Utf8Component::ParentDir | Utf8Component::RootDir | Utf8Component::Prefix(_) => {
+                return path.to_path_buf();
+            }
+        }
+    }
+    if normal.as_str().is_empty() && !path.as_str().is_empty() {
+        return Utf8PathBuf::from(".");
+    }
+    normal
+}
+
+/// Whether `path` is a tracker's definition: a `.toml` file directly in
+/// `.newgit/trackers/`, the files newgit reads definitions from.
+fn is_definition_file(path: &Utf8Path) -> bool {
+    let mut components = path.components().map(|component| component.as_str());
+    components.next() == Some(".newgit")
+        && components.next() == Some("trackers")
+        && components
+            .next()
+            .is_some_and(|file| Utf8Path::new(file).extension() == Some("toml"))
+        && components.next().is_none()
 }
 
 /// Settle who owns what across every tracker. A path's owner is its most
