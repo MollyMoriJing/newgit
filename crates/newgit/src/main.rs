@@ -2371,6 +2371,14 @@ fn checkpoint_verify(instance: Option<String>, message: Option<&str>) -> Result<
             );
             continue;
         }
+        if resource.degraded {
+            println!(
+                "  resource: {} NOT CAPTURED — it was not up when {} was taken, so there is no \
+                 state to compare",
+                resource.name, outcome.before.id
+            );
+            continue;
+        }
         let verdict = if resource.agree { "MATCH" } else { "MISMATCH" };
         println!(
             "  resource: {} {verdict}  before: {}  after: {}",

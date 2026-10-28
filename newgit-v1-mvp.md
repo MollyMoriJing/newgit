@@ -1358,7 +1358,9 @@ the other subcommands):
 - resource checkpoint outputs, dependents first (identity hashes, external
   refs, deposits into trackers); a failed checkpoint command aborts the
   checkpoint loudly — a checkpoint that silently missed a resource is not
-  coherent
+  coherent. A resource that is not up is the exception when its capture
+  fails: the checkpoint goes ahead without it, records `mode = "none"` for
+  it, and names it on a `degraded:` line
 - resolved exports, port allocations, and which processes were running
 
 #### An Unproven Restore Must Say So
@@ -1431,6 +1433,20 @@ in dependency order, restarting what was running. A resource restore failure
 does not abort the rest: it is collected into a recovery record next to the
 checkpoint (`<id>.recovery.toml`) with logs and a retry command, and the
 resource is marked failed.
+
+A resource the checkpoint holds no state for, such as one it went ahead
+without because the resource was not up, keeps its state and status when
+its restore is a `command` reading what a `command` or `external`
+checkpoint records: the undo does not run that restore, as `newgit
+checkpoint` said when it named the resource `degraded`. It would have
+nothing to restore from, and the bundled database restores drop or reset
+the database before they read the dump. A process the resource was running
+is still stopped with the others, and started again after its
+dependencies, and the undo reports it as `not restored + restarted`. Any
+other restore runs as usual: a `recompute` rebuilds from the restored
+source and ignores the ref. A `command` restore whose `{{state_ref}}` has
+no value in the checkpoint is not run either, and counts as a failed
+restore.
 
 Source restore is pure Git in v1; `jj` delegation can come with the jj
 substrate work.
@@ -1667,9 +1683,10 @@ reference for that resource, which is how `cloudctl preview delete
 If rendering leaves any `{{...}}` unresolved, the hook is **refused, not
 run**: a destructive command with a literal placeholder is not a no-op, it is
 a wrong argument. Rendering elsewhere deliberately leaves unknown variables
-verbatim so misconfiguration is visible; cleanup, `[[render]]`, and
-`[exports]` are the places that must fail closed instead — each writes
-something durable that outlives the command that got it wrong.
+verbatim so misconfiguration is visible; cleanup, `[[render]]`,
+`[exports]`, and a `[restore]` command's `{{state_ref}}` are the places that
+must fail closed instead — each writes something durable that outlives the
+command that got it wrong.
 
 ---
 

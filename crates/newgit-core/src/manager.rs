@@ -21,7 +21,7 @@ use crate::deposit_diff::{DepositDiff, diff_deposits};
 use crate::error::{NewgitError, Result};
 use crate::export::{self, ExportFilter, ExportPlan, prepare_destination};
 use crate::export_target::ExportTarget;
-use crate::exports::{RenderContext, render, unresolved_placeholder};
+use crate::exports::{RenderContext, STATE_REF_PLACEHOLDER, render, unresolved_placeholder};
 use crate::installs::{Admission, InstallReport, InstallStore};
 use crate::lock::{InstanceLock, LOCKED_ENV, locked_env_value};
 use crate::materializer::{
@@ -728,14 +728,14 @@ pub struct VerifyOutcome {
 impl VerifyOutcome {
     /// The restore is proven when the middle `undo` completed cleanly and
     /// every resource whose restore could fail landed on the state ref it
-    /// started from.
+    /// started from — which needs `before` to have captured it at all.
     pub fn is_proven(&self) -> bool {
         self.undo.is_complete()
             && self
                 .resources
                 .iter()
                 .filter(|resource| resource.exercised)
-                .all(|resource| resource.agree)
+                .all(|resource| resource.agree && !resource.degraded)
     }
 }
 
@@ -746,6 +746,10 @@ pub struct VerifyResource {
     /// False for `[restore] mode = "none"` or `"external"` — nothing ran
     /// that could prove or disprove anything, so agreement here is trivial.
     pub exercised: bool,
+    /// `before` went ahead without this resource, which was not up: there
+    /// was no state to compare, so its restore is unproven whatever the
+    /// two refs say.
+    pub degraded: bool,
     pub before_state_ref: Option<String>,
     pub after_state_ref: Option<String>,
     pub agree: bool,
@@ -875,7 +879,8 @@ pub struct UndoTrackerOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UndoResourceOutcome {
     /// What the restore did, for display: `none`, `recompute(prepare)`,
-    /// `command`, `external (no-op)`; `+ restarted` when a process came back.
+    /// `command`, `external (no-op)`, `not restored` for one whose checkpoint
+    /// holds no state for it; `+ restarted` when a process came back.
     pub action: String,
     pub name: String,
     /// Whether the restore action itself succeeded. A restore that runs
@@ -6552,7 +6557,10 @@ impl BranchManager {
                 .find(|state| state.name == before_state.name)
                 .and_then(|state| state.state_ref.clone());
             let agree = before_state.state_ref == after_ref;
-            let mismatch = before_state.restore_exercisable && !agree;
+            // `before` went ahead without it, so there is no state to compare
+            // `after` against, and two empty refs agreeing is not a proof.
+            let degraded = before.degraded.contains(&before_state.name);
+            let mismatch = before_state.restore_exercisable && !degraded && !agree;
             let cause = mismatch.then(|| {
                 if failed_restores.contains(&before_state.name.as_str()) {
                     MismatchCause::RestoreFailed
@@ -6576,6 +6584,7 @@ impl BranchManager {
             resources.push(VerifyResource {
                 name: before_state.name.clone(),
                 exercised: before_state.restore_exercisable,
+                degraded,
                 before_state_ref: before_state.state_ref.clone(),
                 after_state_ref: after_ref,
                 agree,
@@ -7844,13 +7853,39 @@ impl BranchManager {
         )?;
         let mut warnings = safety.warnings.clone();
 
+        // A checkpoint that went ahead without a resource that was not up —
+        // degraded, see `checkpoint_branch` — records `mode = "none"` for it
+        // and says an undo to it leaves that resource as it finds it. For a
+        // resource whose restore reads what its checkpoint records, `none`
+        // holds nothing to restore it from, whether it was left out or the
+        // definition captured nothing yet when the checkpoint was taken.
+        // Running that restore anyway can lose the database: it is handed a
+        // literal `{{state_ref}}`, and the bundled templates drop or reset
+        // the database before they read the dump. So the undo does not run
+        // it, and the resource keeps its state and status. Any other restore
+        // loses nothing by the ref's absence and runs as usual: a `recompute`
+        // rebuilds from the inputs put back below.
+        let left_alone: BTreeSet<&str> = restored
+            .resource_states
+            .iter()
+            .filter(|state| {
+                state.mode == "none"
+                    && self
+                        .resource_definition(&state.name)
+                        .is_ok_and(ResourceDefinition::restore_reads_checkpoint)
+            })
+            .map(|state| state.name.as_str())
+            .collect();
+
         // Nothing may keep running while content changes underneath it. A
         // partial undo leaves every other resource alone, so it must not stop
         // them either.
         let supervisor = self.supervisor(&branch);
+        let mut stopped = BTreeSet::new();
         for definition in &self.resources {
             if wanted(&definition.name) && supervisor.running_pid(&definition.name).is_some() {
                 supervisor.stop(&definition.name, &definition.stop_signal())?;
+                stopped.insert(definition.name.as_str());
             }
         }
 
@@ -8019,31 +8054,49 @@ impl BranchManager {
                 continue;
             }
             let definition = self.resource_definition(name)?;
-            if definition.definition_rev != state.definition_rev {
+            let was_left_alone = left_alone.contains(name.as_str());
+            let (mut action_label, ok, exercised) = if was_left_alone {
                 warnings.push(format!(
-                    "resource `{name}` definition changed since the checkpoint; restored with \
-                     the current definition"
+                    "checkpoint {} holds no state for resource `{name}`, so this undo left it as \
+                     it is",
+                    restored.id
                 ));
-            }
+                // Its process, though, was stopped above with everything
+                // else, and comes back as it was found: below, after its
+                // dependencies, so it starts on the config just re-rendered
+                // and against their restored state. One this undo did not
+                // stop, it did not touch, and does not report.
+                if !stopped.contains(name.as_str()) {
+                    continue;
+                }
+                ("not restored".to_owned(), true, false)
+            } else {
+                if definition.definition_rev != state.definition_rev {
+                    warnings.push(format!(
+                        "resource `{name}` definition changed since the checkpoint; restored \
+                         with the current definition"
+                    ));
+                }
 
-            let pre_undo = safety
-                .record
-                .resource_states
-                .iter()
-                .find(|pre| &pre.name == name)
-                .and_then(|pre| pre.state_ref.as_deref());
-            let (mut action_label, ok, exercised) = self.restore_resource(
-                &mut branch,
-                definition,
-                state,
-                RestoreContext {
-                    pre_undo_state_ref: pre_undo,
-                    binding_moved,
-                    force_recompute: options.force_recompute,
-                },
-                &mut failures,
-                &mut warnings,
-            )?;
+                let pre_undo = safety
+                    .record
+                    .resource_states
+                    .iter()
+                    .find(|pre| &pre.name == name)
+                    .and_then(|pre| pre.state_ref.as_deref());
+                self.restore_resource(
+                    &mut branch,
+                    definition,
+                    state,
+                    RestoreContext {
+                        pre_undo_state_ref: pre_undo,
+                        binding_moved,
+                        force_recompute: options.force_recompute,
+                    },
+                    &mut failures,
+                    &mut warnings,
+                )?
+            };
             if let Some(binding) = branch.resources.get_mut(name) {
                 // Only a restore that ran something can have brought the
                 // resource up. One that ran nothing — `none`, `external`, no
@@ -8066,12 +8119,17 @@ impl BranchManager {
             }
 
             let mut restart_failed = false;
-            if ok && state.was_running {
+            if was_left_alone || (ok && state.was_running) {
+                let when = if was_left_alone {
+                    "before this undo"
+                } else {
+                    "at checkpoint time"
+                };
                 match self.restart_long_running(&branch, definition) {
                     Ok(true) => action_label.push_str(" + restarted"),
                     Ok(false) => warnings.push(format!(
-                        "resource `{name}` was running at checkpoint time but has no \
-                         long-running action to restart"
+                        "resource `{name}` was running {when} but has no long-running action to \
+                         restart"
                     )),
                     Err(error) => {
                         restart_failed = true;
@@ -8315,6 +8373,32 @@ impl BranchManager {
                 let template = spec.command.as_deref().expect("validated at parse time");
                 let binding = branch.resources.get(&definition.name);
                 let state_ref = self.consumable_state_ref(state)?;
+                // A record can hold no state ref for a resource it did
+                // capture: a `command` checkpoint that printed nothing, or
+                // one taken while the definition checkpointed a `hash`.
+                // Rendered anyway, the literal `{{state_ref}}` would show
+                // only once the command had run, and the bundled restores
+                // drop or reset the database before they read the dump. So
+                // it is refused, like a cleanup hook in the same state, and
+                // the resource counts as not restored.
+                if state_ref.is_none() && template.contains(STATE_REF_PLACEHOLDER) {
+                    warnings.push(format!(
+                        "resource `{}`: the checkpoint recorded no state ref for it, so its \
+                         restore command, which uses {STATE_REF_PLACEHOLDER}, was not run",
+                        definition.name
+                    ));
+                    failures.push(RestoreFailure {
+                        resource: definition.name.clone(),
+                        detail: format!(
+                            "restore command not run: {STATE_REF_PLACEHOLDER} has no value in \
+                             this checkpoint"
+                        ),
+                        log: None,
+                        retry_with: "undo to a checkpoint that recorded a state ref for it"
+                            .to_owned(),
+                    });
+                    return Ok(("command not run: no state ref".to_owned(), false, false));
+                }
                 let bound = self.bound_vars(branch);
                 let context = RenderContext {
                     branch_name: &branch.name,
