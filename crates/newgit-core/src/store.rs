@@ -342,8 +342,8 @@ impl MetadataStore {
     /// the instance's binding record (`BranchManager::claim_ports`, the only
     /// caller). The records are the only claim on a port, so two processes
     /// that each read them before the other had written would both be handed
-    /// the same one. Every other write of a binding record, and the id
-    /// `CheckpointLog::next_id` picks, is as unserialized as before.
+    /// the same one, and those may be spawning different instances: this is
+    /// one lock for the whole store, not one per instance.
     ///
     /// On Linux and macOS `File::lock` is `flock(2)`, which locks the open
     /// file rather than the process: two managers in one process exclude

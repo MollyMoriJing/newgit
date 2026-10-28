@@ -2338,6 +2338,16 @@ impl BranchManager {
                 continue;
             }
 
+            // Save the binding as it stands, exports and rendered files
+            // included and still `Pending`, before anything long runs. The
+            // claim `claim_ports` saved holds this resource's ports and
+            // nothing else, and there is none for a resource without ports,
+            // so a spawn that died in `prepare` would leave a record whose
+            // `newgit action <resource>.prepare` runs without the exports and
+            // marks it ready, or one without the resource at all, which
+            // `status` calls ready.
+            self.store.save_branch_record(branch)?;
+
             // Prepare runs with the bindings made so far, so dependents see
             // their dependencies' exports. Failed dependencies block
             // dependents; the instance still spawns so logs can be inspected.
