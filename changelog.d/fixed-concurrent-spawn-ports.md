@@ -16,7 +16,10 @@
   bind, not once they are prepared: `newgit status` shows an instance
   that is still spawning, and one whose spawn failed or was killed after
   that point keeps its record, and with it its ports, until `newgit
-  remove`.
+  remove`. Each resource is in that record, `Pending`, with its exports
+  and rendered files, before its `prepare` runs, so after a spawn killed
+  in `prepare`, `newgit action <resource>.prepare` runs it with the
+  resource's exports, and newgit still knows which files it rendered.
 
   A resource is `Pending` in that record while its `prepare` runs, so
   readiness no longer assumes a `Pending` resource is waiting on a
