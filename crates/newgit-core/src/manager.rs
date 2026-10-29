@@ -110,6 +110,10 @@ pub struct SpawnFromCheckpointOutcome {
     pub branch: BranchInstance,
     pub spawned: SpawnOutcome,
     pub undo: UndoOutcome,
+    /// Each `autostart` action started once the restore was done. Started
+    /// after it rather than at the spawn, so the restore does not stop a
+    /// process the checkpoint never had running.
+    pub started: Vec<StopStartResource>,
     /// Who took the checkpoint, and the agent that did, if one did.
     pub author: String,
     pub agent: Option<String>,
@@ -133,6 +137,10 @@ impl SpawnFromCheckpointOutcome {
                 .resources
                 .values()
                 .all(|binding| binding.status == ResourceStatus::Ready)
+            && self
+                .started
+                .iter()
+                .all(|start| start.status != StopStartStatus::Failed)
     }
 }
 
@@ -144,6 +152,9 @@ pub struct SpawnOutcome {
     pub created_source_branch: bool,
     pub trackers: Vec<TrackerBindOutcome>,
     pub resources: Vec<ResourceBindOutcome>,
+    /// Each `autostart` action spawn tried to start, dependencies first. A
+    /// resource whose start failed did not come up, and counts as failed.
+    pub started: Vec<StopStartResource>,
     /// Set when this name's checkpoint directory already held records from a
     /// previous, archived instance, so numbering continues rather than
     /// restarting. See [`InheritedCheckpoints`].
@@ -187,11 +198,18 @@ impl SpawnOutcome {
     /// is not a milder case than a failed one — it is equally unusable either
     /// way, it just failed for a reason one step upstream.
     pub fn failed_resources(&self) -> Vec<&str> {
-        self.resources
+        let mut failed: Vec<&str> = self
+            .resources
             .iter()
             .filter(|resource| resource.status != ResourceStatus::Ready || resource.is_blocked())
             .map(|resource| resource.name.as_str())
-            .collect()
+            .collect();
+        for start in &self.started {
+            if start.status == StopStartStatus::Failed && !failed.contains(&start.name.as_str()) {
+                failed.push(&start.name);
+            }
+        }
+        failed
     }
 
     /// The instance is complete when every resource bound cleanly. Mirrors
@@ -1918,6 +1936,18 @@ impl BranchManager {
         from: Option<&str>,
         choice: &BindingChoice,
     ) -> Result<SpawnOutcome> {
+        self.spawn_inner(name, from, choice, true)
+    }
+
+    /// The spawn itself. `autostart` false leaves the `autostart` actions to
+    /// the caller: a spawn from a checkpoint starts them after its restore.
+    fn spawn_inner(
+        &self,
+        name: &str,
+        from: Option<&str>,
+        choice: &BindingChoice,
+        autostart: bool,
+    ) -> Result<SpawnOutcome> {
         self.require_resolvable_graph()?;
         if choice.private && self.remote.is_none() {
             return Err(NewgitError::Unsupported(
@@ -2029,6 +2059,11 @@ impl BranchManager {
         let record_path = self.store.create_branch_record(&branch)?;
         let resource_outcomes = self.bind_resources(&mut branch)?;
         self.store.save_branch_record(&branch)?;
+        let started = if autostart {
+            self.autostart(&branch, None)
+        } else {
+            Vec::new()
+        };
 
         // The instance exists locally whatever the remote says: a failure to
         // register is reported, not fatal, and retried at the next checkpoint.
@@ -2043,6 +2078,7 @@ impl BranchManager {
             created_source_branch,
             trackers: tracker_outcomes,
             resources: resource_outcomes,
+            started,
             inherited_checkpoints,
             remote_warning,
             projection_warning,
@@ -2175,7 +2211,12 @@ impl BranchManager {
             }
         }
 
-        let spawned = self.spawn(name, Some(&record.source.head_rev))?;
+        let spawned = self.spawn_inner(
+            name,
+            Some(&record.source.head_rev),
+            &BindingChoice::default(),
+            false,
+        )?;
         let mut branch = spawned.branch.clone();
         // Its tracker branches start where the checkpoint's committed work is.
         for (tracker, commit) in &imported.trackers {
@@ -2236,11 +2277,15 @@ impl BranchManager {
         )?;
         warnings.extend(undo.warnings.iter().cloned());
         branch = self.store.find_branch(&branch.name)?;
+        // After the restore, which leaves running what the checkpoint had
+        // running; anything already up is skipped.
+        let started = self.autostart(&branch, None);
 
         Ok(SpawnFromCheckpointOutcome {
             branch,
             spawned,
             undo,
+            started,
             author: found.created_by,
             agent: found.agent,
             warnings,
@@ -4418,6 +4463,15 @@ impl BranchManager {
         let before = self.binding_before(instance)?;
         let mut change = self.use_tracker_inner(instance, tracker, true)?;
         change.rebuilt = self.rebuild_for_binding(instance, &before)?;
+        // A drop stopped what the tracker brings; using it again starts
+        // them, after the rebuild, so they start on the binding they now
+        // have. Only those: what this instance runs otherwise is left as
+        // it is, stopped or not.
+        if !change.started.is_empty() {
+            let branch = self.store.find_branch(instance)?;
+            let only: BTreeSet<&str> = change.started.iter().map(String::as_str).collect();
+            change.autostarted = self.autostart(&branch, Some(&only));
+        }
         Ok(change)
     }
 
@@ -8652,6 +8706,84 @@ impl BranchManager {
             .start(&definition.name, &command, &cwd, &env, &log)
     }
 
+    /// Start each bound resource's `autostart` action, dependencies first,
+    /// as `newgit action <resource>.<action>` would. One already running is
+    /// left alone and not reported. One that is not ready, is blocked, or
+    /// depends on a resource whose start failed here is not started, and is
+    /// reported failed with the reason: it did not come up.
+    ///
+    /// Starting is not waiting: a dependent is started once its dependency's
+    /// process exists, not once it answers (#54).
+    ///
+    /// `only`, when given, limits it to those resources.
+    fn autostart(
+        &self,
+        branch: &BranchInstance,
+        only: Option<&BTreeSet<&str>>,
+    ) -> Vec<StopStartResource> {
+        let supervisor = self.supervisor(branch);
+        let mut failed_here = BTreeSet::new();
+        let mut started = Vec::new();
+        for definition in self.lifecycle_definitions() {
+            let name = &definition.name;
+            if only.is_some_and(|only| !only.contains(name.as_str())) {
+                continue;
+            }
+            let Some((action_name, action)) = definition.autostart_action() else {
+                continue;
+            };
+            let Some(binding) = branch.resources.get(name) else {
+                continue;
+            };
+            if supervisor.running_pid(name).is_some() {
+                continue;
+            }
+            let down: Vec<String> = definition
+                .depends_on
+                .iter()
+                .filter(|dependency| failed_here.contains(*dependency))
+                .map(|dependency| format!("`{dependency}`"))
+                .collect();
+            // The reason nearest the cause first: a dependency that did not
+            // start here, then one that is down, then this resource's own
+            // `prepare`.
+            let result = if !down.is_empty() {
+                Err(format!(
+                    "resource `{name}` depends on {}, which did not start",
+                    down.join(", ")
+                ))
+            } else if let Err(error) = self.refuse_if_blocked(branch, definition) {
+                Err(error.to_string())
+            } else if binding.status != ResourceStatus::Ready {
+                let why = match binding.status {
+                    ResourceStatus::Failed => "failed",
+                    _ => "is not ready",
+                };
+                Err(format!(
+                    "resource `{name}` {why}, so `{action_name}` was not started"
+                ))
+            } else {
+                self.start_supervised(branch, definition, action, action_name)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            };
+            let (status, error) = match result {
+                Ok(()) => (StopStartStatus::Started, None),
+                Err(error) => {
+                    failed_here.insert(name.clone());
+                    (StopStartStatus::Failed, Some(error))
+                }
+            };
+            started.push(StopStartResource {
+                name: name.clone(),
+                action: action_name.to_owned(),
+                status,
+                error,
+            });
+        }
+        started
+    }
+
     /// Every defined resource in lifecycle order: dependencies before
     /// dependents over `depends_on`. A resource the order leaves out — a
     /// graph with problems skips what it cannot place — follows, in
@@ -9328,8 +9460,11 @@ pub struct BindingChange {
     pub replaced: Vec<String>,
     /// Trackers a use bound because it requires them.
     pub brought: Vec<String>,
-    /// Resources a use started.
+    /// Resources a use bound and prepared.
     pub started: Vec<String>,
+    /// The `autostart` actions of those resources, started once the use
+    /// was done.
+    pub autostarted: Vec<StopStartResource>,
     /// Resources a drop stopped.
     pub stopped: Vec<String>,
     /// Installs rebuilt because the binding is part of their identity: a
