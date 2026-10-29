@@ -5279,21 +5279,38 @@ impl BranchManager {
     /// every dropped code tracker's paths left out, with any bound tracker
     /// nested inside one put back. Empty when nothing is left out.
     fn sparse_patterns(&self, dropped_names: &BTreeSet<String>) -> Vec<String> {
+        let (left_out, put_back) = self.sparse_paths(dropped_names);
+        if left_out.is_empty() {
+            return Vec::new();
+        }
+        let mut patterns = vec!["/*".to_owned()];
+        for path in left_out {
+            patterns.push(format!("!/{path}/"));
+            patterns.push(format!("!/{path}"));
+        }
+        for path in put_back {
+            patterns.push(format!("/{path}/"));
+            patterns.push(format!("/{path}"));
+        }
+        patterns
+    }
+
+    /// The paths behind [`Self::sparse_patterns`]: what an instance that
+    /// drops `dropped_names` leaves out of its working tree — every dropped
+    /// code tracker's paths — and what it puts back inside them, the paths
+    /// of any bound tracker nested there.
+    fn sparse_paths(&self, dropped_names: &BTreeSet<String>) -> (Vec<&Utf8Path>, Vec<&Utf8Path>) {
         let dropped: Vec<&TrackerDefinition> = self
             .code
             .iter()
             .filter(|definition| dropped_names.contains(&definition.name))
             .collect();
-        if dropped.iter().all(|definition| definition.paths.is_empty()) {
-            return Vec::new();
-        }
-        let mut patterns = vec!["/*".to_owned()];
-        for definition in &dropped {
-            for path in &definition.paths {
-                patterns.push(format!("!/{path}/"));
-                patterns.push(format!("!/{path}"));
-            }
-        }
+        let left_out = dropped
+            .iter()
+            .flat_map(|definition| &definition.paths)
+            .map(Utf8PathBuf::as_path)
+            .collect();
+        let mut put_back = Vec::new();
         for definition in &self.code {
             if dropped_names.contains(&definition.name) {
                 continue;
@@ -5306,12 +5323,11 @@ impl BranchManager {
                         .any(|outer| path != outer && path.starts_with(outer))
                 });
                 if inside {
-                    patterns.push(format!("/{path}/"));
-                    patterns.push(format!("/{path}"));
+                    put_back.push(path.as_path());
                 }
             }
         }
-        patterns
+        (left_out, put_back)
     }
 
     pub fn capture_tracker(&self, instance: &str, tracker: &str) -> Result<CaptureReport> {
@@ -8882,10 +8898,17 @@ impl BranchManager {
             // workspace happens to be on now: undo moves the branch it
             // restores, never a bystander.
             self.point_workspace_head(&branch, &restored.source, &mut warnings)?;
+            // The uncommitted state is not reapplied to what that binding
+            // leaves out of the working tree — a dropped tracker's paths, as
+            // its current definition names them — so none of it is written
+            // there (#225).
+            let (left_out, put_back) = self.sparse_paths(&branch.dropped);
             GitSource::workspace_restore_to(
                 &workspace,
                 &restored.source.head_rev,
                 restored.source.dirty_rev.as_deref(),
+                &left_out,
+                &put_back,
             )?;
             // The instance's branch follows only a checkpoint taken on it. Its
             // pre-undo tip is what it was last blessed to — the safety
