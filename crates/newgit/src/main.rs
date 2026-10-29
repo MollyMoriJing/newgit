@@ -431,10 +431,18 @@ struct SpawnArgs {
     from_checkpoint: Option<String>,
     /// Bind this tracker (repeatable): over its role's default, or one that
     /// is only bound when asked for
-    #[arg(long = "use", value_name = "TRACKER")]
+    #[arg(
+        long = "use",
+        value_name = "TRACKER",
+        conflicts_with = "from_checkpoint"
+    )]
     uses: Vec<String>,
     /// Do not bind this tracker (repeatable)
-    #[arg(long = "drop", value_name = "TRACKER")]
+    #[arg(
+        long = "drop",
+        value_name = "TRACKER",
+        conflicts_with = "from_checkpoint"
+    )]
     drops: Vec<String>,
     /// On the remote, only you see this instance — its checkpoints and its
     /// forks of the code trackers — until `newgit merge` publishes its work:
@@ -1182,6 +1190,8 @@ fn spawn(args: SpawnArgs) -> Result<()> {
     let manager = manager_here()?;
     warn_gitignore(&manager);
     if let Some(spec) = &args.from_checkpoint {
+        // No `--use` or `--drop` reach here (clap refuses them with it): the
+        // undo that finishes the spawn restores the checkpoint's binding.
         return spawn_from_checkpoint(&manager, &args.name, spec, args.json);
     }
     let outcome = manager.spawn_binding(
