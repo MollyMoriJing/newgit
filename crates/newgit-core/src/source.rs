@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::process::Command;
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -690,6 +691,32 @@ impl GitSource {
         run_git(&args).map(|_| ())
     }
 
+    /// The paths among `paths` that a workspace clone's index holds. A record
+    /// of what was rendered can outlive a file's place there (a commit that
+    /// deletes it), and [`Self::workspace_skip_worktree`] marks none of a
+    /// list that names one path the index does not hold.
+    pub fn workspace_indexed(
+        workspace: &Utf8Path,
+        paths: &[Utf8PathBuf],
+    ) -> Result<Vec<Utf8PathBuf>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pathspecs: Vec<String> = paths
+            .iter()
+            .map(|path| format!(":(literal){path}"))
+            .collect();
+        let mut args = vec!["-C", workspace.as_str(), "ls-files", "-z", "--"];
+        args.extend(pathspecs.iter().map(String::as_str));
+        let listing = run_git(&args)?;
+        let indexed: BTreeSet<&str> = listing.split('\0').collect();
+        Ok(paths
+            .iter()
+            .filter(|path| indexed.contains(path.as_str()))
+            .cloned()
+            .collect())
+    }
+
     /// Snapshot uncommitted and untracked (non-ignored) workspace state as a
     /// dangling commit on top of HEAD, without touching HEAD, the real
     /// index, or the worktree. Returns `None` when the worktree is clean.
@@ -703,6 +730,12 @@ impl GitSource {
     /// HEAD does not, so without this `git add -A` would sweep the instance's
     /// rendered ports into the checkpoint — the one place skip-worktree does
     /// not protect on its own.
+    ///
+    /// In a sparse checkout, Git clears that bit from every file it finds on
+    /// disk as it reads an index, unless `sparse.expectFilesOutsideOfPatterns`
+    /// is set. The workspace sets it (`BranchManager::apply_sparse`); this
+    /// sets it again for the `git add -A`, so the marks hold here even in a
+    /// workspace that does not yet.
     pub fn workspace_dirty_commit(
         workspace: &Utf8Path,
         message: &str,
@@ -722,7 +755,17 @@ impl GitSource {
             args.extend(rendered.iter().map(|path| path.as_str()));
             run_git_env(&args, &env)?;
         }
-        run_git_env(&["-C", ws, "add", "-A"], &env)?;
+        run_git_env(
+            &[
+                "-C",
+                ws,
+                "-c",
+                "sparse.expectFilesOutsideOfPatterns=true",
+                "add",
+                "-A",
+            ],
+            &env,
+        )?;
         let tree = run_git_env(&["-C", ws, "write-tree"], &env)?;
 
         let head_tree = run_git(&["-C", ws, "rev-parse", "HEAD^{tree}"])?;
