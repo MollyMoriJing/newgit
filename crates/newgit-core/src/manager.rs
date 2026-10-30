@@ -284,6 +284,12 @@ impl ResourceBindOutcome {
 #[derive(Debug, Default)]
 struct RenderedRestore {
     files: Vec<(Utf8PathBuf, String)>,
+    /// Why capturing this content would be wrong (#260): a rendered value
+    /// newgit could not place, or content that would no longer render.
+    /// `tracker capture` refuses on it; the safety captures newgit takes on
+    /// its own (checkpoint, re-bind, checkout) record it anyway, because
+    /// refusing those would lose the work they exist to keep.
+    refusal: Option<NewgitError>,
 }
 
 impl RenderedRestore {
@@ -3470,11 +3476,36 @@ impl BranchManager {
             let Ok(current) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let applied: Vec<render::AppliedReplacement> = claims_on(branch, &relative)
-                .iter()
-                .flat_map(|claim| claim.applied.iter().cloned())
-                .collect();
-            let reversed = render::reverse(&current, &applied);
+            let claims = claims_on(branch, &relative);
+            // Against what the render wrote, not every occurrence of the
+            // value: a user's line that happens to hold the same text stays
+            // theirs.
+            let committed = self
+                .committed_content(branch, &relative, Some(tracker.name.as_str()))
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let render::Reversed {
+                content: reversed,
+                unplaced,
+            } = render::reverse_rendered(&current, &relative, &committed, &claims);
+            if restore.refusal.is_none() {
+                let problem = if !unplaced.is_empty() {
+                    Some(format!(
+                        "still holds this instance's values where newgit could not tell what \
+                         the render wrote from text beside it: {}",
+                        unplaced.join("; ")
+                    ))
+                } else {
+                    render::unrenderable(&relative, &reversed, &claims)
+                        .map(|why| format!("would no longer render: {why}"))
+                };
+                restore.refusal = problem.map(|problem| NewgitError::RenderCaptureRefused {
+                    tracker: tracker.name.clone(),
+                    path: relative.clone(),
+                    problem,
+                });
+            }
             if reversed == current {
                 continue;
             }
@@ -3651,7 +3682,46 @@ impl BranchManager {
         let Some(binding) = branch.resources.remove(name) else {
             return Ok(());
         };
-        unrender_binding(&branch.workspace_path, &binding)
+        self.unrender_binding(branch, name, &binding)
+    }
+
+    /// Take a binding's values out of every file it rendered that is still
+    /// there. Reversed rather than re-rendered: a file another resource also
+    /// renders keeps that resource's values and any edit beside them, and a
+    /// file only this one rendered goes back to its committed defaults.
+    fn unrender_binding(
+        &self,
+        branch: &BranchInstance,
+        name: &str,
+        binding: &ResourceBinding,
+    ) -> Result<()> {
+        for record in &binding.rendered {
+            let path = branch.workspace_path.join(&record.path);
+            if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+                continue;
+            }
+            let Ok(current) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            // Only the spans this resource wrote (#260); a value it cannot
+            // place is left for the drift report rather than guessed at.
+            let committed = self
+                .committed_content(branch, &record.path, record.tracker.as_deref())
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let claim = [render::Claim {
+                resource: name,
+                applied: &record.applied,
+            }];
+            let reversed =
+                render::reverse_rendered(&current, &record.path, &committed, &claim).content;
+            if reversed != current {
+                std::fs::write(&path, &reversed)
+                    .map_err(|source| NewgitError::io(path.clone(), source))?;
+            }
+        }
+        Ok(())
     }
 
     /// Rendered paths across every resource — what export must take from HEAD
@@ -5253,7 +5323,11 @@ impl BranchManager {
         // values must not enter it — but the file cannot simply be skipped
         // either, or a key added beside them would never reach the lane.
         // Reversing the substitution keeps the edits and drops the values.
-        let reversed = self.unrender_for_capture(&branch, definition)?;
+        let mut reversed = self.unrender_for_capture(&branch, definition)?;
+        if let Some(refusal) = reversed.refusal.take() {
+            reversed.restore()?;
+            return Err(refusal);
+        }
 
         let previous = branch
             .trackers
@@ -9904,7 +9978,7 @@ impl BranchManager {
                 // Its values come out of the files it rendered, as an unbind
                 // takes them: a capture reverses only bound claims, so left
                 // in they would reach a shared lane. `use` renders them again.
-                if let Err(error) = unrender_binding(&branch.workspace_path, &binding) {
+                if let Err(error) = self.unrender_binding(branch, name, &binding) {
                     report.note = Some(format!("its rendered values were left in: {error}"));
                 }
                 branch.parked.insert(
@@ -10184,28 +10258,6 @@ fn hook_program(exe: Option<&std::path::Path>, path_var: Option<&std::ffi::OsStr
 /// Quote `value` as one POSIX shell word.
 fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-/// Take a binding's values out of every file it rendered that is still
-/// there. Reversed rather than re-rendered: a file another resource also
-/// renders keeps that resource's values and any edit beside them, and a file
-/// only this one rendered goes back to its committed defaults.
-fn unrender_binding(workspace: &Utf8Path, binding: &ResourceBinding) -> Result<()> {
-    for record in &binding.rendered {
-        let path = workspace.join(&record.path);
-        if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
-            continue;
-        }
-        let Ok(current) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let reversed = render::reverse(&current, &record.applied);
-        if reversed != current {
-            std::fs::write(&path, &reversed)
-                .map_err(|source| NewgitError::io(path.clone(), source))?;
-        }
-    }
-    Ok(())
 }
 
 /// Every resource's claim on `path` in this instance, in resource-name
