@@ -315,7 +315,9 @@ Definition management (noun subcommands):
   path under a symlinked directory, is refused by name
   ([spec](design/spec.md#secret-trackers))
 - `newgit tracker list` — a tree by ownership: kind, role, priority,
-  maintainers, and (inside a workspace) what is bound
+  maintainers, and (inside a workspace) what is bound. Trackers with no
+  `paths` come after the tree, with what deposits into them and what they
+  bring
 - `newgit tracker use <tracker> [instance]` / `newgit tracker drop <tracker>
   [instance] [--stash | --discard]` — a drop parks the resources the tracker
   brought: taken down by `suspend` (else `[cleanup]`), ports kept, and

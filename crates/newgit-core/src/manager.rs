@@ -4784,10 +4784,14 @@ impl BranchManager {
             self.apply_sparse(&branch)?;
         } else {
             let definition = self.definition(tracker)?.clone();
-            let report = self.capture_tracker(instance, tracker)?;
-            branch = self.store.find_branch(instance)?;
-            change.captured = Some(report.rev);
-            crate::tracker_repo::clear_owned_paths(&workspace, &definition)?;
+            // A tracker with no paths has nothing in the workspace: its
+            // deposits are already in its lane, and a checkpoint covers them.
+            if !definition.paths.is_empty() {
+                let report = self.capture_tracker(instance, tracker)?;
+                branch = self.store.find_branch(instance)?;
+                change.captured = Some(report.rev);
+                crate::tracker_repo::clear_owned_paths(&workspace, &definition)?;
+            }
             branch.dropped.insert(tracker.to_owned());
         }
         // The resources it brought are taken down and parked with it: using
@@ -5582,9 +5586,12 @@ impl BranchManager {
                     .then(|| GitSource::workspace_branch(&branch.workspace_path).ok())
                     .flatten()
                     .and_then(|head| OffBranch::of(head.as_deref(), &branch.source_ref));
+                // What the record binds, not every tracker defined: of a
+                // role's alternatives only the one bound shows.
                 let trackers = self
                     .trackers
                     .iter()
+                    .filter(|definition| !branch.dropped.contains(&definition.name))
                     .map(|definition| {
                         let content_rev = branch
                             .trackers

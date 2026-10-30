@@ -153,8 +153,17 @@ that fails leaves the resource `failed` without failing the command, since the
 binding has changed by then. A process already running when a use or drop
 rewrites a rendered file is restarted if its resource declares `reads`
 covering that file, and otherwise named as possibly stale, with the command
-that restarts it (#249; see *Render* in [spec.md](spec.md)). `root`,
-`project`, and `access` cannot be dropped. A checkpoint records the binding, and undo restores it.
+that restarts it (#249; see *Render* in [spec.md](spec.md)). A secret
+tracker's content is captured into its lane before its files leave the
+workspace; a tracker with no `paths` (one that only receives `into_tracker`
+deposits, or only brings resources) has nothing in the workspace, so there is
+no capture step and `--stash`/`--discard` have nothing to act on — its
+deposits are already in its lane, and a checkpoint covers them. (An explicit
+`newgit tracker capture` of such a tracker is still an error: asked for
+directly, it should say there is nothing to capture.) `root`, `project`, and
+`access` cannot be dropped. A checkpoint records the binding, and undo
+restores it; `newgit status` lists the trackers the binding binds, not every
+tracker in a role.
 
 `{{bound.trackers}}` and `{{bound.paths}}` give a resource's commands what the
 instance binds, so a shared install builds only the bound members.
