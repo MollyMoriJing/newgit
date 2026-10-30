@@ -966,7 +966,7 @@ Repeatable: one `[[render]]` per file.
 
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
-| `path` | string | yes | — | workspace-relative path to the file. Must be tracked by Git or owned by a tracker: a render substitutes into committed content, so there has to be some. The exception is a file inside this resource's own `[identity] produces` — see *Rendering into a built tree*. Two resources rendering one path is refused at load. |
+| `path` | string | yes | — | workspace-relative path to the file. Must be tracked by Git or owned by a tracker: a render substitutes into committed content, so there has to be some. The exception is a file inside this resource's own `[identity] produces` — see *Rendering into a built tree*. Several resources may render one path, each with its own rules — see *Several resources, one file*. |
 | `replace` | array of tables | yes | — | the substitutions, below. |
 
 | key | type | required | default | meaning |
@@ -1025,6 +1025,39 @@ render should produce and compares, at `checkpoint` and before each re-render,
 naming the file and how many lines are about to go. Silence means there is
 nothing to lose. To change a rendered file for real, change it in the store
 repo.
+
+#### Several resources, one file
+
+A file often needs values from several resources — an app's `.env.local`
+wants its own port and the database's URL. Declare each rule on the resource
+the value comes from, all naming the same `path`:
+
+```toml
+# .newgit/resources/db.toml
+[[render]]
+path = "apps/web/.env.local"
+replace = [{ find = "DATABASE_URL=postgres://127.0.0.1:54322/app", with = "DATABASE_URL=postgres://127.0.0.1:{{ports.db}}/app" }]
+
+# .newgit/resources/web.toml
+[[render]]
+path = "apps/web/.env.local"
+replace = [{ find = "PORT=3000", with = "PORT={{ports.web}}" }]
+```
+
+The file is one simultaneous batch over every resource's rules, exactly as
+if they were declared together: every `find` is located in the committed
+content and every count checked there, so the result does not depend on
+which resource bound first. Capture reverses all of them; `tracker drop`
+that unbinds or parks one resource reverses only its values. When the
+committed file changes so that one resource's `find` no longer matches,
+that resource's render fails and says so; the others still render theirs.
+
+Each piece of text still has one owner. Two resources whose `find`s are
+identical, or one inside the other, are refused at load; finds that overlap
+only in the file's content are refused when it renders. The error names
+both resources and both strings. If one resource needs the other's value
+inside the text it owns, have the other export it and use
+`{{exports.NAME}}`.
 
 #### Rendered files under a running process
 

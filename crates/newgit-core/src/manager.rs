@@ -3350,34 +3350,63 @@ impl BranchManager {
         // A render into the resource's own built tree is the install
         // store's: it has no committed content, and it runs when the store
         // fills the tree (see `tree_renders`).
-        for spec in definition
+        let specs: Vec<&render::RenderSpec> = definition
             .render
             .iter()
             .filter(|spec| !definition.renders_into_produced(spec))
-        {
-            let owner = self.tracker_owning(&spec.path);
-            let committed = self.committed_content(branch, &spec.path, owner.as_deref())?;
+            .collect();
+        let mut paths: Vec<&Utf8PathBuf> = Vec::new();
+        for spec in &specs {
+            if !paths.contains(&&spec.path) {
+                paths.push(&spec.path);
+            }
+        }
+
+        let bound = self.bound_vars(branch);
+        let context = RenderContext {
+            branch_name: &branch.name,
+            branch_slug: &branch.slug,
+            workspace: branch.workspace_path.as_str(),
+            scripts: self.scripts_dir(),
+            ports: Some(&context_ports),
+            exports: Some(&context_exports),
+            bound: Some(&bound),
+            ..RenderContext::default()
+        };
+
+        for path in paths {
+            let owner = self.tracker_owning(path);
+            let committed = self.committed_content(branch, path, owner.as_deref())?;
             let Some(committed) = committed else {
                 return Err(NewgitError::RenderPathNotCommitted {
                     resource: definition.name.clone(),
-                    path: spec.path.clone(),
+                    path: path.clone(),
                 });
             };
 
-            let bound = self.bound_vars(branch);
-            let context = RenderContext {
-                branch_name: &branch.name,
-                branch_slug: &branch.slug,
-                workspace: branch.workspace_path.as_str(),
-                scripts: self.scripts_dir(),
-                ports: Some(&context_ports),
-                exports: Some(&context_exports),
-                bound: Some(&bound),
-                ..RenderContext::default()
-            };
-            let (contents, applied) = render::apply(&definition.name, spec, &committed, &context)?;
+            let mut mine = Vec::new();
+            for spec in specs.iter().filter(|spec| &spec.path == path) {
+                mine.push(render::resolve(&definition.name, spec, &context)?);
+            }
+            // Every other resource rendering this file keeps its values in
+            // it: the file is one batch over all of their claims, located in
+            // the committed content, so it is the same whichever bound first.
+            // A claim that no longer locates in the committed content (the
+            // file moved under its `find`) is left out rather than failing
+            // this resource's render too: that resource reports its own
+            // error when it renders, and this one is not collateral damage.
+            let mut claims: Vec<render::Claim> = claims_on(branch, path)
+                .into_iter()
+                .filter(|claim| claim.resource != definition.name)
+                .filter(|claim| render::substitute(path, &committed, &[*claim]).is_ok())
+                .collect();
+            claims.extend(mine.iter().map(|applied| render::Claim {
+                resource: &definition.name,
+                applied,
+            }));
+            let contents = render::compose(path, &committed, &claims)?;
 
-            let target = branch.workspace_path.join(&spec.path);
+            let target = branch.workspace_path.join(path);
             if let Some(parent) = target.parent() {
                 crate::materializer::create_dir_all(parent)?;
             }
@@ -3385,18 +3414,20 @@ impl BranchManager {
                 .map_err(|source| NewgitError::io(target.clone(), source))?;
 
             if owner.is_none() {
-                source_owned.push(spec.path.clone());
+                source_owned.push(path.clone());
             }
-            outcomes.push(RenderOutcome {
-                path: spec.path.clone(),
-                replacements: applied.len(),
-                tracker: owner.clone(),
-            });
-            records.push(RenderRecord {
-                path: spec.path.clone(),
-                tracker: owner,
-                applied,
-            });
+            for applied in mine {
+                outcomes.push(RenderOutcome {
+                    path: path.clone(),
+                    replacements: applied.len(),
+                    tracker: owner.clone(),
+                });
+                records.push(RenderRecord {
+                    path: path.clone(),
+                    tracker: owner.clone(),
+                    applied,
+                });
+            }
         }
 
         // Source-owned targets only: tracker-owned paths are already in
@@ -3423,29 +3454,33 @@ impl BranchManager {
         tracker: &TrackerDefinition,
     ) -> Result<RenderedRestore> {
         let mut restore = RenderedRestore::default();
-        for binding in branch.resources.values() {
-            for record in &binding.rendered {
-                if record.tracker.as_deref() != Some(tracker.name.as_str()) {
-                    continue;
-                }
-                let path = branch.workspace_path.join(&record.path);
-                // Only a regular file is un-rendered in place. Through a
-                // symlink this would read, and then write, wherever it leads;
-                // capture keeps or refuses the link itself.
-                if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
-                    continue;
-                }
-                let Ok(current) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let reversed = render::reverse(&current, &record.applied);
-                if reversed == current {
-                    continue;
-                }
-                std::fs::write(&path, &reversed)
-                    .map_err(|source| NewgitError::io(path.clone(), source))?;
-                restore.files.push((path, current));
+        // Per file, not per record: a file several resources render is
+        // reversed once, over every claim on it, so what is put back after
+        // the capture is the file as it was rather than half of it.
+        for relative in rendered_paths(branch, |record| {
+            record.tracker.as_deref() == Some(tracker.name.as_str())
+        }) {
+            let path = branch.workspace_path.join(&relative);
+            // Only a regular file is un-rendered in place. Through a
+            // symlink this would read, and then write, wherever it leads;
+            // capture keeps or refuses the link itself.
+            if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+                continue;
             }
+            let Ok(current) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let applied: Vec<render::AppliedReplacement> = claims_on(branch, &relative)
+                .iter()
+                .flat_map(|claim| claim.applied.iter().cloned())
+                .collect();
+            let reversed = render::reverse(&current, &applied);
+            if reversed == current {
+                continue;
+            }
+            std::fs::write(&path, &reversed)
+                .map_err(|source| NewgitError::io(path.clone(), source))?;
+            restore.files.push((path, current));
         }
         Ok(restore)
     }
@@ -3603,16 +3638,26 @@ impl BranchManager {
         lane.read_file(&rev, path)
     }
 
+    /// Take a resource's binding out of an instance, and its values out of
+    /// every file it rendered that is still there.
+    ///
+    /// Reversed rather than re-rendered: a file another resource also
+    /// renders keeps that resource's values and any edit beside them, and a
+    /// file only this one rendered goes back to its committed defaults. Left
+    /// alone, it would go on naming ports this instance no longer holds, and
+    /// a capture — which reverses only the claims still bound — would carry
+    /// them into a shared lane.
+    fn unbind_resource(&self, branch: &mut BranchInstance, name: &str) -> Result<()> {
+        let Some(binding) = branch.resources.remove(name) else {
+            return Ok(());
+        };
+        unrender_binding(&branch.workspace_path, &binding)
+    }
+
     /// Rendered paths across every resource — what export must take from HEAD
     /// and what a checkpoint's dirty commit must leave alone.
     fn rendered_source_paths(&self, branch: &BranchInstance) -> Vec<Utf8PathBuf> {
-        branch
-            .resources
-            .values()
-            .flat_map(|binding| binding.rendered.iter())
-            .filter(|record| record.tracker.is_none())
-            .map(|record| record.path.clone())
-            .collect()
+        rendered_paths(branch, |record| record.tracker.is_none())
     }
 
     /// Re-render every resource's targets, in dependency order.
@@ -3642,32 +3687,43 @@ impl BranchManager {
     /// re-render — so counting it would name an edit nobody made.
     fn render_drift(&self, branch: &BranchInstance) -> Vec<String> {
         let mut drifted = Vec::new();
-        for (resource, binding) in &branch.resources {
-            for record in &binding.rendered {
-                let Ok(Some(committed)) =
-                    self.committed_content(branch, &record.path, record.tracker.as_deref())
-                else {
-                    continue;
-                };
-                let Ok(expected) =
-                    render::substitute(resource, &record.path, &committed, &record.applied)
-                else {
-                    continue;
-                };
-                let Ok(actual) = std::fs::read_to_string(branch.workspace_path.join(&record.path))
-                else {
-                    continue;
-                };
-                if actual != expected && actual != committed {
-                    drifted.push(format!(
-                        "`{}` has changes that render will discard: it is rendered by resource \
-                         `{resource}`, so newgit rewrites it from committed content and this \
-                         instance's values ({} line(s) differ). Move the edit into the \
-                         committed file in the store repo to keep it.",
-                        record.path,
-                        differing_lines(&expected, &actual)
-                    ));
-                }
+        for path in rendered_paths(branch, |_| true) {
+            let tracker = branch
+                .resources
+                .values()
+                .flat_map(|binding| binding.rendered.iter())
+                .find(|record| record.path == path)
+                .and_then(|record| record.tracker.clone());
+            let Ok(Some(committed)) = self.committed_content(branch, &path, tracker.as_deref())
+            else {
+                continue;
+            };
+            let claims = claims_on(branch, &path);
+            let Ok(expected) = render::substitute(&path, &committed, &claims) else {
+                continue;
+            };
+            let Ok(actual) = std::fs::read_to_string(branch.workspace_path.join(&path)) else {
+                continue;
+            };
+            if actual != expected && actual != committed {
+                let mut owners: Vec<String> = claims
+                    .iter()
+                    .map(|claim| format!("`{}`", claim.resource))
+                    .collect();
+                owners.dedup();
+                drifted.push(format!(
+                    "`{path}` has changes that render will discard: it is rendered by {} {}, so \
+                     newgit rewrites it from committed content and this instance's values ({} \
+                     line(s) differ). Move the edit into the committed file in the store repo \
+                     to keep it.",
+                    if owners.len() == 1 {
+                        "resource"
+                    } else {
+                        "resources"
+                    },
+                    owners.join(" and "),
+                    differing_lines(&expected, &actual)
+                ));
             }
         }
         drifted
@@ -4326,7 +4382,7 @@ impl BranchManager {
                 // the caller actually asked for.
                 let _ = supervisor.stop(name, &definition.stop_signal());
             }
-            branch.resources.remove(name);
+            self.unbind_resource(&mut branch, name)?;
             branch.updated_at = Utc::now();
             self.store.save_branch_record(&branch)?;
             unbound_instances.push(branch.name);
@@ -9845,6 +9901,12 @@ impl BranchManager {
             }
 
             if let Some(binding) = branch.resources.remove(name) {
+                // Its values come out of the files it rendered, as an unbind
+                // takes them: a capture reverses only bound claims, so left
+                // in they would reach a shared lane. `use` renders them again.
+                if let Err(error) = unrender_binding(&branch.workspace_path, &binding) {
+                    report.note = Some(format!("its rendered values were left in: {error}"));
+                }
                 branch.parked.insert(
                     name.clone(),
                     ParkedBinding {
@@ -10122,6 +10184,67 @@ fn hook_program(exe: Option<&std::path::Path>, path_var: Option<&std::ffi::OsStr
 /// Quote `value` as one POSIX shell word.
 fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Take a binding's values out of every file it rendered that is still
+/// there. Reversed rather than re-rendered: a file another resource also
+/// renders keeps that resource's values and any edit beside them, and a file
+/// only this one rendered goes back to its committed defaults.
+fn unrender_binding(workspace: &Utf8Path, binding: &ResourceBinding) -> Result<()> {
+    for record in &binding.rendered {
+        let path = workspace.join(&record.path);
+        if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+            continue;
+        }
+        let Ok(current) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let reversed = render::reverse(&current, &record.applied);
+        if reversed != current {
+            std::fs::write(&path, &reversed)
+                .map_err(|source| NewgitError::io(path.clone(), source))?;
+        }
+    }
+    Ok(())
+}
+
+/// Every resource's claim on `path` in this instance, in resource-name
+/// order. A file several resources render is written, checked for drift,
+/// and reversed over all of these at once.
+fn claims_on<'a>(branch: &'a BranchInstance, path: &Utf8Path) -> Vec<render::Claim<'a>> {
+    branch
+        .resources
+        .iter()
+        .flat_map(|(resource, binding)| {
+            binding
+                .rendered
+                .iter()
+                .filter(move |record| record.path == path)
+                .map(move |record| render::Claim {
+                    resource,
+                    applied: &record.applied,
+                })
+        })
+        .collect()
+}
+
+/// The distinct paths this instance's resources rendered, among the records
+/// `keep` selects. Distinct because several resources may render one file.
+fn rendered_paths(
+    branch: &BranchInstance,
+    keep: impl Fn(&RenderRecord) -> bool,
+) -> Vec<Utf8PathBuf> {
+    let mut paths: Vec<Utf8PathBuf> = Vec::new();
+    for record in branch
+        .resources
+        .values()
+        .flat_map(|binding| binding.rendered.iter())
+    {
+        if keep(record) && !paths.contains(&record.path) {
+            paths.push(record.path.clone());
+        }
+    }
+    paths
 }
 
 /// How many lines differ between the expected render and what is on disk —
