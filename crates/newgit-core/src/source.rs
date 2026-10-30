@@ -703,10 +703,17 @@ impl GitSource {
     /// HEAD does not, so without this `git add -A` would sweep the instance's
     /// rendered ports into the checkpoint — the one place skip-worktree does
     /// not protect on its own.
+    ///
+    /// `left_out` is what the binding leaves out of the working tree, and
+    /// `put_back` the bound paths nested in it (see
+    /// `BranchManager::sparse_paths`). What is under the one and not the
+    /// other is out of the instance's scope, and the snapshot leaves it out.
     pub fn workspace_dirty_commit(
         workspace: &Utf8Path,
         message: &str,
         rendered: &[Utf8PathBuf],
+        left_out: &[&Utf8Path],
+        put_back: &[&Utf8Path],
     ) -> Result<Option<String>> {
         let scratch = tempfile::tempdir().map_err(|source| NewgitError::io(workspace, source))?;
         let index = scratch.path().join("index");
@@ -722,7 +729,32 @@ impl GitSource {
             args.extend(rendered.iter().map(|path| path.as_str()));
             run_git_env(&args, &env)?;
         }
-        run_git_env(&["-C", ws, "add", "-A"], &env)?;
+        // Named rather than left to the sparse checkout, outside which `git
+        // add -A` skips an edited file without a word and fails on a new one.
+        let excluded: Vec<String> = left_out
+            .iter()
+            .map(|path| format!(":(exclude,literal){path}"))
+            .collect();
+        let mut add = vec!["-C", ws, "add", "-A", "--", "."];
+        add.extend(excluded.iter().map(String::as_str));
+        run_git_env(&add, &env)?;
+        // That took a bound tracker nested in a dropped one out too, though
+        // it is back in the working tree. `git add` refuses a path that
+        // matches nothing, so one with nothing on disk or at HEAD — nothing
+        // to snapshot — is not named.
+        let nested: Vec<String> = put_back
+            .iter()
+            .filter(|path| {
+                workspace.join(path).symlink_metadata().is_ok()
+                    || run_git(&["-C", ws, "cat-file", "-e", &format!("HEAD:{path}")]).is_ok()
+            })
+            .map(|path| format!(":(literal){path}"))
+            .collect();
+        if !nested.is_empty() {
+            let mut add = vec!["-C", ws, "add", "-A", "--"];
+            add.extend(nested.iter().map(String::as_str));
+            run_git_env(&add, &env)?;
+        }
         let tree = run_git_env(&["-C", ws, "write-tree"], &env)?;
 
         let head_tree = run_git(&["-C", ws, "rev-parse", "HEAD^{tree}"])?;
@@ -745,6 +777,51 @@ impl GitSource {
             &ident,
         )
         .map(Some)
+    }
+
+    /// What `git status` reports under `paths` and outside `except` in a
+    /// workspace clone: changed tracked files, and untracked (non-ignored)
+    /// ones, a directory with nothing tracked in it as one entry.
+    pub fn workspace_changes(
+        workspace: &Utf8Path,
+        paths: &[&Utf8Path],
+        except: &[&Utf8Path],
+    ) -> Result<Vec<Utf8PathBuf>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pathspecs: Vec<String> = paths
+            .iter()
+            .map(|path| format!(":(literal){path}"))
+            .chain(
+                except
+                    .iter()
+                    .map(|path| format!(":(exclude,literal){path}")),
+            )
+            .collect();
+        let mut args = vec![
+            "-C",
+            workspace.as_str(),
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--no-renames",
+            "--untracked-files=normal",
+            "--",
+        ];
+        args.extend(pathspecs.iter().map(String::as_str));
+        // Every v2 entry starts with its kind, so the trim in `run_git` never
+        // reaches a path, and without renames the path is the last field.
+        Ok(run_git(&args)?
+            .split('\0')
+            .filter_map(|entry| match entry.split_once(' ') {
+                Some(("1", fields)) => fields.splitn(8, ' ').nth(7),
+                Some(("u", fields)) => fields.splitn(10, ' ').nth(9),
+                Some(("?", path)) => Some(path),
+                _ => None,
+            })
+            .map(Utf8PathBuf::from)
+            .collect())
     }
 
     pub fn workspace_update_ref(workspace: &Utf8Path, name: &str, rev: &str) -> Result<()> {

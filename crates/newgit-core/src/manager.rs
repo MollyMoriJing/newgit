@@ -3805,6 +3805,51 @@ impl BranchManager {
         drifted
     }
 
+    /// What the working tree has under what the binding leaves out of it
+    /// (`sparse_paths`), by the dropped tracker owning each path. A
+    /// checkpoint taken while those trackers are dropped holds none of it.
+    ///
+    /// Rendered files aside: they are kept out of snapshots by design, undo
+    /// renders them again, and `render_drift` names an edit to one. With
+    /// sparse checkout on, Git takes the skip-worktree bit off a file on
+    /// disk, so it reports one under a dropped tracker's paths as changed
+    /// all the same.
+    fn changes_left_out(
+        &self,
+        branch: &BranchInstance,
+    ) -> Result<BTreeMap<String, Vec<Utf8PathBuf>>> {
+        let mut changes: BTreeMap<String, Vec<Utf8PathBuf>> = BTreeMap::new();
+        let (left_out, put_back) = self.sparse_paths(&branch.dropped);
+        if left_out.is_empty() {
+            return Ok(changes);
+        }
+        let rendered = self.rendered_source_paths(branch);
+        let except: Vec<&Utf8Path> = put_back
+            .iter()
+            .copied()
+            .chain(rendered.iter().map(Utf8PathBuf::as_path))
+            .collect();
+        for path in GitSource::workspace_changes(&branch.workspace_path, &left_out, &except)? {
+            // Its most specific claimant, as ownership goes.
+            let owner = self
+                .code
+                .iter()
+                .filter(|definition| branch.dropped.contains(&definition.name))
+                .flat_map(|definition| {
+                    definition
+                        .paths
+                        .iter()
+                        .filter(|owned| path.starts_with(owned))
+                        .map(move |owned| (owned.components().count(), &definition.name))
+                })
+                .max();
+            if let Some((_, owner)) = owner {
+                changes.entry(owner.clone()).or_default().push(path);
+            }
+        }
+        Ok(changes)
+    }
+
     fn rerender_all(&self, branch: &mut BranchInstance) -> Vec<String> {
         // Checked before the re-render, not after: afterwards the edit is
         // already gone and there is nothing left to name.
@@ -7538,11 +7583,25 @@ impl BranchManager {
         self.ensure_workspace_push(branch)?;
 
         let head_rev = GitSource::workspace_head(&workspace)?;
+        // What the binding leaves out of the working tree is not this
+        // instance's work, so the snapshot leaves it out too. Whatever is
+        // there anyway is named, like a rendered file's edit above.
+        let (left_out, put_back) = self.sparse_paths(&branch.dropped);
         let dirty_rev = GitSource::workspace_dirty_commit(
             &workspace,
             &format!("newgit {id}: uncommitted state of `{}`", branch.name),
             &self.rendered_source_paths(branch),
+            &left_out,
+            &put_back,
         )?;
+        let outside = self.changes_left_out(branch)?;
+        if !outside.is_empty() {
+            warnings.push(format!(
+                "{}, and this checkpoint leaves them out: {} to keep them",
+                describe_left_out(&branch.name, &outside),
+                rebind_hint(&outside)
+            ));
+        }
         let tip = dirty_rev.clone().unwrap_or_else(|| head_rev.clone());
         let workspace_ref = format!("refs/newgit/checkpoints/{id}");
         let store_ref = format!("refs/newgit/checkpoints/{}/{id}", branch.slug);
@@ -8860,6 +8919,22 @@ impl BranchManager {
         let partial = !options.only.is_empty();
         let wanted = |name: &String| !partial || options.only.contains(name);
         let mut dropped_before: Option<BTreeSet<String>> = None;
+
+        // The source restore below removes whatever is in a dropped tracker's
+        // paths, and the safety checkpoint leaves it out, so that would be
+        // gone for good. Refused before anything changes, as `tracker drop`
+        // refuses uncommitted work.
+        if !partial {
+            let outside = self.changes_left_out(&branch)?;
+            if !outside.is_empty() {
+                return Err(NewgitError::Unsupported(format!(
+                    "{}: a checkpoint leaves them out, and undo would remove them; {} to keep \
+                     them, or remove them",
+                    describe_left_out(&branch.name, &outside),
+                    rebind_hint(&outside)
+                )));
+            }
+        }
 
         // The message describes *when* this checkpoint was taken, and a
         // reader takes that as a description of *what is in it*. Those come
@@ -10425,6 +10500,32 @@ fn differing_lines(expected: &str, actual: &str) -> usize {
         .filter(|(left, right)| left != right)
         .count();
     common + expected.len().abs_diff(actual.len())
+}
+
+/// `` `x` has changes in the paths of dropped tracker `b` (`apps/b/new.js`) ``:
+/// what `changes_left_out` found, for a warning or a refusal.
+fn describe_left_out(instance: &str, changes: &BTreeMap<String, Vec<Utf8PathBuf>>) -> String {
+    let trackers: Vec<String> = changes
+        .iter()
+        .map(|(tracker, paths)| {
+            let paths: Vec<String> = paths.iter().map(|path| format!("`{path}`")).collect();
+            format!("`{tracker}` ({})", paths.join(", "))
+        })
+        .collect();
+    format!(
+        "`{instance}` has changes in the paths of dropped tracker{} {}",
+        if changes.len() == 1 { "" } else { "s" },
+        trackers.join(", ")
+    )
+}
+
+/// How the changes `describe_left_out` names come back into the instance's
+/// scope, where a checkpoint holds them.
+fn rebind_hint(changes: &BTreeMap<String, Vec<Utf8PathBuf>>) -> String {
+    match changes.keys().collect::<Vec<_>>().as_slice() {
+        [tracker] => format!("bind it again with `newgit tracker use {tracker}`"),
+        _ => "bind them again with `newgit tracker use <tracker>`".to_owned(),
+    }
 }
 
 fn validate_ownership_with_replacement(
