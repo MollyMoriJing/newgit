@@ -72,9 +72,16 @@ this repository is `spheroman/newgit` on newgit.dev, and GitHub's
   `LANDING_PAGE` in `wrangler.jsonc`. newgit.dev's is
   `remote/site/index.html` in `site`, a secret `project-devs` tracker, so
   the page is never committed and naming it in the config is what
-  publishes it. A change goes live with `newgit tracker merge site` and a
-  checkpoint, within a minute (the edge caches it), with no deploy. With
-  no page to serve, `/` redirects to the GitHub repository.
+  publishes it. A change goes live with `newgit tracker merge site`, within
+  a minute (the edge caches it), with no deploy. A shared secret tracker
+  stored on the remote (`storage = "remote"`) has its `main` there as the
+  repo's branch `main`, as a code tracker does, and `/` reads it.
+  `newgit tracker merge` pushes it before moving `main` here, and fails
+  whole if the push does, so merging such a tracker needs a login and the
+  network. A checkpoint's sync carries only pins and instance branches
+  (`refs/trackers/<tracker>/…`), so a tracker never merged serves nothing
+  and `/` redirects to the GitHub repository. Nothing reads that `main`
+  back into another machine yet: `tracker pull` there still takes its own.
 - GitHub export (0.6.0): `newgit export --remote <NAME>` pushes the chosen
   trackers' `main`s, history and all, to the target defined in
   `.newgit/exports/<NAME>.toml`; `--dry-run` composes and checks without

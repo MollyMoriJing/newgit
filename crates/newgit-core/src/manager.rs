@@ -1147,6 +1147,9 @@ pub struct RestoreReport {
 pub struct MergeTrackerOutcome {
     pub tracker: String,
     pub rev: String,
+    /// The remote project whose copy of the tracker's `main` moved too, for
+    /// a tracker stored there.
+    pub published: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5541,11 +5544,56 @@ impl BranchManager {
                 rev,
             });
         }
+        // The remote first: a merge that did not reach it fails whole,
+        // rather than leaving `main` moved on this machine only.
+        let published = self.publish_tracker_main(&branch, definition, &rev)?;
         lane.set_main(&rev)?;
         Ok(MergeTrackerOutcome {
             tracker: definition.name.clone(),
             rev,
+            published,
         })
+    }
+
+    /// Move the remote's `main` for a shared tracker whose synced state lives
+    /// there (`storage = "remote"`) to `rev`. A checkpoint's sync pushes only
+    /// such a tracker's pins and instance branches, never its `main`, so this
+    /// is the one way that `main` moves.
+    ///
+    /// On the remote a tracker repo's `main` is its branch `main`, as a code
+    /// tracker's is: the repo's default branch, what the Worker's
+    /// `LANDING_PAGE` reads, and what anything reading a tracker by branch
+    /// gets. A per-user tracker's `main` already rides every checkpoint.
+    ///
+    /// Forced, so of two merges at once the last wins; the rev it replaces
+    /// stays on the remote under its pin and its instance branch. A lease
+    /// would refuse instead, but nothing fetches the remote's `main` back
+    /// into this machine's yet, so a refused merge would have no way to
+    /// catch up. The lease comes with that fetch.
+    fn publish_tracker_main(
+        &self,
+        branch: &BranchInstance,
+        definition: &TrackerDefinition,
+        rev: &str,
+    ) -> Result<Option<String>> {
+        if definition.storage != Storage::Remote || definition.audience == "user" {
+            return Ok(None);
+        }
+        let Some(link) = &self.remote else {
+            return Ok(None);
+        };
+        let remote = link.connect(Acting::Workspace(&branch.workspace_path))?;
+        let repo = tracker_repo(&link.project, definition, "");
+        let credential = remote.credential(&link.project, &repo, Scope::Write)?;
+        let url = credential.remote.clone().unwrap_or_default();
+        let pin = format!("refs/trackers/{}/pins/{rev}", definition.name);
+        GitSource::push_refs(
+            &[&format!("--git-dir={}", self.store.paths().tracker_store)],
+            &url,
+            &[format!("{pin}:{pin}"), format!("+{pin}:refs/heads/main")],
+            Some(&basic_auth_header(&credential)),
+        )?;
+        Ok(Some(link.project.clone()))
     }
 
     pub fn create_tracker(

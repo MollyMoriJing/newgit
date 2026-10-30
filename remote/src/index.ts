@@ -691,11 +691,13 @@ async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExp
 const REPOSITORY = "https://github.com/Spheroman/newgit";
 
 /**
- * The landing page: one file of one tracker, at that tracker's trunk, named
+ * The landing page: one file of one tracker, at that tracker's `main`, named
  * by `LANDING_PAGE` in wrangler.jsonc. newgit.dev's is in `site`, a secret
  * tracker, so this route is the one place its content is published, and
  * only the file the config names. Publishing a change is `newgit tracker
- * merge site` and a checkpoint, not a deploy.
+ * merge site`, which moves the repo's branch `main` (its default branch, so
+ * what `HEAD` reads); no deploy. Only a merge creates that branch, so a
+ * tracker never merged serves nothing.
  */
 async function landingPage(method: string, env: Env, repos: Repos): Promise<Response> {
 	const page = env.LANDING_PAGE;
