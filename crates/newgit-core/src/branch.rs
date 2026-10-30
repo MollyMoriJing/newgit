@@ -110,6 +110,16 @@ pub struct ResourceBinding {
     /// — neither runs a command that can fail.
     #[serde(default)]
     pub restore_proven: bool,
+    /// Why rendering this resource's `[[render]]` files failed at bind, when
+    /// it did. Kept in the record, not only in the bind's report, so
+    /// `status` can say why the resource is `failed` and point at the fix:
+    /// the file or the definition, then `newgit resource rebind` (#262).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_error: Option<String>,
+    /// Why an export refused to resolve at bind, when one did; as
+    /// `render_error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_error: Option<String>,
 }
 
 /// A binding a tracker drop set aside: the binding as it was, and how far

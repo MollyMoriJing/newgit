@@ -152,7 +152,9 @@ settling and unsettling a thread
 ([#157](https://github.com/Spheroman/newgit/issues/157)): `stop` stops every
 running long-running action, dependents first, and records what it stopped
 in `.newgit/state/<slug>/stopped.toml`; `start` brings back exactly
-that, dependencies first, so a resource nobody had started stays stopped.
+that, dependencies first, so a resource nobody had started stays stopped,
+plus any `autostart` action that died on its own (`status` shows it as
+`exited(1)`, `killed(SIGKILL)` or `crashed`, not `stopped`).
 Port claims are kept, so the instance returns on the same ports. With
 `--json` each prints `{"instance", "resources": [{"name", "action",
 "status", "error"}]}`, listing only what it acted on, and still exits 1 if
@@ -279,7 +281,8 @@ inside a workspace):
   prints the rendered command and its directory, and runs nothing
 - `newgit stop [instance] [--json]` / `start [instance] [--json]` — stop
   every running long-running action and run each `suspend`, dependents
-  first, and later bring back exactly what that took down; ports,
+  first, and later bring back exactly what that took down (and any
+  `autostart` action that died on its own); ports,
   workspace, trackers, and installs stay as they are. Both exit 0 with
   nothing to do and 1 if any resource failed
 - `newgit checkpoint [instance] [-m <msg>] [--verify]` / `undo [instance]
@@ -323,6 +326,8 @@ Definition management (noun subcommands):
 - `newgit resource add <name> --template <template>` / `list` / `templates`
 - `newgit resource remove <name> [--force]` — `--force` drops it from live
   instances and releases their ports instead of refusing
+- `newgit resource rebind <name> [instance]` — bind it again as spawn did,
+  after fixing a render or export that failed
 
 Remote:
 

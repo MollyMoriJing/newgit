@@ -552,8 +552,12 @@ a failure: `spawn` exits 0, says so, and `spawn --json` lists it under
 `starting`; `newgit status` shows `starting` until the port answers.
 `spawn --from-checkpoint` starts them after its restore, and `newgit
 tracker use` starts those of the resources the tracker brings, which `drop`
-stopped. Nothing else autostarts: `newgit start` brings back exactly what
-`newgit stop` stopped.
+stopped. Nothing else autostarts: `newgit start` brings back what `newgit
+stop` stopped, and any `autostart` action that died on its own. One that
+died (it exited, crashed, or was killed, without newgit stopping it) shows
+in `newgit status` as `exited(1)`, `killed(SIGKILL)` or `crashed`, not
+`stopped`, and makes the instance not ready; its log ends with how it
+ended (`[newgit] exited 1`).
 
 **`stop` is the one name newgit reads for signals.** Names are otherwise
 inert — `start` is pure convention, made real by `long_running` and not by
@@ -582,8 +586,8 @@ to `term`. Precisely:
 anything, dependents first: it signals each supervised process (as above),
 then runs `suspend`. `newgit start [instance]` brings back exactly what the
 last stop took down, dependencies first: it runs `resume`, then starts the
-long-running action again. A resource that was not running at the stop stays
-down, and one whose dependency did not come back is not started against it.
+long-running action again, along with any `autostart` action that died on
+its own. A resource that was not running at the stop stays down, and one whose dependency did not come back is not started against it.
 The workspace, trackers, port claims and installs are left alone, so the
 instance comes back on the same ports with its rendered config still valid.
 
