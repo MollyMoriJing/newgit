@@ -858,15 +858,31 @@ impl GitSource {
     /// worktree as uncommitted changes again, deletions included. Ignored
     /// files (tracker paths, node_modules) are deliberately left alone;
     /// trackers and resources own their restoration.
+    ///
+    /// `left_out` and `put_back` are the paths a sparse checkout leaves out of
+    /// the working tree and puts back inside them. The uncommitted state is
+    /// reapplied everywhere but under `left_out` outside `put_back`, where
+    /// paths keep what the reset gives them: skip-worktree and off disk, when
+    /// the workspace's sparse checkout leaves them out.
     pub fn workspace_restore_to(
         workspace: &Utf8Path,
         head_rev: &str,
         dirty_rev: Option<&str>,
+        left_out: &[&Utf8Path],
+        put_back: &[&Utf8Path],
     ) -> Result<()> {
         let ws = workspace.as_str();
         run_git(&["-C", ws, "reset", "--quiet", "--hard", head_rev])?;
         run_git(&["-C", ws, "clean", "-fdq"])?;
         if let Some(dirty) = dirty_rev {
+            // Checking a tree out writes each path where it differs from the
+            // index, sparse or not, and clears the skip-worktree bit of each
+            // path it writes: a dropped tracker's files would come back as
+            // ordinary tracked files (#225). So under `left_out`, outside
+            // `put_back`, the tree checked out has what the reset above left
+            // in the index, and the checkout leaves those paths alone.
+            let tree =
+                Self::snapshot_within_sparse(workspace, head_rev, dirty, left_out, put_back)?;
             // `--no-overlay`, so a tracked path the snapshot lacks is removed:
             // it was deleted when the checkpoint was taken, and the reset
             // above has just brought it back. The default overlay mode only
@@ -880,7 +896,7 @@ impl GitSource {
                 "checkout",
                 "--quiet",
                 "--no-overlay",
-                dirty,
+                &tree,
                 "--",
                 ".",
             ])?;
@@ -908,6 +924,40 @@ impl GitSource {
             run_git(&["-C", ws, "reset", "--quiet", head_rev])?;
         }
         Ok(())
+    }
+
+    /// The tree to reapply `dirty` from: `dirty`'s own, with `left_out` as
+    /// `head_rev` has it and the `put_back` paths inside it as `dirty` has
+    /// them. Built in a throwaway index, as `workspace_dirty_commit` builds
+    /// the snapshot: nothing in the working tree is written to make it.
+    fn snapshot_within_sparse(
+        workspace: &Utf8Path,
+        head_rev: &str,
+        dirty: &str,
+        left_out: &[&Utf8Path],
+        put_back: &[&Utf8Path],
+    ) -> Result<String> {
+        if left_out.is_empty() {
+            return Ok(dirty.to_owned());
+        }
+        let scratch = tempfile::tempdir().map_err(|source| NewgitError::io(workspace, source))?;
+        let index = scratch.path().join("index");
+        let Some(index) = index.to_str() else {
+            return Err(NewgitError::NonUtf8Path(index.display().to_string()));
+        };
+        let env = [("GIT_INDEX_FILE".to_owned(), index.to_owned())];
+
+        let ws = workspace.as_str();
+        run_git_env(&["-C", ws, "read-tree", dirty], &env)?;
+        for (rev, paths) in [(head_rev, left_out), (dirty, put_back)] {
+            if paths.is_empty() {
+                continue;
+            }
+            let mut args = vec!["-C", ws, "reset", "--quiet", rev, "--"];
+            args.extend(paths.iter().map(|path| path.as_str()));
+            run_git_env(&args, &env)?;
+        }
+        run_git_env(&["-C", ws, "write-tree"], &env)
     }
 
     /// Every path the workspace's Git tracks, workspace-relative. This is
