@@ -30,7 +30,7 @@
 
   The setting also keeps the bit on a dropped tracker's file that is
   written into the working tree again. `git status` no longer shows an
-  edit to it, `tracker drop` of a tracker whose paths hold it no longer
-  refuses over it, and an undo that leaves its tracker dropped leaves the
-  file as it is instead of removing it. `tracker use` brings it into view
-  as a modification.
+  edit to it, and `tracker drop` of a tracker whose paths hold it no
+  longer refuses over it. A checkpoint still names it and `undo` still
+  refuses over it, since they look past that bit, and `tracker use`
+  brings it into view as a modification.

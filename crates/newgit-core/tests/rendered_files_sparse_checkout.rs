@@ -11,9 +11,9 @@
 //!
 //! The patterns now leave the rendered files out too, and the workspace
 //! sets `sparse.expectFilesOutsideOfPatterns`. That setting also keeps the
-//! bit on a dropped tracker's file written again on disk, so `git status`,
-//! `tracker drop` and undo leave that file alone; the last tests pin what
-//! each now does with it.
+//! bit on a dropped tracker's file written again on disk, so `git status`
+//! and `tracker drop` leave that file alone, while a checkpoint and undo
+//! still see it; the last tests pin what each now does with it.
 //!
 //! New tests live in their own file per AGENTS.md's "Working in parallel"
 //! conventions.
@@ -78,10 +78,23 @@ fn status(workspace: &Utf8Path) -> String {
     )
 }
 
+/// A resource, its port and the first number tried for it, the file it
+/// renders, and the committed text its port replaces there.
+type Render = (&'static str, &'static str, u16, &'static str, &'static str);
+
 /// Resource `svc` renders its port into the root-owned `config.toml`, and
-/// `web` into `apps/a/config.toml`, inside tracker `a`'s paths. Code
-/// trackers over the given paths are created in order.
+/// `web` into `apps/a/config.toml`, inside tracker `a`'s paths.
+const RENDERS: &[Render] = &[
+    ("svc", "api", 47300, "config.toml", "port = 1"),
+    ("web", "web", 47400, "apps/a/config.toml", "port = 2"),
+];
+
+/// `RENDERS`, with code trackers over the given paths created in order.
 fn setup(temp: &Utf8Path, trackers: &[(&str, &str)]) -> BranchManager {
+    setup_with(temp, trackers, RENDERS)
+}
+
+fn setup_with(temp: &Utf8Path, trackers: &[(&str, &str)], renders: &[Render]) -> BranchManager {
     let repo = temp.join("store");
     std::fs::create_dir_all(&repo).expect("mkdir");
     git(&repo, &["init", "-q", "-b", "main"]);
@@ -93,6 +106,7 @@ fn setup(temp: &Utf8Path, trackers: &[(&str, &str)]) -> BranchManager {
         ("apps/b/index.js", "b v1\n"),
         ("apps/b/keep.js", "keep v1\n"),
         ("apps/b/inner/x.js", "inner v1\n"),
+        ("apps/b/conf/config.toml", "port = 3\n"),
     ] {
         write(&repo, path, contents);
     }
@@ -105,10 +119,7 @@ fn setup(temp: &Utf8Path, trackers: &[(&str, &str)]) -> BranchManager {
         materializer: None,
     });
     store.write_config(&config).expect("write config");
-    for (name, port, start, path, find) in [
-        ("svc", "api", 47300, "config.toml", "port = 1"),
-        ("web", "web", 47400, "apps/a/config.toml", "port = 2"),
-    ] {
+    for (name, port, start, path, find) in renders {
         std::fs::write(
             store.paths().resources.join(format!("{name}.toml")),
             format!(
@@ -243,6 +254,65 @@ fn a_checkpoint_holds_no_rendered_value_in_a_sparse_workspace_without_the_settin
         ),
         "M\tREADME.md"
     );
+}
+
+/// A rendered file in a bound tracker nested in a dropped one, here all that
+/// tracker has: the snapshot adds such a tracker's paths on their own, and
+/// the mark holds there too, with the setting and, set back to the patterns
+/// an earlier newgit wrote, without it. Undo reapplies those paths on their
+/// own as well, and leaves the mark on.
+#[test]
+fn a_checkpoint_holds_no_rendered_value_in_a_bound_tracker_nested_in_a_dropped_one() {
+    let (_guard, temp) = tempdir();
+    let mut renders = RENDERS.to_vec();
+    renders.push(("deep", "deep", 47500, "apps/b/conf/config.toml", "port = 3"));
+    let manager = setup_with(&temp, &[("b", "apps/b"), ("conf", "apps/b/conf")], &renders);
+    let workspace = dropped_b(&manager);
+    assert_eq!(
+        tag(&workspace, "apps/b/conf/config.toml"),
+        "S apps/b/conf/config.toml"
+    );
+    assert_eq!(status(&workspace), "");
+    write(&workspace, "README.md", "hello agent\n");
+    let snapshot = || {
+        let outcome = manager.checkpoint("x", None).expect("checkpoint");
+        let dirty = outcome.record.source.dirty_rev.expect("README.md is dirty");
+        git(
+            &workspace,
+            &["diff-tree", "-r", "--name-status", "HEAD", &dirty],
+        )
+    };
+    assert_eq!(snapshot(), "M\tREADME.md");
+    manager.undo("x", &UndoOptions::default()).expect("undo");
+    assert_eq!(
+        tag(&workspace, "apps/b/conf/config.toml"),
+        "S apps/b/conf/config.toml"
+    );
+    assert_eq!(status(&workspace), " M README.md");
+
+    git(
+        &workspace,
+        &[
+            "sparse-checkout",
+            "set",
+            "--no-cone",
+            "/*",
+            "!/apps/b/",
+            "!/apps/b",
+            "/apps/b/conf/",
+            "/apps/b/conf",
+        ],
+    );
+    git(
+        &workspace,
+        &["config", "sparse.expectFilesOutsideOfPatterns", "false"],
+    );
+    assert!(
+        status(&workspace).contains(" M apps/b/conf/config.toml"),
+        "{}",
+        status(&workspace)
+    );
+    assert_eq!(snapshot(), "M\tREADME.md");
 }
 
 #[test]
@@ -450,12 +520,13 @@ fn tracker_drop_is_not_refused_over_a_rendered_file_in_its_paths() {
 }
 
 /// `sparse.expectFilesOutsideOfPatterns` keeps the bit on a dropped
-/// tracker's file that is written again, as it keeps it on a rendered file.
-/// So `git status` does not show the edit, and undo's `reset --hard` leaves
-/// the file as it is rather than removing it. Binding the tracker again
-/// brings the edit into view.
+/// tracker's file that is written again, as it keeps it on a rendered file,
+/// so `git status` does not show the edit. A checkpoint still names it, and
+/// undo, which would remove it, still refuses: they read the working tree
+/// past that bit, and leave every file's bit as it was. Binding the tracker
+/// again brings the edit into view.
 #[test]
-fn undo_leaves_a_file_written_again_in_a_dropped_trackers_paths_as_it_is() {
+fn a_checkpoint_and_undo_still_see_a_file_written_again_in_a_dropped_trackers_paths() {
     let (_guard, temp) = tempdir();
     let manager = setup(&temp, AB);
     let workspace = dropped_b(&manager);
@@ -463,11 +534,27 @@ fn undo_leaves_a_file_written_again_in_a_dropped_trackers_paths_as_it_is() {
     write(&workspace, "apps/b/index.js", "b edited while dropped\n");
     assert_eq!(status(&workspace), "");
 
-    manager.undo("x", &UndoOptions::default()).expect("undo");
+    let named = "`x` has changes in the paths of dropped tracker `b` (`apps/b/index.js`)";
+    let checkpoint = manager.checkpoint("x", None).expect("checkpoint");
+    assert!(
+        checkpoint
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with(named)),
+        "{:?}",
+        checkpoint.warnings
+    );
+    let refused = manager
+        .undo("x", &UndoOptions::default())
+        .expect_err("undo would remove the edit");
+    assert!(refused.to_string().starts_with(named), "{refused}");
     assert_eq!(
         read(&workspace, "apps/b/index.js").as_deref(),
         Some("b edited while dropped\n")
     );
+    assert_eq!(tag(&workspace, "apps/b/index.js"), "S apps/b/index.js");
+    assert_eq!(tag(&workspace, "config.toml"), "S config.toml");
+    assert_eq!(status(&workspace), "");
 
     manager.use_tracker("x", "b").expect("use b");
     assert_eq!(
@@ -477,9 +564,9 @@ fn undo_leaves_a_file_written_again_in_a_dropped_trackers_paths_as_it_is() {
     assert_eq!(status(&workspace), " M apps/b/index.js");
 }
 
-/// The same for `tracker drop`'s check for uncommitted work: a file of a
-/// dropped tracker nested in the one being dropped, written again, is not
-/// that check's to see, and the drop leaves it on disk.
+/// `tracker drop`'s check for uncommitted work goes by `git status`, so a
+/// file of a dropped tracker nested in the one being dropped, written
+/// again, is not that check's to see, and the drop leaves it on disk.
 #[test]
 fn tracker_drop_leaves_a_file_written_again_in_a_nested_dropped_trackers_paths() {
     let (_guard, temp) = tempdir();

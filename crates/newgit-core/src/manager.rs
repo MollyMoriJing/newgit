@@ -906,6 +906,9 @@ pub struct CheckpointOutcome {
     /// Why the checkpoint is not on the remote, when there is one and syncing
     /// failed. (Also among `warnings`.)
     pub sync_error: Option<String>,
+    /// Trackers the remote refused, so left out of a sync that otherwise
+    /// went through. (Each is also among `warnings`, with why.)
+    pub left_out: Vec<String>,
     /// Resources that were not up, so not captured.
     pub degraded: Vec<String>,
 }
@@ -1144,6 +1147,9 @@ pub struct RestoreReport {
 pub struct MergeTrackerOutcome {
     pub tracker: String,
     pub rev: String,
+    /// The remote project whose copy of the tracker's `main` moved too, for
+    /// a tracker stored there.
+    pub published: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3804,6 +3810,52 @@ impl BranchManager {
         drifted
     }
 
+    /// What the working tree has under what the binding leaves out of it
+    /// (`sparse_paths`), by the dropped tracker owning each path. A
+    /// checkpoint taken while those trackers are dropped holds none of it.
+    ///
+    /// Rendered files aside: they are kept out of snapshots by design, undo
+    /// renders them again, and `render_drift` names an edit to one.
+    /// `workspace_changes` looks past the skip-worktree bit of a file on
+    /// disk, which is how it sees a dropped tracker's file written again,
+    /// so it would report one under a dropped tracker's paths as changed
+    /// all the same.
+    fn changes_left_out(
+        &self,
+        branch: &BranchInstance,
+    ) -> Result<BTreeMap<String, Vec<Utf8PathBuf>>> {
+        let mut changes: BTreeMap<String, Vec<Utf8PathBuf>> = BTreeMap::new();
+        let (left_out, put_back) = self.sparse_paths(&branch.dropped);
+        if left_out.is_empty() {
+            return Ok(changes);
+        }
+        let rendered = self.rendered_source_paths(branch);
+        let except: Vec<&Utf8Path> = put_back
+            .iter()
+            .copied()
+            .chain(rendered.iter().map(Utf8PathBuf::as_path))
+            .collect();
+        for path in GitSource::workspace_changes(&branch.workspace_path, &left_out, &except)? {
+            // Its most specific claimant, as ownership goes.
+            let owner = self
+                .code
+                .iter()
+                .filter(|definition| branch.dropped.contains(&definition.name))
+                .flat_map(|definition| {
+                    definition
+                        .paths
+                        .iter()
+                        .filter(|owned| path.starts_with(owned))
+                        .map(move |owned| (owned.components().count(), &definition.name))
+                })
+                .max();
+            if let Some((_, owner)) = owner {
+                changes.entry(owner.clone()).or_default().push(path);
+            }
+        }
+        Ok(changes)
+    }
+
     fn rerender_all(&self, branch: &mut BranchInstance) -> Vec<String> {
         // Checked before the re-render, not after: afterwards the edit is
         // already gone and there is nothing left to name.
@@ -5317,21 +5369,38 @@ impl BranchManager {
     /// every dropped code tracker's paths left out, with any bound tracker
     /// nested inside one put back. Empty when nothing is left out.
     fn sparse_patterns(&self, dropped_names: &BTreeSet<String>) -> Vec<String> {
+        let (left_out, put_back) = self.sparse_paths(dropped_names);
+        if left_out.is_empty() {
+            return Vec::new();
+        }
+        let mut patterns = vec!["/*".to_owned()];
+        for path in left_out {
+            patterns.push(format!("!/{path}/"));
+            patterns.push(format!("!/{path}"));
+        }
+        for path in put_back {
+            patterns.push(format!("/{path}/"));
+            patterns.push(format!("/{path}"));
+        }
+        patterns
+    }
+
+    /// The paths behind [`Self::sparse_patterns`]: what an instance that
+    /// drops `dropped_names` leaves out of its working tree — every dropped
+    /// code tracker's paths — and what it puts back inside them, the paths
+    /// of any bound tracker nested there.
+    fn sparse_paths(&self, dropped_names: &BTreeSet<String>) -> (Vec<&Utf8Path>, Vec<&Utf8Path>) {
         let dropped: Vec<&TrackerDefinition> = self
             .code
             .iter()
             .filter(|definition| dropped_names.contains(&definition.name))
             .collect();
-        if dropped.iter().all(|definition| definition.paths.is_empty()) {
-            return Vec::new();
-        }
-        let mut patterns = vec!["/*".to_owned()];
-        for definition in &dropped {
-            for path in &definition.paths {
-                patterns.push(format!("!/{path}/"));
-                patterns.push(format!("!/{path}"));
-            }
-        }
+        let left_out = dropped
+            .iter()
+            .flat_map(|definition| &definition.paths)
+            .map(Utf8PathBuf::as_path)
+            .collect();
+        let mut put_back = Vec::new();
         for definition in &self.code {
             if dropped_names.contains(&definition.name) {
                 continue;
@@ -5344,12 +5413,11 @@ impl BranchManager {
                         .any(|outer| path != outer && path.starts_with(outer))
                 });
                 if inside {
-                    patterns.push(format!("/{path}/"));
-                    patterns.push(format!("/{path}"));
+                    put_back.push(path.as_path());
                 }
             }
         }
-        patterns
+        (left_out, put_back)
     }
 
     pub fn capture_tracker(&self, instance: &str, tracker: &str) -> Result<CaptureReport> {
@@ -5576,11 +5644,56 @@ impl BranchManager {
                 rev,
             });
         }
+        // The remote first: a merge that did not reach it fails whole,
+        // rather than leaving `main` moved on this machine only.
+        let published = self.publish_tracker_main(&branch, definition, &rev)?;
         lane.set_main(&rev)?;
         Ok(MergeTrackerOutcome {
             tracker: definition.name.clone(),
             rev,
+            published,
         })
+    }
+
+    /// Move the remote's `main` for a shared tracker whose synced state lives
+    /// there (`storage = "remote"`) to `rev`. A checkpoint's sync pushes only
+    /// such a tracker's pins and instance branches, never its `main`, so this
+    /// is the one way that `main` moves.
+    ///
+    /// On the remote a tracker repo's `main` is its branch `main`, as a code
+    /// tracker's is: the repo's default branch, what the Worker's
+    /// `LANDING_PAGE` reads, and what anything reading a tracker by branch
+    /// gets. A per-user tracker's `main` already rides every checkpoint.
+    ///
+    /// Forced, so of two merges at once the last wins; the rev it replaces
+    /// stays on the remote under its pin and its instance branch. A lease
+    /// would refuse instead, but nothing fetches the remote's `main` back
+    /// into this machine's yet, so a refused merge would have no way to
+    /// catch up. The lease comes with that fetch.
+    fn publish_tracker_main(
+        &self,
+        branch: &BranchInstance,
+        definition: &TrackerDefinition,
+        rev: &str,
+    ) -> Result<Option<String>> {
+        if definition.storage != Storage::Remote || definition.audience == "user" {
+            return Ok(None);
+        }
+        let Some(link) = &self.remote else {
+            return Ok(None);
+        };
+        let remote = link.connect(Acting::Workspace(&branch.workspace_path))?;
+        let repo = tracker_repo(&link.project, definition, "");
+        let credential = remote.credential(&link.project, &repo, Scope::Write)?;
+        let url = credential.remote.clone().unwrap_or_default();
+        let pin = format!("refs/trackers/{}/pins/{rev}", definition.name);
+        GitSource::push_refs(
+            &[&format!("--git-dir={}", self.store.paths().tracker_store)],
+            &url,
+            &[format!("{pin}:{pin}"), format!("+{pin}:refs/heads/main")],
+            Some(&basic_auth_header(&credential)),
+        )?;
+        Ok(Some(link.project.clone()))
     }
 
     pub fn create_tracker(
@@ -7509,11 +7622,25 @@ impl BranchManager {
         self.ensure_workspace_push(branch)?;
 
         let head_rev = GitSource::workspace_head(&workspace)?;
+        // What the binding leaves out of the working tree is not this
+        // instance's work, so the snapshot leaves it out too. Whatever is
+        // there anyway is named, like a rendered file's edit above.
+        let (left_out, put_back) = self.sparse_paths(&branch.dropped);
         let dirty_rev = GitSource::workspace_dirty_commit(
             &workspace,
             &format!("newgit {id}: uncommitted state of `{}`", branch.name),
             &self.rendered_source_paths(branch),
+            &left_out,
+            &put_back,
         )?;
+        let outside = self.changes_left_out(branch)?;
+        if !outside.is_empty() {
+            warnings.push(format!(
+                "{}, and this checkpoint leaves them out: {} to keep them",
+                describe_left_out(&branch.name, &outside),
+                rebind_hint(&outside)
+            ));
+        }
         let tip = dirty_rev.clone().unwrap_or_else(|| head_rev.clone());
         let workspace_ref = format!("refs/newgit/checkpoints/{id}");
         let store_ref = format!("refs/newgit/checkpoints/{}/{id}", branch.slug);
@@ -7695,8 +7822,21 @@ impl BranchManager {
 
         // The checkpoint exists locally now, whatever happens next; syncing
         // it is what lets another machine spawn it.
+        let mut left_out = Vec::new();
         let sync_error = match self.sync_checkpoint(branch, &record) {
-            Ok(()) => None,
+            Ok(refused) => {
+                for (tracker, reason) in refused {
+                    warnings.push(format!(
+                        "`{tracker}` is not in checkpoint {} on the remote, which has no \
+                         definition for it yet: {reason}. The rest synced, and the first \
+                         checkpoint after its definition reaches the default branch brings \
+                         `{tracker}`",
+                        record.id
+                    ));
+                    left_out.push(tracker);
+                }
+                None
+            }
             Err(error) => {
                 warnings.push(format!(
                     "checkpoint {} is saved here but not on the remote: {error}",
@@ -7711,6 +7851,7 @@ impl BranchManager {
             record_path,
             warnings,
             sync_error,
+            left_out,
             degraded,
         })
     }
@@ -8539,17 +8680,25 @@ impl BranchManager {
     ///
     /// Registers the instance first if an earlier attempt failed. Runs on
     /// the workspace's own token, so it works where only that token exists.
+    ///
+    /// A secret tracker the remote will not take a credential for is left
+    /// out, and returned with the remote's reason, rather than failing the
+    /// sync: most often it is new, and the remote reads its audience from
+    /// its definition on the default branch, which only this very push or
+    /// merge would put there. The record that goes up leaves it out too, so
+    /// it never names a rev the remote does not have. Any other failure
+    /// still fails the sync.
     fn sync_checkpoint(
         &self,
         branch: &mut BranchInstance,
         record: &CheckpointRecord,
-    ) -> Result<()> {
+    ) -> Result<Vec<(String, String)>> {
         let Some(link) = &self.remote else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         self.register_remote(branch)?;
         let Some(binding) = branch.remote.clone() else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         // Nothing is uploaded until everything it would carry is checked:
         // the checkpoint ref — the uncommitted-work commit included — and
@@ -8566,6 +8715,7 @@ impl BranchManager {
         record.code = code;
 
         let mut login = None;
+        let mut left_out = Vec::new();
         for state in &record.tracker_states {
             let Some(rev) = &state.content_rev else {
                 continue;
@@ -8582,7 +8732,21 @@ impl BranchManager {
                 definition,
                 login.as_deref().unwrap_or_default(),
             );
-            let credential = remote.credential(&binding.project, &repo, Scope::Write)?;
+            let credential = match remote.credential(&binding.project, &repo, Scope::Write) {
+                Ok(credential) => credential,
+                // 404 is a tracker whose definition is not on the default
+                // branch yet, which a later checkpoint can still bring. A 403
+                // is a real refusal (not a member, not in the audience):
+                // waiting will not change it, so it fails the sync.
+                Err(NewgitError::Remote {
+                    status: 404,
+                    message,
+                }) => {
+                    left_out.push((state.name.clone(), message));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let url = credential.remote.clone().unwrap_or_default();
             let prefix = format!("refs/trackers/{}", state.name);
             let pin = format!("{prefix}/pins/{rev}");
@@ -8605,12 +8769,16 @@ impl BranchManager {
             )?;
         }
 
+        record
+            .tracker_states
+            .retain(|state| !left_out.iter().any(|(name, _)| *name == state.name));
         let value = serde_json::to_value(&record).map_err(|error| NewgitError::Remote {
             status: 0,
             message: format!("could not encode checkpoint {}: {error}", record.id),
         })?;
         remote.put_checkpoint(&binding.project, &branch.slug, &record.id, &value)?;
-        remote.set_head(&binding.project, &branch.slug, &record.source.head_rev)
+        remote.set_head(&binding.project, &branch.slug, &record.source.head_rev)?;
+        Ok(left_out)
     }
 
     /// `log_name` labels the action log: `checkpoint` for a real checkpoint,
@@ -8791,6 +8959,22 @@ impl BranchManager {
         let wanted = |name: &String| !partial || options.only.contains(name);
         let mut dropped_before: Option<BTreeSet<String>> = None;
 
+        // The source restore below removes whatever is in a dropped tracker's
+        // paths, and the safety checkpoint leaves it out, so that would be
+        // gone for good. Refused before anything changes, as `tracker drop`
+        // refuses uncommitted work.
+        if !partial {
+            let outside = self.changes_left_out(&branch)?;
+            if !outside.is_empty() {
+                return Err(NewgitError::Unsupported(format!(
+                    "{}: a checkpoint leaves them out, and undo would remove them; {} to keep \
+                     them, or remove them",
+                    describe_left_out(&branch.name, &outside),
+                    rebind_hint(&outside)
+                )));
+            }
+        }
+
         // The message describes *when* this checkpoint was taken, and a
         // reader takes that as a description of *what is in it*. Those come
         // apart precisely when the last thing that happened to this instance
@@ -8920,10 +9104,17 @@ impl BranchManager {
             // workspace happens to be on now: undo moves the branch it
             // restores, never a bystander.
             self.point_workspace_head(&branch, &restored.source, &mut warnings)?;
+            // The uncommitted state is not reapplied to what that binding
+            // leaves out of the working tree — a dropped tracker's paths, as
+            // its current definition names them — so none of it is written
+            // there (#225).
+            let (left_out, put_back) = self.sparse_paths(&branch.dropped);
             GitSource::workspace_restore_to(
                 &workspace,
                 &restored.source.head_rev,
                 restored.source.dirty_rev.as_deref(),
+                &left_out,
+                &put_back,
             )?;
             // The instance's branch follows only a checkpoint taken on it. Its
             // pre-undo tip is what it was last blessed to — the safety
@@ -10348,6 +10539,32 @@ fn differing_lines(expected: &str, actual: &str) -> usize {
         .filter(|(left, right)| left != right)
         .count();
     common + expected.len().abs_diff(actual.len())
+}
+
+/// `` `x` has changes in the paths of dropped tracker `b` (`apps/b/new.js`) ``:
+/// what `changes_left_out` found, for a warning or a refusal.
+fn describe_left_out(instance: &str, changes: &BTreeMap<String, Vec<Utf8PathBuf>>) -> String {
+    let trackers: Vec<String> = changes
+        .iter()
+        .map(|(tracker, paths)| {
+            let paths: Vec<String> = paths.iter().map(|path| format!("`{path}`")).collect();
+            format!("`{tracker}` ({})", paths.join(", "))
+        })
+        .collect();
+    format!(
+        "`{instance}` has changes in the paths of dropped tracker{} {}",
+        if changes.len() == 1 { "" } else { "s" },
+        trackers.join(", ")
+    )
+}
+
+/// How the changes `describe_left_out` names come back into the instance's
+/// scope, where a checkpoint holds them.
+fn rebind_hint(changes: &BTreeMap<String, Vec<Utf8PathBuf>>) -> String {
+    match changes.keys().collect::<Vec<_>>().as_slice() {
+        [tracker] => format!("bind it again with `newgit tracker use {tracker}`"),
+        _ => "bind them again with `newgit tracker use <tracker>`".to_owned(),
+    }
 }
 
 fn validate_ownership_with_replacement(
