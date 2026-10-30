@@ -322,6 +322,11 @@ Definition management (noun subcommands):
   [instance] [--stash | --discard]` — a drop parks the resources the tracker
   brought: taken down by `suspend` (else `[cleanup]`), ports kept, and
   brought back on them by the next `use`; `remove` tears parked ones down
+- `newgit tracker repair [--dry-run]` — rewrite code tracker commits split
+  before newgit kept each original's message ending and signature, so a
+  clone from the remote gets the project's own commit ids. Moves every code
+  tracker branch, and on the remote each branch's list: a force push of
+  tracker history, so run it once, after upgrading
 - `newgit log <tracker> [instance] [-- <git log args>]` — one tracker's
   history: an instance's branch as of its last checkpoint, or the project
   root's
