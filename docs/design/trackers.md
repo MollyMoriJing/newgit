@@ -128,7 +128,10 @@ At spawn, for each slot (each role, and each role-less tracker):
 
 `newgit tracker use <tracker>` binds a tracker into an existing instance:
 swapping out whatever filled its role, binding what it requires, and starting
-the resources it brings. `newgit tracker drop <tracker>` unbinds one, and
+the resources it brings. A secret tracker comes back with the content it had
+when it was dropped, or, if the instance never bound it, with its main, as a
+spawn would bind it; anything already sitting at its paths is captured to its
+instance branch first. `newgit tracker drop <tracker>` unbinds one, and
 *parks* the resources no longer brought (#254, #255): each is taken down as
 `newgit stop` would take it down (its process signalled, its `suspend` run),
 or, with no `suspend`, by its `[cleanup]`, and the output names the hook that

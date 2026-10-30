@@ -2189,7 +2189,12 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             if change.restored_stash {
                 println!("  its uncommitted work, stashed when it was dropped, is back");
             }
-            if change.files > 0 {
+            if change.files > 0 && change.seeded {
+                println!(
+                    "  {} put in place from its main",
+                    plural(change.files, "file")
+                );
+            } else if change.files > 0 {
                 println!("  {} restored", plural(change.files, "file"));
             }
             print_stale_render(&change.stale);
