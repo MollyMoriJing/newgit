@@ -739,21 +739,29 @@ dependencies are bound, just before `prepare`, and again before a
 would see in its environment, so an Expo `.env` can name the Supabase
 resource's URL.
 
-**A render never writes through a symlink** (#283). It rewrites its file in
-place with this instance's values, so through a link at the path, or at a
-directory above it, it would rewrite whatever the link points at: any file
-the user can write, in the workspace or not. This is the write side of
+**A render never writes through a link** (#283). Before writing any of a
+resource's files, it refuses one that is a symlink or lies under a
+symlinked directory, naming the path, the link, and its target. Through a
+symlinked directory the write would land wherever the link leads: any
+directory the user can write, in the workspace or not. Replacing a symlink
+at the path would discard it without a word. This is the write side of
 [capture's rule](#secret-trackers), judged the same way, with `lstat` and
-nothing followed. Before writing any of a resource's files, the render
-refuses one that is a link or lies under a symlinked directory, naming the
-path, the link, and its target. The bind fails as on any failed render, and
-a re-render after `undo`, `tracker pull`, or `tracker checkout` warns. A
-link that stays inside the workspace is refused too: it reaches a file
-other than the one the committed content describes, which would then carry
-this instance's ports into whatever captures or commits it. Taking a
-render's values back out, before a capture or when a resource is unbound,
-leaves a file reached through a link alone. Remove the link, and `newgit
+nothing followed. The bind fails as on any failed render, and a re-render
+after `undo`, `tracker pull`, or `tracker checkout` warns. A link that
+stays inside the workspace is refused too: it leads to a file other than
+the one the committed content describes, which would then carry this
+instance's ports into whatever captures or commits it. Taking a render's
+values back out, before a capture or when a resource is unbound, leaves a
+file reached through a symlink alone. Remove the link, and `newgit
 resource rebind` writes the file.
+
+A hard link cannot be told from a regular file, and a write into it would
+change every name it has, in the workspace or not. So neither a render nor
+taking its values back out (and putting them back after a capture) writes
+into a file: each writes a temporary file beside the path and renames it
+over the path, as the install store does. The link's other names keep
+what they held, and the path gets a file of its own, with the old one's
+mode.
 
 **A re-render does not reach a process already running.** A dev server
 reads `.env.local` when it starts. When `tracker use` binds a resource whose

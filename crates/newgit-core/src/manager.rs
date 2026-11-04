@@ -296,7 +296,7 @@ struct RenderedRestore {
 impl RenderedRestore {
     fn restore(self) -> Result<()> {
         for (path, contents) in self.files {
-            std::fs::write(&path, contents).map_err(|source| NewgitError::io(path, source))?;
+            replace_file(&path, &contents)?;
         }
         Ok(())
     }
@@ -3428,8 +3428,7 @@ impl BranchManager {
             if let Some(parent) = target.parent() {
                 crate::materializer::create_dir_all(parent)?;
             }
-            std::fs::write(&target, contents)
-                .map_err(|source| NewgitError::io(target.clone(), source))?;
+            replace_file(&target, &contents)?;
 
             if owner.is_none() {
                 source_owned.push(path.clone());
@@ -3484,11 +3483,11 @@ impl BranchManager {
             record.tracker.as_deref() == Some(tracker.name.as_str())
         }) {
             let path = branch.workspace_path.join(&relative);
-            // Only a regular file is un-rendered in place. Through a
-            // symlink, at the path or at a directory above it, this would
-            // read, and then write, wherever it leads; capture keeps or
-            // refuses the link itself.
-            if !rewritable_in_place(&branch.workspace_path, &relative) {
+            // Only a regular file is un-rendered. Under a symlinked
+            // directory this would read, and then write, wherever the link
+            // leads, and a link at the path would be replaced; capture keeps
+            // or refuses the link itself.
+            if !rewritable(&branch.workspace_path, &relative) {
                 continue;
             }
             let Ok(current) = std::fs::read_to_string(&path) else {
@@ -3527,8 +3526,7 @@ impl BranchManager {
             if reversed == current {
                 continue;
             }
-            std::fs::write(&path, &reversed)
-                .map_err(|source| NewgitError::io(path.clone(), source))?;
+            replace_file(&path, &reversed)?;
             restore.files.push((path, current));
         }
         Ok(restore)
@@ -3715,7 +3713,7 @@ impl BranchManager {
     ) -> Result<()> {
         for record in &binding.rendered {
             let path = branch.workspace_path.join(&record.path);
-            if !rewritable_in_place(&branch.workspace_path, &record.path) {
+            if !rewritable(&branch.workspace_path, &record.path) {
                 continue;
             }
             let Ok(current) = std::fs::read_to_string(&path) else {
@@ -3735,8 +3733,7 @@ impl BranchManager {
             let reversed =
                 render::reverse_rendered(&current, &record.path, &committed, &claim).content;
             if reversed != current {
-                std::fs::write(&path, &reversed)
-                    .map_err(|source| NewgitError::io(path.clone(), source))?;
+                replace_file(&path, &reversed)?;
             }
         }
         Ok(())
@@ -3778,7 +3775,7 @@ impl BranchManager {
         for path in rendered_paths(branch, |_| true) {
             // Through a link the render refuses rather than rewrites (#283),
             // so nothing there is about to be discarded.
-            if !rewritable_in_place(&branch.workspace_path, &path) {
+            if !rewritable(&branch.workspace_path, &path) {
                 continue;
             }
             let tracker = branch
@@ -10541,10 +10538,11 @@ fn rendered_paths(
 }
 
 /// Refuse to render `path` through a symlink, at the path itself or at a
-/// directory above it (#283). A render rewrites its file in place, so through
-/// a link it would write this instance's values wherever the link leads,
-/// which can be anywhere the user can write. Judged with `lstat` alone:
-/// nothing is followed to decide.
+/// directory above it (#283). Under a linked directory the render's write
+/// would land wherever the link leads, which can be anywhere the user can
+/// write. A link at the path is refused rather than replaced, naming where it
+/// leads, so whoever put it there decides what belongs at the path. Judged
+/// with `lstat` alone: nothing is followed to decide.
 fn refuse_render_through_link(workspace: &Utf8Path, resource: &str, path: &Utf8Path) -> Result<()> {
     if let Some((link, target)) = symlinked_parent(workspace, path) {
         return Err(NewgitError::RenderUnderSymlinkedParent {
@@ -10567,13 +10565,54 @@ fn refuse_render_through_link(workspace: &Utf8Path, resource: &str, path: &Utf8P
     Ok(())
 }
 
-/// Whether newgit rewrites a rendered file in place: a regular file, reached
-/// without going through a symlink. Anything else would be written wherever
-/// the link leads, so a render refuses it (`refuse_render_through_link`), and
-/// taking its values back out, or reporting drift in it, leaves it alone.
-fn rewritable_in_place(workspace: &Utf8Path, path: &Utf8Path) -> bool {
+/// Whether newgit rewrites a rendered file: a regular file, reached without
+/// going through a symlink. Under a linked directory the write would land
+/// wherever the link leads, and a link at the path would be replaced, so a
+/// render refuses either (`refuse_render_through_link`), and taking its
+/// values back out, or reporting drift in it, leaves it alone.
+fn rewritable(workspace: &Utf8Path, path: &Utf8Path) -> bool {
     symlinked_parent(workspace, path).is_none()
         && std::fs::symlink_metadata(workspace.join(path)).is_ok_and(|meta| meta.is_file())
+}
+
+/// Write a rendered file, or one with its values taken back out, by
+/// replacing it rather than writing into it (#283). The content goes to a
+/// temporary file beside the path, which is renamed over it. A hard link at
+/// the path looks like any regular file, and a write into it would change its
+/// other names too; replaced, they keep what they held, and the path gets a
+/// file of its own. A symlink that appears at the path after it was checked
+/// is replaced, not followed, and a reader sees the old file or the new one,
+/// never half of it.
+///
+/// A new file gets the mode `std::fs::write` would give it (0666 less the
+/// umask) rather than the temporary's 0600, and an existing one keeps its
+/// own.
+fn replace_file(path: &Utf8Path, contents: &str) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = path.parent().unwrap_or_else(|| Utf8Path::new("."));
+    // Not followed: only a regular file's mode is carried over.
+    let mode = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map(|metadata| metadata.permissions());
+    let mut temp = tempfile::Builder::new()
+        .prefix(".")
+        .suffix(".newgit-rendering")
+        .permissions(std::fs::Permissions::from_mode(0o666))
+        .tempfile_in(dir)
+        .map_err(|source| NewgitError::io(dir, source))?;
+    if let Some(mode) = mode {
+        temp.as_file()
+            .set_permissions(mode)
+            .map_err(|source| NewgitError::io(path, source))?;
+    }
+    temp.write_all(contents.as_bytes())
+        .map_err(|source| NewgitError::io(path, source))?;
+    temp.persist(path)
+        .map_err(|error| NewgitError::io(path, error.error))?;
+    Ok(())
 }
 
 /// How many lines differ between the expected render and what is on disk —

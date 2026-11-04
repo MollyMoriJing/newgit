@@ -319,15 +319,15 @@ pub enum NewgitError {
     )]
     RenderPathNotCommitted { resource: String, path: Utf8PathBuf },
 
-    /// A `[[render]]` target is a symlink. A render rewrites its file in
-    /// place, so it would write this instance's values into whatever the
-    /// link points at: a file outside the workspace, or another one in it.
+    /// A `[[render]]` target is a symlink. newgit renders only a regular
+    /// file: it neither writes this instance's values into whatever the link
+    /// points at, a file outside the workspace or another one in it, nor
+    /// replaces a link someone put there.
     #[error(
         "refusing to render `{path}` for resource `{resource}`: it is a symlink to `{target}`, \
-         and newgit renders only a regular file. A render rewrites its file in place, so \
-         through the link it would write this instance's values into whatever the link points \
-         at, in the workspace or not. Remove the link, and the render writes `{path}` from \
-         committed content"
+         and newgit renders only a regular file. It will not write this instance's values into \
+         whatever the link points at, in the workspace or not, or replace a link you put there. \
+         Remove the link, and the render writes `{path}` from committed content"
     )]
     RenderThroughSymlink {
         resource: String,

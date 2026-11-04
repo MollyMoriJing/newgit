@@ -1,14 +1,17 @@
-//! A render never writes through a symlink (#283).
+//! A render never writes through a link (#283).
 //!
-//! A render rewrites its file in place with this instance's ports and
-//! exports. With a link at the path, or at a directory above it, that write
-//! lands wherever the link leads: a file outside the workspace, or another
-//! file inside it. So a render refuses, naming the link and its target, and
+//! A render writes this instance's ports and exports into its file. Through
+//! a symlink at the path, or at a directory above it, that write would land
+//! wherever the link leads: a file outside the workspace, or another file
+//! inside it. So a render refuses, naming the link and its target, and
 //! taking the values back out (before a capture, or when a resource is
 //! unbound) leaves such a file alone rather than writing through the link.
+//! A hard link looks like any regular file, so each of those writes
+//! replaces the file rather than writing into it, and the link's other
+//! names keep what they held.
 #![cfg(unix)]
 
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
@@ -375,5 +378,131 @@ fn unbinding_never_unrenders_through_a_symlinked_directory() {
         read(&moved.join("app.env")),
         rendered,
         "unbinding does not take the values out through the link"
+    );
+}
+
+/// How many names the file at `path` has.
+fn links(path: &Utf8Path) -> u64 {
+    std::fs::metadata(path).expect("stat").nlink()
+}
+
+fn mode(path: &Utf8Path) -> u32 {
+    std::fs::metadata(path).expect("stat").permissions().mode() & 0o777
+}
+
+/// What `dir` holds, by name.
+fn names(dir: &Utf8Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("read dir")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_hard_link_at_a_rendered_path_is_replaced_not_written_through() {
+    let (_guard, temp) = tempdir();
+    let (manager, workspace, outside) = setup(&temp, Owner::Source, WEB);
+    let target = outside.join("target.env");
+    std::fs::remove_file(workspace.join("config/app.env")).expect("rm");
+    std::fs::hard_link(&target, workspace.join("config/app.env")).expect("hard link");
+    pin_mtime(&target);
+
+    let bound = rebind(&manager);
+    assert_eq!(read(&target), MINE, "nothing was written through the link");
+    assert_eq!(mtime(&target), pinned(), "not even for a moment");
+    assert!(bound.render_error.is_none(), "{:?}", bound.render_error);
+    let rendered = read(&workspace.join("config/app.env"));
+    assert!(
+        rendered.starts_with("API_URL=http://127.0.0.1:") && rendered != CONFIG,
+        "the workspace's path holds the render: {rendered}"
+    );
+    assert_eq!(links(&target), 1, "the path got a file of its own");
+    assert_eq!(
+        names(&workspace.join("config")),
+        ["app.env"],
+        "nothing is left beside it"
+    );
+}
+
+#[test]
+fn a_capture_never_unrenders_through_a_hard_link() {
+    let (_guard, temp) = tempdir();
+    let (manager, workspace, outside) = setup(&temp, Owner::Tracker, WEB_TRACKED);
+    // A second name for the rendered file, port and all, outside the
+    // workspace.
+    let other = outside.join("linked.env");
+    std::fs::hard_link(workspace.join("config/app.env"), &other).expect("hard link");
+    let rendered = read(&other);
+    assert_ne!(rendered, CONFIG, "the file holds this instance's port");
+    pin_mtime(&other);
+
+    manager.capture_tracker("x", "env").expect("capture");
+    assert_eq!(read(&other), rendered);
+    assert_eq!(
+        mtime(&other),
+        pinned(),
+        "the values were not taken out, and put back, through the link"
+    );
+    assert_eq!(
+        read(&workspace.join("config/app.env")),
+        rendered,
+        "the workspace's file ends the capture as it began it"
+    );
+}
+
+#[test]
+fn unbinding_never_unrenders_through_a_hard_link() {
+    let (_guard, temp) = tempdir();
+    let (manager, workspace, outside) = setup(&temp, Owner::Source, WEB);
+    let other = outside.join("linked.env");
+    std::fs::hard_link(workspace.join("config/app.env"), &other).expect("hard link");
+    let rendered = read(&other);
+    assert_ne!(rendered, CONFIG, "the file holds this instance's port");
+
+    manager.remove_resource("web", true).expect("remove");
+    assert_eq!(
+        read(&other),
+        rendered,
+        "unbinding does not take the values out through the link"
+    );
+    assert_eq!(read(&workspace.join("config/app.env")), CONFIG);
+}
+
+#[test]
+fn a_replaced_file_keeps_its_mode() {
+    let (_guard, temp) = tempdir();
+    let (manager, workspace, _outside) = setup(&temp, Owner::Source, WEB);
+    let path = workspace.join("config/app.env");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+
+    let bound = rebind(&manager);
+    assert!(bound.render_error.is_none(), "{:?}", bound.render_error);
+    assert_eq!(mode(&path), 0o640);
+}
+
+#[test]
+fn a_file_the_render_creates_gets_the_mode_a_plain_write_would() {
+    let (_guard, temp) = tempdir();
+    let (manager, workspace, _outside) = setup(&temp, Owner::Source, WEB);
+    let path = workspace.join("config/app.env");
+    std::fs::remove_file(&path).expect("rm");
+    let probe = temp.join("probe");
+    std::fs::write(&probe, "").expect("write");
+
+    let bound = rebind(&manager);
+    assert!(bound.render_error.is_none(), "{:?}", bound.render_error);
+    assert!(read(&path).starts_with("API_URL="), "the render wrote it");
+    assert_eq!(
+        mode(&path),
+        mode(&probe),
+        "0666 less the umask, not a temporary file's 0600"
     );
 }
