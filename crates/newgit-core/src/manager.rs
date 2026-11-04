@@ -41,6 +41,7 @@ use crate::supervisor::{ProcessState, StopOutcome, Supervisor, run_captured, run
 use crate::templates::{instantiate, resource_template};
 use crate::tracker::{
     Storage, TrackerDefinition, collect_files, collect_owned_files, content_rev, normalize_path,
+    symlinked_parent,
 };
 use crate::tracker_repo::{
     Branch, CaptureAt, TrackerRepo, clear_owned_paths, copy_file, parse_tracker_state_ref,
@@ -3373,6 +3374,11 @@ impl BranchManager {
                 paths.push(&spec.path);
             }
         }
+        // Every target is judged before any is written, so a refused render
+        // leaves all of this resource's files as they were.
+        for path in &paths {
+            refuse_render_through_link(&branch.workspace_path, &definition.name, path)?;
+        }
 
         let bound = self.bound_vars(branch);
         let context = RenderContext {
@@ -3479,9 +3485,10 @@ impl BranchManager {
         }) {
             let path = branch.workspace_path.join(&relative);
             // Only a regular file is un-rendered in place. Through a
-            // symlink this would read, and then write, wherever it leads;
-            // capture keeps or refuses the link itself.
-            if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+            // symlink, at the path or at a directory above it, this would
+            // read, and then write, wherever it leads; capture keeps or
+            // refuses the link itself.
+            if !rewritable_in_place(&branch.workspace_path, &relative) {
                 continue;
             }
             let Ok(current) = std::fs::read_to_string(&path) else {
@@ -3708,7 +3715,7 @@ impl BranchManager {
     ) -> Result<()> {
         for record in &binding.rendered {
             let path = branch.workspace_path.join(&record.path);
-            if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+            if !rewritable_in_place(&branch.workspace_path, &record.path) {
                 continue;
             }
             let Ok(current) = std::fs::read_to_string(&path) else {
@@ -3769,6 +3776,11 @@ impl BranchManager {
     fn render_drift(&self, branch: &BranchInstance) -> Vec<String> {
         let mut drifted = Vec::new();
         for path in rendered_paths(branch, |_| true) {
+            // Through a link the render refuses rather than rewrites (#283),
+            // so nothing there is about to be discarded.
+            if !rewritable_in_place(&branch.workspace_path, &path) {
+                continue;
+            }
             let tracker = branch
                 .resources
                 .values()
@@ -10526,6 +10538,42 @@ fn rendered_paths(
         }
     }
     paths
+}
+
+/// Refuse to render `path` through a symlink, at the path itself or at a
+/// directory above it (#283). A render rewrites its file in place, so through
+/// a link it would write this instance's values wherever the link leads,
+/// which can be anywhere the user can write. Judged with `lstat` alone:
+/// nothing is followed to decide.
+fn refuse_render_through_link(workspace: &Utf8Path, resource: &str, path: &Utf8Path) -> Result<()> {
+    if let Some((link, target)) = symlinked_parent(workspace, path) {
+        return Err(NewgitError::RenderUnderSymlinkedParent {
+            resource: resource.to_owned(),
+            path: path.to_path_buf(),
+            link,
+            target,
+        });
+    }
+    let absolute = workspace.join(path);
+    if std::fs::symlink_metadata(&absolute).is_ok_and(|meta| meta.is_symlink()) {
+        let target =
+            std::fs::read_link(&absolute).map_err(|source| NewgitError::io(&absolute, source))?;
+        return Err(NewgitError::RenderThroughSymlink {
+            resource: resource.to_owned(),
+            path: path.to_path_buf(),
+            target: Utf8PathBuf::from(target.to_string_lossy().into_owned()),
+        });
+    }
+    Ok(())
+}
+
+/// Whether newgit rewrites a rendered file in place: a regular file, reached
+/// without going through a symlink. Anything else would be written wherever
+/// the link leads, so a render refuses it (`refuse_render_through_link`), and
+/// taking its values back out, or reporting drift in it, leaves it alone.
+fn rewritable_in_place(workspace: &Utf8Path, path: &Utf8Path) -> bool {
+    symlinked_parent(workspace, path).is_none()
+        && std::fs::symlink_metadata(workspace.join(path)).is_ok_and(|meta| meta.is_file())
 }
 
 /// How many lines differ between the expected render and what is on disk —
