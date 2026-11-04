@@ -6,9 +6,10 @@
 //! inside it. So a render refuses, naming the link and its target, and
 //! taking the values back out (before a capture, or when a resource is
 //! unbound) leaves such a file alone rather than writing through the link.
-//! A hard link looks like any regular file, so each of those writes
-//! replaces the file rather than writing into it, and the link's other
-//! names keep what they held.
+//! A hard link looks like any regular file, so each of those writes judges
+//! the file it opened: one with more than one name is replaced rather than
+//! written into, and the link's other names keep what they held, while one
+//! with a single name is still rewritten in place.
 #![cfg(unix)]
 
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -386,6 +387,11 @@ fn links(path: &Utf8Path) -> u64 {
     std::fs::metadata(path).expect("stat").nlink()
 }
 
+/// Which file is at `path`: a new one in its place has another inode.
+fn inode(path: &Utf8Path) -> u64 {
+    std::fs::metadata(path).expect("stat").ino()
+}
+
 fn mode(path: &Utf8Path) -> u32 {
     std::fs::metadata(path).expect("stat").permissions().mode() & 0o777
 }
@@ -477,15 +483,55 @@ fn unbinding_never_unrenders_through_a_hard_link() {
 }
 
 #[test]
-fn a_replaced_file_keeps_its_mode() {
+fn a_hard_linked_file_keeps_its_mode_when_replaced() {
     let (_guard, temp) = tempdir();
-    let (manager, workspace, _outside) = setup(&temp, Owner::Source, WEB);
+    let (manager, workspace, outside) = setup(&temp, Owner::Source, WEB);
     let path = workspace.join("config/app.env");
+    std::fs::hard_link(&path, outside.join("linked.env")).expect("hard link");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod");
 
     let bound = rebind(&manager);
     assert!(bound.render_error.is_none(), "{:?}", bound.render_error);
+    assert_eq!(links(&path), 1, "replaced, not written into");
     assert_eq!(mode(&path), 0o640);
+}
+
+/// So a process holding it open, or a container that bind-mounts it alone,
+/// sees what the render writes.
+#[test]
+fn a_file_with_one_name_is_rewritten_in_place() {
+    let (_guard, temp) = tempdir();
+    let (manager, workspace, _outside) = setup(&temp, Owner::Source, WEB);
+    let path = workspace.join("config/app.env");
+    // Back to committed content, so the render has something to change.
+    std::fs::write(&path, CONFIG).expect("write");
+    let before = inode(&path);
+
+    let bound = rebind(&manager);
+    assert!(bound.render_error.is_none(), "{:?}", bound.render_error);
+    assert_ne!(read(&path), CONFIG, "the render wrote it");
+    assert_eq!(
+        inode(&path),
+        before,
+        "the same file, not a new one in its place"
+    );
+}
+
+#[test]
+fn a_capture_leaves_a_file_with_one_name_in_place() {
+    let (_guard, temp) = tempdir();
+    let (manager, workspace, _outside) = setup(&temp, Owner::Tracker, WEB_TRACKED);
+    let path = workspace.join("config/app.env");
+    let rendered = read(&path);
+    let before = inode(&path);
+
+    manager.capture_tracker("x", "env").expect("capture");
+    assert_eq!(read(&path), rendered);
+    assert_eq!(
+        inode(&path),
+        before,
+        "the values were taken out and put back in the same file"
+    );
 }
 
 #[test]
@@ -503,6 +549,6 @@ fn a_file_the_render_creates_gets_the_mode_a_plain_write_would() {
     assert_eq!(
         mode(&path),
         mode(&probe),
-        "0666 less the umask, not a temporary file's 0600"
+        "0666 less the umask, as `std::fs::write` gives"
     );
 }

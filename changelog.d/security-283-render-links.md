@@ -12,9 +12,9 @@
   directory the same way. Now the render refuses a symlink at the path or
   above it before writing any of the resource's files, naming the path,
   the link, and its target; a link that stays inside the workspace is
-  refused too, since it reaches some other file. And every write of a
-  rendered file replaces it with a new file, so a hard link's other names
-  keep what they held. One consequence: a container that bind-mounts a
-  single rendered file keeps the old file until it restarts. If a render
-  now fails on a link you meant, replace the link with the real file or
-  directory, and `newgit resource rebind` renders it again.
+  refused too, since it reaches some other file. A rendered file with more
+  than one name, a hard link, is replaced with a new file rather than
+  written into, so its other names keep what they held; any other is
+  still rewritten in place. If a render now fails on a link you meant,
+  replace the link with the real file or directory, and `newgit resource
+  rebind` renders it again.

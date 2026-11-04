@@ -756,11 +756,15 @@ file reached through a symlink alone. Remove the link, and `newgit
 resource rebind` writes the file.
 
 A hard link cannot be told from a regular file, and a write into it would
-change every name it has, in the workspace or not. So neither a render nor
-taking its values back out (and putting them back after a capture) writes
-into a file: each writes a temporary file beside the path and renames it
-over the path, as the install store does. The link's other names keep
-what they held, and the path gets a file of its own, with the old one's
+change every name it has, in the workspace or not. So a render, and taking
+its values back out or putting them back after a capture, opens the file
+without following a symlink at the path (`O_NOFOLLOW`) and judges the file
+it opened, not the path: nothing swapped in after the check is written. A
+file with one name is rewritten in place, so a process holding it open, or
+a container that bind-mounts it alone, sees the new content. A file with
+more than one name is replaced instead, by a temporary file beside the
+path renamed over it, as the install store does: its other names keep
+what they held, and the path gets a file of its own with the old one's
 mode.
 
 **A re-render does not reach a process already running.** A dev server
