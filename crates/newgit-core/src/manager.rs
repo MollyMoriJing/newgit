@@ -218,6 +218,20 @@ impl Recognise {
     }
 }
 
+/// What a `git push` from the project root did.
+#[derive(Debug)]
+pub struct ProjectPushOutcome {
+    pub merge: MergeOutcome,
+    /// Each target that had something new, or failed.
+    pub exports: Vec<ProjectPushExport>,
+}
+
+#[derive(Debug)]
+pub struct ProjectPushExport {
+    pub target: String,
+    pub result: std::result::Result<RemoteExportOutcome, String>,
+}
+
 /// What `tracker create --git --mount --from` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportGitTrackerOutcome {
@@ -1016,6 +1030,9 @@ pub struct RemoteExportOptions {
     pub force: bool,
     /// Compose and check, but push nothing.
     pub dry_run: bool,
+    /// A `git push` from the project root: only if the target's view moved
+    /// since the last export, and never pulling from an ahead target.
+    pub from_push: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1629,9 +1646,8 @@ impl BranchManager {
     /// tracker's `main` unchanged — every id, signature, and merge as
     /// upstream has them, since a tracker is stored relative to its own root.
     /// Then one commit in the project root adds the definition (in `access`),
-    /// the mount, and the pin; it composes as a *brought in* merge, so the
-    /// history appears under the mount through one merge, and `git log` and
-    /// `git blame` reach through it. The project root fast-forwards to it;
+    /// the mount, and the pin: one ordinary view commit holding the files.
+    /// The history stays in the tracker. The project root fast-forwards to it;
     /// `newgit merge main` publishes it, as for any new tracker.
     ///
     /// Refuses, leaving nothing behind, when anything is at `mount` already
@@ -2253,6 +2269,7 @@ impl BranchManager {
     /// its tracker branches up to its own branch — the one `newgit init`
     /// found checked out — not whatever it has checked out now.
     pub fn sync_project_root(&self) -> Result<usize> {
+        self.route_project_root()?;
         let file = self.store.paths().project_branch_file();
         let branch = match std::fs::read_to_string(&file) {
             Ok(branch) => branch.trim().to_owned(),
@@ -2279,7 +2296,140 @@ impl BranchManager {
         let Ok(tip) = self.source.rev_parse(&format!("refs/heads/{branch}")) else {
             return Ok(0);
         };
+        // Failing leaves the split to make commits of its own, which merge.
+        let _ = self.learn_pulled_view(&tip);
         self.split_instance(PROJECT_ROOT_INSTANCE, &tip)
+    }
+
+    /// `git pull` in the project root brings view commits this machine did
+    /// not make. Most split back to the very root commit the remote has, but
+    /// one that landed through a mirror names the mirror's commit, which only
+    /// the remote's root commit records. So when the commit `tip` shares with
+    /// `origin/main` has no note yet, compose the remote's `main` here, which
+    /// notes every view commit of it.
+    fn learn_pulled_view(&self, tip: &str) -> Result<()> {
+        let Some(link) = &self.remote else {
+            return Ok(());
+        };
+        let project = self.store.paths().project_root.clone();
+        let Ok(fetched) = self.source.rev_parse(&format!(
+            "refs/remotes/{PUBLISH_REMOTE}/{PROJECT_ROOT_INSTANCE}"
+        )) else {
+            return Ok(());
+        };
+        let shared = self.source.merge_base(tip, &fetched)?;
+        if crate::compose::read_root(&project, &shared)?.is_some() {
+            return Ok(());
+        }
+        let client = link.connect(Acting::Login)?;
+        let list = self.branch_list(
+            Some((client.as_ref(), link.project.as_str())),
+            PROJECT_ROOT_INSTANCE,
+        )?;
+        if let Some(root) = list.get(&self.root.name) {
+            self.compose_here("refs/newgit/views/branches/main", root)?;
+        }
+        Ok(())
+    }
+
+    /// On a linked project, make the project root's `origin` the remote's
+    /// Git endpoint, as a workspace's is. A mirror withholding a tracker has
+    /// ids of its own, so `git pull` from it would bring in commits that are
+    /// not the project's; the endpoint serves the project's own. `git push`
+    /// goes to the outbox, as a workspace's does, and
+    /// [`Self::receive_project_push`] merges and exports what it brings. Each
+    /// `branches = true` target is a remote too, for `gh`, and pushing to it
+    /// straight is refused, as in a workspace.
+    ///
+    /// Run by `newgit remote add` and whenever the project root is synced,
+    /// which moves a project linked before this; a repeat costs one read of
+    /// the config.
+    pub fn route_project_root(&self) -> Result<()> {
+        let Some(link) = &self.remote else {
+            return Ok(());
+        };
+        let root = self.store.paths().project_root.clone();
+        let endpoint = format!("{}/{}.git", link.url.trim_end_matches('/'), link.project);
+        let targets = self.export_targets().unwrap_or_default();
+        let targets: Vec<&ExportTarget> = targets.iter().filter(|target| target.branches).collect();
+        let set = crate::source::run_git_env(
+            &["-C", root.as_str(), "config", "--get-regexp", "^remote\\."],
+            &[],
+        )
+        .unwrap_or_default();
+        let has = |key: &str, value: &str| {
+            set.lines().any(|line| {
+                line.split_once(' ')
+                    .is_some_and(|(found, text)| found == key && text == value)
+            })
+        };
+        let outbox = self.outbox();
+        let receive_pack = self.receive_pack_command(PROJECT_ROOT_INSTANCE);
+        if has("remote.origin.url", &endpoint)
+            && has("remote.origin.pushurl", outbox.as_str())
+            && has("remote.origin.receivepack", &receive_pack)
+            && targets
+                .iter()
+                .all(|target| has(&format!("remote.{}.url", target.name), &target.push_url()))
+        {
+            return Ok(());
+        }
+        let config = |key: &str, value: &str| {
+            crate::source::run_git_env(&["-C", root.as_str(), "config", key, value], &[]).map(drop)
+        };
+        self.ensure_push_route(&outbox)?;
+        GitSource::workspace_route_origin(&root, Some(&endpoint), &outbox, &receive_pack)?;
+        if !set.contains("remote.origin.fetch") {
+            config("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")?;
+        }
+        GitSource::workspace_use_credential_helper(
+            &root,
+            &[&endpoint],
+            &format!("!{} credential", sh_quote(&newgit_program())),
+        )?;
+        if let Some(branch) = self.project_branch()
+            && branch == PROJECT_ROOT_INSTANCE
+            && !crate::source::run_git_env(
+                &[
+                    "-C",
+                    root.as_str(),
+                    "config",
+                    "--get",
+                    &format!("branch.{branch}.remote"),
+                ],
+                &[],
+            )
+            .is_ok_and(|remote| !remote.is_empty())
+        {
+            config(&format!("branch.{branch}.remote"), "origin")?;
+            config(
+                &format!("branch.{branch}.merge"),
+                &format!("refs/heads/{branch}"),
+            )?;
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let owned: Vec<ExportTarget> = targets.into_iter().cloned().collect();
+        self.route_export_remotes(&root, PROJECT_ROOT_INSTANCE, &owned, &outbox)?;
+        let definitions = self.carved_definitions();
+        let resolved = route_to_targets(
+            &owned,
+            std::slice::from_ref(&self.root.name),
+            |target, tracker| {
+                definitions
+                    .iter()
+                    .find(|definition| definition.name == tracker)
+                    .is_some_and(|definition| {
+                        export_reason(target, definition) != ExportReason::Withheld
+                    })
+            },
+        )
+        .resolved;
+        if let Some(target) = resolved {
+            config(&format!("remote.{target}.gh-resolved"), "base")?;
+        }
+        Ok(())
     }
 
     /// Where `tracker`'s history is for `instance` (its branch, once its
@@ -3380,23 +3530,8 @@ impl BranchManager {
     /// store if its `origin` changes.
     fn ensure_workspace_push(&self, branch: &BranchInstance) -> Result<()> {
         let outbox = self.outbox();
-        self.source.ensure_outbox(&outbox)?;
-        let hook = outbox.join("hooks/pre-receive");
-        let script = pre_receive_script(&self.store.paths().project_root, &newgit_program());
-        if std::fs::read_to_string(&hook).ok().as_deref() != Some(script.as_str()) {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::write(&hook, &script).map_err(|error| NewgitError::io(&hook, error))?;
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
-                .map_err(|error| NewgitError::io(&hook, error))?;
-        }
-
-        // Git runs this with the outbox's path appended.
-        let receive_pack = format!(
-            "{} push-receive-pack --store {} -- {}",
-            sh_quote(&newgit_program()),
-            sh_quote(self.store.paths().project_root.as_str()),
-            sh_quote(&branch.name),
-        );
+        self.ensure_push_route(&outbox)?;
+        let receive_pack = self.receive_pack_command(&branch.name);
         // On a remote, `origin` is the project's Git endpoint; otherwise the
         // store's own origin.
         let fetch_url = match &branch.remote {
@@ -3410,9 +3545,36 @@ impl BranchManager {
             &receive_pack,
         )?;
         if branch.remote.is_some() {
-            self.route_export_remotes(branch, &outbox)?;
+            let targets = self.export_targets()?;
+            self.route_export_remotes(&branch.workspace_path, &branch.name, &targets, &outbox)?;
+            self.resolve_gh(branch, &targets)?;
         }
         Ok(())
+    }
+
+    /// The outbox, with the hook a push arrives through.
+    fn ensure_push_route(&self, outbox: &Utf8Path) -> Result<()> {
+        self.source.ensure_outbox(outbox)?;
+        let hook = outbox.join("hooks/pre-receive");
+        let script = pre_receive_script(&self.store.paths().project_root, &newgit_program());
+        if std::fs::read_to_string(&hook).ok().as_deref() != Some(script.as_str()) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&hook, &script).map_err(|error| NewgitError::io(&hook, error))?;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+                .map_err(|error| NewgitError::io(&hook, error))?;
+        }
+        Ok(())
+    }
+
+    /// What Git runs to receive a push from `instance`, the outbox's path
+    /// appended.
+    fn receive_pack_command(&self, instance: &str) -> String {
+        format!(
+            "{} push-receive-pack --store {} -- {}",
+            sh_quote(&newgit_program()),
+            sh_quote(self.store.paths().project_root.as_str()),
+            sh_quote(instance),
+        )
     }
 
     /// On a newgit remote, `origin` is the project's Git endpoint, which
@@ -3425,12 +3587,17 @@ impl BranchManager {
     ///
     /// Pushing to it directly is refused, naming `origin`: a direct push
     /// would carry trackers the target withholds, and skip the checkpoint.
-    fn route_export_remotes(&self, branch: &BranchInstance, outbox: &Utf8Path) -> Result<()> {
-        let workspace = branch.workspace_path.as_str();
+    fn route_export_remotes(
+        &self,
+        workspace: &Utf8Path,
+        instance: &str,
+        targets: &[ExportTarget],
+        outbox: &Utf8Path,
+    ) -> Result<()> {
+        let workspace = workspace.as_str();
         let config = |key: &str, value: &str| {
             crate::source::run_git_env(&["-C", workspace, "config", key, value], &[]).map(|_| ())
         };
-        let targets = self.export_targets()?;
         for target in targets.iter().filter(|target| target.branches) {
             let remote = &target.name;
             config(&format!("remote.{remote}.url"), &target.push_url())?;
@@ -3446,13 +3613,15 @@ impl BranchManager {
                     sh_quote(&newgit_program()),
                     sh_quote(self.store.paths().project_root.as_str()),
                     sh_quote(remote),
-                    sh_quote(&branch.name),
+                    sh_quote(instance),
                 ),
             )?;
             // What the target's own branch holds, as of the last export from
             // here, so `gh pr create --fill` can list the PR's commits.
             let main = export_ref(&target.name, PROJECT_ROOT_INSTANCE);
-            if self.source.rev_parse(&main).is_ok() {
+            if workspace != self.store.paths().project_root.as_str()
+                && self.source.rev_parse(&main).is_ok()
+            {
                 crate::source::run_git_env(
                     &[
                         "-C",
@@ -3467,7 +3636,7 @@ impl BranchManager {
                 )?;
             }
         }
-        self.resolve_gh(branch, &targets)
+        Ok(())
     }
 
     /// The trackers in Git the instance's work touched: those whose
@@ -7340,8 +7509,8 @@ impl BranchManager {
     /// Push a composed projection of the trackers' `main`s to export target
     /// `name` (`.newgit/exports/<name>.toml`), history and all.
     ///
-    /// Fails closed: only `public` trackers in Git and the ones the target
-    /// names ship, a tracker outside Git cannot be named, and a composed history
+    /// Fails closed: only the trackers in Git the target names ship (the
+    /// `public` ones when it names none), a tracker outside Git cannot be named, and a composed history
     /// that ever adds a path a tracker outside Git owns is refused before anything
     /// is pushed. Composing is deterministic, so exporting again
     /// fast-forwards the target; a different tracker set is a different
@@ -7381,7 +7550,25 @@ impl BranchManager {
 
         let (mut trackers, mut view) =
             self.compose_export(&target, &list, PROJECT_ROOT_INSTANCE)?;
-        let pulled = if options.force {
+        let pushed_ref = export_ref(&target.name, "pushed");
+        if options.from_push {
+            // Nothing new for this target: not even a fetch, so a pull
+            // request waiting there does not fail a push it has no part in.
+            if self.source.rev_parse(&pushed_ref).ok().as_deref() == Some(view.tip.as_str()) {
+                return Ok(RemoteExportOutcome {
+                    target: target.clone(),
+                    url: target.push_url(),
+                    trackers,
+                    tip: view.tip,
+                    commits: view.commits,
+                    pushed: false,
+                    project_root_error,
+                    pulled: 0,
+                });
+            }
+            self.refuse_target_ahead(&target, &view.tip)?;
+        }
+        let pulled = if options.force || options.from_push {
             0
         } else {
             self.pull_export_target(&target, &view.tip, options.dry_run)?
@@ -7442,6 +7629,7 @@ impl BranchManager {
                     }
                     other => other,
                 })?;
+            self.source.update_ref(&pushed_ref, &view.tip)?;
         }
 
         Ok(RemoteExportOutcome {
@@ -7454,6 +7642,22 @@ impl BranchManager {
             project_root_error,
             pulled,
         })
+    }
+
+    /// Refuse when `target`'s branch has commits `tip` does not: a push does
+    /// not pull, so it names the command that does.
+    fn refuse_target_ahead(&self, target: &ExportTarget, tip: &str) -> Result<()> {
+        let Some(theirs) = self.fetch_target(target)? else {
+            return Ok(());
+        };
+        if theirs == tip || self.source.is_ancestor(&theirs, tip)? {
+            return Ok(());
+        }
+        Err(NewgitError::Unsupported(format!(
+            "`{}` on `{}` has commits `main` does not (merged there?), and a push does not pull \
+             them in: `newgit pull --remote {}`, then `newgit export --remote {}`",
+            target.branch, target.name, target.name, target.name
+        )))
     }
 
     /// When `target`'s branch is ahead of `tip`, the export about to be
@@ -7601,8 +7805,7 @@ impl BranchManager {
     /// - **Rooted at a tracker** (`root`), they are that tracker's own
     ///   history: its `main` fast-forwards to them, or really merges them as
     ///   `newgit merge` would, and then its pin in the project root moves to
-    ///   that `main` as `newgit pull <tracker>` moves it — one commit,
-    ///   composing as a merge that brings them in on top.
+    ///   that `main` as `newgit pull <tracker>` moves it, in one commit.
     /// - **Otherwise** they are view commits. The ones that came from here
     ///   are recognised — by id, by the note naming the root commit an
     ///   exported commit stands for, or by a canonical id — and the rest
@@ -7774,76 +7977,10 @@ impl BranchManager {
             .filter(|definition| export_reason(target, definition) == ExportReason::Withheld)
             .cloned()
             .collect();
-        let mut objects = crate::objects::Objects::open(&project)?;
-        let mut mapped: BTreeMap<String, String> = BTreeMap::new();
-        for id in &walk {
-            if let Some(ours) = recognise.view_of(self, id)? {
-                mapped.insert(id.clone(), ours);
-                continue;
-            }
-            let commit = objects.commit(id)?;
-            if commit.parents.is_empty() {
-                return Err(NewgitError::Unsupported(format!(
-                    "commit {} on `{}` shares no history with the project, so it cannot be \
-                     brought in as work",
-                    short(id),
-                    target.name
-                )));
-            }
-            let mut parents = Vec::new();
-            for parent in &commit.parents {
-                let ours = match mapped.get(parent) {
-                    Some(ours) => ours.clone(),
-                    None => recognise
-                        .view_of(self, parent)?
-                        .unwrap_or_else(|| parent.clone()),
-                };
-                if !parents.contains(&ours) {
-                    parents.push(ours);
-                }
-            }
-            let first = objects.commit(&parents[0])?;
-            let mut tree = commit.tree.clone();
-            for definition in &withheld {
-                let mount = definition.mount.as_str();
-                if mount == "." {
-                    return Err(NewgitError::Unsupported(format!(
-                        "`{}` withholds `{}`, which is mounted at `.`, so its files cannot be \
-                         put back into the commits that come from there",
-                        target.name, definition.name
-                    )));
-                }
-                if objects.subtree(&commit.tree, mount)?.is_some()
-                    || objects.entry_at(&commit.tree, mount)?.is_some()
-                {
-                    return Err(NewgitError::SplitRefused(format!(
-                        "commit {} on `{}` changes `{mount}`, which belongs to `{}`, a tracker \
-                         that target does not ship, so nothing was pulled",
-                        short(id),
-                        target.name,
-                        definition.name
-                    )));
-                }
-                let theirs_there = objects
-                    .subtree(&first.tree, mount)?
-                    .map(|tree| (crate::objects::TREE_MODE.to_vec(), tree));
-                tree = objects.set_path(&tree, mount, theirs_there)?;
-            }
-            let made = if tree == commit.tree && parents == commit.parents {
-                id.clone()
-            } else {
-                objects.make_commit(
-                    &tree,
-                    &parents,
-                    &commit.author,
-                    &commit.committer,
-                    &crate::objects::Commit::unsigned_headers(&commit.headers),
-                    &commit.message,
-                )
-            };
-            mapped.insert(id.clone(), made);
-        }
-        objects.flush()?;
+        let mapped =
+            crate::compose::bring_in(&project, &target.name, &walk, &withheld, &mut |id| {
+                recognise.view_of(self, id)
+            })?;
         let tip = match mapped.get(theirs) {
             Some(tip) => tip.clone(),
             None => recognise
@@ -8281,6 +8418,9 @@ impl BranchManager {
     /// On a newgit remote there is nothing to mirror: a push publishes the
     /// instance's work into its trackers' forks, not one history somewhere.
     pub fn serve_push(&self, instance: &str) -> Result<Utf8PathBuf> {
+        if instance == PROJECT_ROOT_INSTANCE {
+            return self.serve_project_push();
+        }
         let branch = self.store.find_branch(instance)?;
         let outbox = self.outbox();
         self.source.ensure_outbox(&outbox)?;
@@ -8288,6 +8428,85 @@ impl BranchManager {
             GitSource::sync_outbox(&outbox, &self.require_publish_url()?, None)?;
         }
         Ok(outbox)
+    }
+
+    /// A push from the project root. The outbox holds no `main`, so Git
+    /// always hands the push over: `Everything up-to-date` would end a retry
+    /// after a failed export before it reached newgit.
+    fn serve_project_push(&self) -> Result<Utf8PathBuf> {
+        let outbox = self.outbox();
+        self.ensure_push_route(&outbox)?;
+        if let Some(branch) = self.project_branch() {
+            let _ = crate::source::run_git_env(
+                &[
+                    "-C",
+                    outbox.as_str(),
+                    "update-ref",
+                    "-d",
+                    &format!("refs/heads/{branch}"),
+                ],
+                &[],
+            );
+        }
+        Ok(outbox)
+    }
+
+    /// A `git push` of the project root's branch: what `newgit merge main`
+    /// and then `newgit export --remote <target>` do by hand, for each
+    /// target whose view of `main` is not what was last pushed there, each
+    /// getting only its own trackers.
+    ///
+    /// A refused merge fails the push and nothing is exported. Once the
+    /// merge has landed it stays: an export that fails is reported in the
+    /// outcome, and the others still run. Nothing here pulls: a target that
+    /// is ahead is a failed export, naming `newgit pull --remote`.
+    pub fn receive_project_push(&self, updates: &[RefUpdate]) -> Result<ProjectPushOutcome> {
+        let branch = self
+            .project_branch()
+            .unwrap_or_else(|| PROJECT_ROOT_INSTANCE.to_owned());
+        let own_ref = format!("refs/heads/{branch}");
+        let spawn = "`newgit spawn <name>` makes an instance, whose branch can be pushed";
+        for update in updates {
+            if update.name != own_ref {
+                return Err(NewgitError::Unsupported(format!(
+                    "the project root pushes only `{branch}`, so `{}` was refused: {spawn}",
+                    update.name
+                )));
+            }
+            let Some(new) = &update.new else {
+                return Err(NewgitError::Unsupported(format!(
+                    "refusing to delete `{branch}`: it is the project's own branch"
+                )));
+            };
+            if *new != self.source.rev_parse(&own_ref)? {
+                return Err(NewgitError::Unsupported(format!(
+                    "this pushes {} to `{branch}`, which is not the project root's `{branch}`: \
+                     {spawn}",
+                    short(new)
+                )));
+            }
+        }
+        // Before the merge, so a target that cannot be read stops the push
+        // with nothing landed.
+        let targets = self.export_targets()?;
+        let merge = self.merge(PROJECT_ROOT_INSTANCE, PROJECT_ROOT_INSTANCE)?;
+        let exports = targets
+            .iter()
+            .map(|target| ProjectPushExport {
+                target: target.name.clone(),
+                result: self
+                    .export_to_remote(
+                        &target.name,
+                        RemoteExportOptions {
+                            from_push: true,
+                            ..RemoteExportOptions::default()
+                        },
+                    )
+                    .map_err(|error| error.to_string()),
+            })
+            .filter(|export| !matches!(&export.result, Ok(outcome) if !outcome.pushed))
+            .collect();
+        Ok(ProjectPushOutcome { merge, exports })
     }
 
     /// The second half, run from the outbox's `pre-receive` hook while the
@@ -9373,54 +9592,7 @@ impl BranchManager {
         theirs: &str,
         message: &str,
     ) -> Result<std::result::Result<String, Vec<String>>> {
-        let root = self.store.paths().project_root.clone();
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root.as_str())
-            .args([
-                "merge-tree",
-                "--write-tree",
-                "--name-only",
-                "--no-messages",
-                ours,
-                theirs,
-            ])
-            .output()
-            .map_err(|source| NewgitError::io(root.clone(), source))?;
-        let text = String::from_utf8_lossy(&output.stdout).into_owned();
-        let mut lines = text.lines();
-        let tree = lines.next().unwrap_or_default().to_owned();
-        match output.status.code() {
-            Some(0) => {}
-            Some(1) => {
-                return Ok(Err(lines
-                    .take_while(|line| !line.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect()));
-            }
-            _ => {
-                return Err(NewgitError::SourceCommand {
-                    command: format!("git merge-tree --write-tree {ours} {theirs}"),
-                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-                });
-            }
-        }
-        let commit = crate::source::run_git_env(
-            &[
-                "-C",
-                root.as_str(),
-                "commit-tree",
-                &tree,
-                "-p",
-                ours,
-                "-p",
-                theirs,
-                "-m",
-                message,
-            ],
-            &[],
-        )?;
-        Ok(Ok(commit.trim().to_owned()))
+        crate::source::merge_commits(&self.store.paths().project_root, ours, theirs, message, &[])
     }
 
     /// Publish an instance's work for checkpoint `record`: its committed work
@@ -9611,7 +9783,7 @@ impl BranchManager {
     /// `newgit pull <tracker>`: one view commit in `instance` (the project
     /// root when `None`) that moves `tracker`'s pin to its `follow` ref —
     /// `Pull t3code: 14 commits from main` — authored by whoever runs it.
-    /// It composes as a merge bringing those commits in, and merges into
+    /// It holds the tracker's files at the new pin, and merges into
     /// `main` like any instance commit. The workspace fast-forwards to it.
     pub fn pull(&self, instance: Option<&str>, tracker: &str) -> Result<PullOutcome> {
         self.require_migrated()?;
@@ -9638,7 +9810,7 @@ impl BranchManager {
     /// Move `definition`'s pin in `instance` (the project root when `None`)
     /// to `new`, which came from `from` (a ref, or a target): one view
     /// commit, `Pull <tracker>: N commits from <from>`, authored by whoever
-    /// runs it, composing as a merge that brings the commits in. Nothing
+    /// runs it, holding the tracker's files at `new`. Nothing
     /// when the pin already has `new`.
     fn move_pin(
         &self,
@@ -11877,7 +12049,7 @@ pub const ADOPTED_REF: &str = "refs/newgit/adopted";
 
 /// The project root's name as an instance: its tracker branches are
 /// `instances/main`, so no spawned instance may take the name.
-const PROJECT_ROOT_INSTANCE: &str = "main";
+pub const PROJECT_ROOT_INSTANCE: &str = "main";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackerMergeAction {
@@ -12099,12 +12271,12 @@ fn export_reason(target: &ExportTarget, definition: &TrackerDefinition) -> Expor
             ExportReason::Withheld
         };
     }
-    if definition.audience == "public" {
-        ExportReason::Public
-    } else if target.trackers.contains(&definition.name) {
-        ExportReason::Listed
-    } else {
+    if !target.lists(&definition.name, &definition.audience) {
         ExportReason::Withheld
+    } else if definition.audience == "public" {
+        ExportReason::Public
+    } else {
+        ExportReason::Listed
     }
 }
 

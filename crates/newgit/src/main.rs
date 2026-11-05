@@ -268,8 +268,9 @@ enum Command {
         into: String,
     },
     /// Move a mounted tracker's pin to its `follow` ref (default `main`): one
-    /// commit, `Pull <tracker>: N commits from <ref>`, that brings its new
-    /// history in as a merge. Nothing else moves a pin on anyone's behalf
+    /// commit, `Pull <tracker>: N commits from <ref>`, holding its files at
+    /// the new pin; its history stays in its own repo. Nothing else moves a
+    /// pin on anyone's behalf
     ///
     /// With --remote <target>, bring the commits on an export target's branch
     /// (a pull request merged there) back instead: into the tracker a rooted
@@ -314,6 +315,10 @@ enum Command {
     /// inside its container: fetches every branch, pushes them in steps
     #[command(hide = true)]
     EndpointCopy,
+    /// The Git endpoint's pull from a mirror a GitHub webhook said moved, run
+    /// inside its container: brings the commit in and lands it on `main`
+    #[command(hide = true)]
+    EndpointPull,
     /// Link this project to a newgit remote
     Remote {
         #[command(subcommand)]
@@ -706,6 +711,16 @@ fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string(&newgit_core::endpoint::copy_repo(&plan)?)?
+            );
+            Ok(())
+        }
+        Command::EndpointPull => {
+            let plan: newgit_core::endpoint::PullPlan =
+                serde_json::from_reader(std::io::stdin())
+                    .context("the plan on stdin is not JSON newgit can read")?;
+            println!(
+                "{}",
+                serde_json::to_string(&newgit_core::endpoint::pull_mirror(&plan)?)?
             );
             Ok(())
         }
@@ -2051,7 +2066,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 short_rev(&outcome.main)
             );
             println!(
-                "  mounted:   {}, brought in by one merge ({}) on the project root",
+                "  mounted:   {}, joined as one commit ({}) on the project root",
                 outcome.mount,
                 short_rev(&outcome.view)
             );
@@ -2737,6 +2752,14 @@ fn push_receive_pack(store: &Utf8Path, instance: &str, repository: &Utf8Path) ->
 /// branch there itself.
 fn refuse_export_push(store: &Utf8Path, instance: &str, target: &str) -> Result<()> {
     let manager = BranchManager::open(MetadataStore::at(store))?;
+    if instance == newgit_core::manager::PROJECT_ROOT_INSTANCE {
+        bail!(
+            "newgit: `{target}` is an export target: newgit pushes there itself, composed from \
+             the trackers `{target}` ships. A push straight to it could carry trackers it \
+             withholds.\n\
+             newgit: `git push origin main` merges and exports."
+        );
+    }
     let branch = manager.store().find_branch(instance)?.source_ref;
     bail!(
         "newgit: `{target}` is an export target: newgit pushes this branch there itself, \
@@ -2744,6 +2767,60 @@ fn refuse_export_push(store: &Utf8Path, instance: &str, target: &str) -> Result<
          checkpoint and could carry trackers it withholds.\n\
          newgit: push with `git push origin {branch}`, then open a pull request with `gh pr \
          create`."
+    )
+}
+
+/// A push from the project root: a refused merge fails it with its own
+/// message. Once the merge has landed, an export that failed still fails the
+/// push, because it did not do all it was asked to, and says what to rerun.
+fn push_project_root(manager: &BranchManager, updates: &[RefUpdate]) -> Result<()> {
+    use newgit_core::manager::TrackerMergeAction;
+    let outcome = manager.receive_project_push(updates)?;
+    print_warnings(&outcome.merge.warnings);
+    let moved: Vec<&str> = outcome
+        .merge
+        .trackers
+        .iter()
+        .filter(|merge| merge.action != TrackerMergeAction::Unchanged)
+        .map(|merge| merge.tracker.as_str())
+        .collect();
+    if moved.is_empty() {
+        println!("newgit: `main` already has this");
+    } else {
+        println!("newgit: merged into `main` ({})", moved.join(", "));
+    }
+    if let Some(note) = &outcome.merge.project_root {
+        println!("newgit: {note}");
+    }
+    let mut failed = Vec::new();
+    for export in &outcome.exports {
+        match &export.result {
+            Ok(exported) => println!(
+                "newgit: exported to `{}` ({}, branch {})",
+                export.target, exported.url, exported.target.branch
+            ),
+            Err(error) => {
+                eprintln!("newgit: the export to `{}` failed: {error}", export.target);
+                failed.push(export.target.as_str());
+            }
+        }
+    }
+    if failed.is_empty() {
+        return Ok(());
+    }
+    let rerun: Vec<String> = failed
+        .iter()
+        .map(|target| format!("`newgit export --remote {target}`"))
+        .collect();
+    bail!(
+        "newgit: the push is not finished: `main` has the merge, and it stays, but {} did not \
+         get it. Rerun {}, or `git push` again.",
+        failed
+            .iter()
+            .map(|target| format!("`{target}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        rerun.join(" and ")
     )
 }
 
@@ -2761,6 +2838,9 @@ fn push_pre_receive(instance: &str) -> Result<()> {
         .map(Utf8PathBuf::from);
 
     let manager = manager_here()?;
+    if instance == newgit_core::manager::PROJECT_ROOT_INSTANCE {
+        return push_project_root(&manager, &updates);
+    }
     println!("newgit: checkpointing `{instance}` before publishing this push");
     let outcome = manager.receive_push(instance, &updates, admitting.as_deref())?;
     print_warnings(&outcome.checkpoint.warnings);
@@ -3131,6 +3211,7 @@ fn export(args: ExportArgs) -> Result<()> {
         return export_to_remote(
             name,
             RemoteExportOptions {
+                from_push: false,
                 force: args.force,
                 dry_run: args.dry_run,
             },

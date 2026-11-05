@@ -8,6 +8,10 @@
 
 import { DurableObject } from "cloudflare:workers";
 
+import { liveDeps } from "./index";
+import type { MirrorInstance } from "./endpoint";
+import { type MirrorPull, PULL_BRANCH, PULL_POLL_MS, PULL_START_MS, WEBHOOK_MERGER, advancePulls } from "./webhook";
+
 export interface ProjectInfo {
 	name: string;
 	owner: string;
@@ -33,10 +37,19 @@ export type MergeStart =
 	| { ok: false; reason: "moved"; list: TrackerList }
 	| { ok: false; reason: "locked"; by: string; until: string };
 
+export type PullStart =
+	| { ok: true; base: TrackerList; stale: { repo: string; artifactsId: string }[] }
+	| { ok: false; reason: "missing" }
+	| { ok: false; reason: "locked"; by: string; until: string };
+
 export type MergeFinish =
 	| { ok: true; branch: Branch; tokens: { repo: string; artifactsId: string }[] }
 	| { ok: false; reason: "missing" | "unlocked" }
 	| { ok: false; reason: "moved"; list: TrackerList };
+
+function samePull(left: MirrorPull, right: MirrorPull): boolean {
+	return left.target === right.target && left.commit === right.commit;
+}
 
 function sameList(left: TrackerList, right: TrackerList): boolean {
 	const keys = Object.keys(left).sort();
@@ -257,6 +270,18 @@ export class ProjectDO extends DurableObject<Env> {
 		return { ok: true, branch: this.branch(name)!, tokens: lock.tokens ?? [] };
 	}
 
+	/**
+	 * Let go of the merge into `name` that `by` holds, moving nothing: the
+	 * passwords handed out for it, to cancel. A lock someone else took since
+	 * is left alone.
+	 */
+	releaseMerge(name: string, by: string): { repo: string; artifactsId: string }[] {
+		const lock = this.mergeLock(name);
+		if (lock === null || lock.by !== by) return [];
+		this.sql.exec("DELETE FROM meta WHERE key = ?", `merge:${name}`);
+		return lock.tokens ?? [];
+	}
+
 	/** Whether `list` is exactly the index the merge in flight into `name` began with. */
 	mergeTargets(name: string, list: TrackerList): boolean {
 		const target = this.mergeLock(name)?.target;
@@ -268,6 +293,123 @@ export class ProjectDO extends DurableObject<Env> {
 			.exec<{ value: string }>("SELECT value FROM meta WHERE key = ?", `merge:${name}`)
 			.toArray()[0];
 		return row ? (JSON.parse(row.value) as MergeLock) : null;
+	}
+
+	/** Webhook pulls waiting or running, oldest first (src/webhook.ts). */
+	pulls(): MirrorPull[] {
+		const row = this.sql.exec<{ value: string }>("SELECT value FROM meta WHERE key = 'pulls'").toArray()[0];
+		return row ? (JSON.parse(row.value) as MirrorPull[]) : [];
+	}
+
+	private writePulls(pulls: MirrorPull[]) {
+		this.sql.exec("INSERT OR REPLACE INTO meta VALUES ('pulls', ?)", JSON.stringify(pulls));
+	}
+
+	/**
+	 * Queue a pull and wake up to run it. A redelivery of one still queued
+	 * changes nothing.
+	 */
+	async queuePull(pull: MirrorPull): Promise<void> {
+		const pulls = this.pulls();
+		if (!pulls.some((known) => samePull(known, pull))) this.writePulls([...pulls, pull]);
+		await this.ctx.storage.setAlarm(Date.now() + PULL_START_MS);
+	}
+
+	/** Take a pull off the queue: the passwords its looks used, to cancel. */
+	dropPull(pull: MirrorPull): { repo: string; artifactsId: string }[] {
+		const tokens = this.pulls().find((known) => samePull(known, pull))?.tokens ?? [];
+		this.writePulls(this.pulls().filter((known) => !samePull(known, pull)));
+		return tokens;
+	}
+
+	/** A look found something to land. */
+	markPeeked(pull: MirrorPull): void {
+		this.writePulls(this.pulls().map((known) => (samePull(known, pull) ? { ...known, peeked: true } : known)));
+	}
+
+	/** Whose work this pull may hold: settled. */
+	setPullInstances(pull: MirrorPull, instances: MirrorInstance[]): void {
+		this.writePulls(this.pulls().map((known) => (samePull(known, pull) ? { ...known, instances } : known)));
+	}
+
+	/** GitHub listed no pull request: remember for how long, and when it was last asked. */
+	noteLookup(pull: MirrorPull, lookup: NonNullable<MirrorPull["lookup"]>): void {
+		this.writePulls(this.pulls().map((known) => (samePull(known, pull) ? { ...known, lookup } : known)));
+	}
+
+	notePullTokens(pull: MirrorPull, tokens: { repo: string; artifactsId: string }[]): void {
+		this.writePulls(
+			this.pulls().map((known) =>
+				samePull(known, pull) ? { ...known, tokens: [...(known.tokens ?? []), ...tokens] } : known,
+			),
+		);
+	}
+
+	/**
+	 * The instances with a fork of any of `trackers`, and what their last
+	 * checkpoint holds of each: the one place the remote reads a checkpoint's
+	 * record, because it has nowhere else to learn an instance's pins. A fork
+	 * with no checkpoint says nothing, which reads as work: an empty pin.
+	 */
+	withheldWork(trackers: string[]): MirrorInstance[] {
+		const work: MirrorInstance[] = [];
+		for (const { name } of this.instances()) {
+			const forked = this.forkRepos(name).filter((tracker) => trackers.includes(tracker));
+			if (forked.length === 0) continue;
+			const row = this.sql
+				.exec<{ record: string }>(
+					"SELECT record FROM checkpoints WHERE instance = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+					name,
+				)
+				.toArray()[0];
+			const record = row ? (JSON.parse(row.record) as { code?: { head?: Record<string, string> } }) : undefined;
+			work.push({ name, pins: Object.fromEntries(forked.map((tracker) => [tracker, record?.code?.head?.[tracker] ?? ""])) });
+		}
+		return work;
+	}
+
+	/** Count a failure. How many there have been. */
+	pullFailed(pull: MirrorPull): number {
+		const attempts = (this.pulls().find((known) => samePull(known, pull))?.attempts ?? 0) + 1;
+		this.writePulls(this.pulls().map((known) => (samePull(known, pull) ? { ...known, attempts } : known)));
+		return attempts;
+	}
+
+	/** The lock lapsed: forget the index it began with. */
+	restartPull(pull: MirrorPull): void {
+		this.writePulls(this.pulls().map((known) => (samePull(known, pull) ? { ...known, base: undefined } : known)));
+	}
+
+	/**
+	 * Take `main`'s merge lock for a pull, or find it taken already: the
+	 * index it began with. Refused while anyone else's merge is in flight.
+	 */
+	beginPull(pull: MirrorPull, seconds: number): PullStart {
+		const known = this.pulls().find((candidate) => samePull(candidate, pull));
+		if (known?.base !== undefined) return { ok: true, base: known.base, stale: [] };
+		const branch = this.branch(PULL_BRANCH);
+		if (branch === null) return { ok: false, reason: "missing" };
+		const started = this.beginMerge(PULL_BRANCH, branch.list, WEBHOOK_MERGER, seconds, branch.list);
+		if (!started.ok) {
+			if (started.reason === "locked") return started;
+			return { ok: false, reason: "missing" };
+		}
+		this.writePulls(
+			this.pulls().map((candidate) => (samePull(candidate, pull) ? { ...candidate, base: branch.list } : candidate)),
+		);
+		return { ok: true, base: branch.list, stale: started.stale };
+	}
+
+	/**
+	 * What keeps a pull going: nothing else polls the container once GitHub
+	 * has had its 202. Stops when the queue is empty.
+	 */
+	async alarm(): Promise<void> {
+		const info = this.info();
+		if (info === null || this.pulls().length === 0) return;
+		const deps = liveDeps(this.env, (promise) => this.ctx.waitUntil(promise));
+		if (await advancePulls(this.env, deps, { owner: info.owner, name: info.name }))
+			await this.ctx.storage.setAlarm(Date.now() + PULL_POLL_MS);
 	}
 
 	isMember(login: string): boolean {
