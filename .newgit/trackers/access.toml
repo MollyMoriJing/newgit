@@ -1,6 +1,7 @@
 audience = "project-devs"
 storage = "local"
 merge_with_source = true
-paths = [".newgit/trackers"]
+mount = ".newgit/trackers"
+paths = ["."]
 git = true
 maintainers = "owner"
