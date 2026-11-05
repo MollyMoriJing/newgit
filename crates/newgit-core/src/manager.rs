@@ -106,6 +106,135 @@ pub struct CreateCodeTrackerOutcome {
     pub commits: u32,
 }
 
+/// What `newgit pull --remote <target>` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRemoteOutcome {
+    pub target: String,
+    pub url: String,
+    pub branch: String,
+    /// The tracker a rooted target is rooted at; `None` for one composed
+    /// from the project.
+    pub root: Option<String>,
+    /// How many commits on the target were new here.
+    pub commits: usize,
+    /// Whether they came in by a real merge (the tracker's `main`, or the
+    /// project root, had moved too) rather than a fast-forward.
+    pub merged: bool,
+    /// For a rooted target, how many of the tracker's commits its pin moved
+    /// over.
+    pub pinned: usize,
+    /// The project root's new tip, when it moved.
+    pub view: Option<String>,
+}
+
+/// Which view commit a commit from a target stands for, when it came from
+/// here: by the note naming the root commit it was composed from (an
+/// exported commit, rebuilt without withheld trackers, is noted too), by a
+/// canonical id a rebuilt commit of ours names, or by a root commit split
+/// from it. Its view commit is that root commit composed for every tracker
+/// here.
+struct Recognise {
+    repo: Utf8PathBuf,
+    root: String,
+    /// Canonical id → the rebuilt commit that names it.
+    canonical: BTreeMap<String, String>,
+    /// View commit a root commit was split from → that root commit.
+    split_from: BTreeMap<String, String>,
+    views: BTreeMap<String, String>,
+}
+
+impl Recognise {
+    fn new(repo: &Utf8Path, root: &str) -> Result<Self> {
+        let git = |args: &[&str]| {
+            let mut full = vec!["-C", repo.as_str()];
+            full.extend_from_slice(args);
+            crate::source::run_git_env(&full, &[]).unwrap_or_default()
+        };
+        let mut canonical = BTreeMap::new();
+        for line in git(&[
+            "notes",
+            "--ref",
+            crate::compose::CANONICAL_NOTES_REF,
+            "list",
+        ])
+        .lines()
+        {
+            if let Some((blob, rebuilt)) = line.split_once(' ') {
+                let text = git(&["cat-file", "blob", blob]);
+                if let Some(original) = text.trim().strip_prefix("canonical ") {
+                    canonical.insert(original.to_owned(), rebuilt.to_owned());
+                }
+            }
+        }
+        let mut split_from = BTreeMap::new();
+        let glob = format!("--glob=refs/newgit/trackers/{root}/*");
+        let listing = git(&[
+            "log",
+            &glob,
+            "--format=%H%x00%(trailers:key=Newgit-Split,valueonly)%x01",
+        ]);
+        for record in listing.split('\x01') {
+            if let Some((commit, source)) = record.trim().split_once('\0') {
+                let source = source.trim();
+                if !source.is_empty() {
+                    split_from.insert(source.to_owned(), commit.to_owned());
+                }
+            }
+        }
+        Ok(Self {
+            repo: repo.to_path_buf(),
+            root: root.to_owned(),
+            canonical,
+            split_from,
+            views: BTreeMap::new(),
+        })
+    }
+
+    /// The view commit `commit` stands for here, if it came from here.
+    fn view_of(&mut self, manager: &BranchManager, commit: &str) -> Result<Option<String>> {
+        let noted = |id: &str| -> Result<Option<String>> {
+            Ok(crate::compose::read_root(&self.repo, id)?
+                .filter(|(tracker, _)| tracker == &self.root)
+                .map(|(_, root)| root))
+        };
+        let root_commit = match noted(commit)? {
+            Some(root) => Some(root),
+            None => match self.canonical.get(commit).cloned() {
+                Some(rebuilt) => noted(&rebuilt)?,
+                None => self.split_from.get(commit).cloned(),
+            },
+        };
+        let Some(root_commit) = root_commit else {
+            return Ok(None);
+        };
+        if let Some(view) = self.views.get(&root_commit) {
+            return Ok(Some(view.clone()));
+        }
+        let view = manager.compose_here("refs/newgit/pull/recognised", &root_commit)?;
+        if let Some(view) = &view {
+            self.views.insert(root_commit, view.clone());
+        }
+        Ok(view)
+    }
+}
+
+/// What `tracker create --git --mount --from` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportGitTrackerOutcome {
+    /// The definition, where the project root's working tree now has it.
+    pub path: Utf8PathBuf,
+    pub mount: Utf8PathBuf,
+    /// The imported history's tip: the tracker's `main`, unchanged.
+    pub main: String,
+    /// How many commits that history has.
+    pub commits: usize,
+    /// The view commit that brought it in, now the project root's tip.
+    pub view: String,
+    /// The history has a `.gitmodules`, which Git does not read under a
+    /// mount: its submodules are not checked out.
+    pub submodules: bool,
+}
+
 /// What `spawn --from-checkpoint` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnFromCheckpointOutcome {
@@ -833,6 +962,8 @@ pub enum ExportReason {
     Public,
     /// The target's `trackers` names it.
     Listed,
+    /// The target is rooted at it (`root`).
+    Root,
     /// Neither: its history stays out.
     Withheld,
 }
@@ -1490,6 +1621,336 @@ impl BranchManager {
             source: self.root.name.clone(),
             commits: u32::from(pinned.is_some()),
         })
+    }
+
+    /// Create a tracker in Git mounted at `mount` from another repository's
+    /// history (docs/design/trackers.md, *The t3code milestone*, #140):
+    /// branch `branch` of `from` (its `HEAD` when `None`) becomes the
+    /// tracker's `main` unchanged — every id, signature, and merge as
+    /// upstream has them, since a tracker is stored relative to its own root.
+    /// Then one commit in the project root adds the definition (in `access`),
+    /// the mount, and the pin; it composes as a *brought in* merge, so the
+    /// history appears under the mount through one merge, and `git log` and
+    /// `git blame` reach through it. The project root fast-forwards to it;
+    /// `newgit merge main` publishes it, as for any new tracker.
+    ///
+    /// Refuses, leaving nothing behind, when anything is at `mount` already
+    /// (committed or on disk) and when the history adds a file that, under
+    /// the mount, a tracker outside Git owns.
+    pub fn import_git_tracker(
+        &self,
+        name: &str,
+        audience: &str,
+        mount: &Utf8Path,
+        from: &str,
+        branch: Option<&str>,
+    ) -> Result<ImportGitTrackerOutcome> {
+        validate_name(name)?;
+        self.refuse_root(name, "it always exists")?;
+        self.require_migrated()?;
+        let definition = TrackerDefinition::in_git(name, audience.to_owned(), mount)?;
+        let mount = definition.mount.clone();
+        if mount.as_str() == "." {
+            return Err(NewgitError::Unsupported(format!(
+                "`{name}` would be mounted at `.`, beside root: import it into a directory of its \
+                 own (`--mount apps/{name}`)"
+            )));
+        }
+        let root = self.store.paths().project_root.clone();
+        let definition_path = self.store.paths().trackers.join(format!("{name}.toml"));
+        if self
+            .all_definitions()
+            .iter()
+            .any(|existing| existing.name == name)
+            || definition_path.exists()
+        {
+            return Err(NewgitError::AlreadyExists(definition_path));
+        }
+        let mut all = self.all_definitions();
+        all.push(definition.clone());
+        crate::tracker::resolve_ownership(&mut all)?;
+
+        let project_branch = self.project_branch().ok_or_else(|| {
+            NewgitError::Unsupported(
+                "the project root has no branch of its own checked out, and an import is a \
+                 commit on it: check out its branch (`git switch <branch>`) first"
+                    .to_owned(),
+            )
+        })?;
+        let branch_ref = format!("refs/heads/{project_branch}");
+        let checked_out =
+            crate::source::run_git_env(&["-C", root.as_str(), "symbolic-ref", "-q", "HEAD"], &[])
+                .is_ok_and(|head| head.trim() == branch_ref);
+        if !checked_out {
+            return Err(NewgitError::Unsupported(format!(
+                "an import is a commit on the project root's branch, `{project_branch}`, which is \
+                 not checked out there: `git switch {project_branch}` first"
+            )));
+        }
+        let head = self.source.rev_parse(&branch_ref)?;
+        let committed = crate::source::run_git_env(
+            &[
+                "-C",
+                root.as_str(),
+                "ls-tree",
+                "--name-only",
+                &head,
+                "--",
+                mount.as_str(),
+            ],
+            &[],
+        )?;
+        let on_disk = std::fs::read_dir(root.join(&mount))
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or_else(|_| root.join(&mount).symlink_metadata().is_ok());
+        if !committed.trim().is_empty() || on_disk {
+            return Err(NewgitError::Unsupported(format!(
+                "`{mount}` already has files, and an imported tracker starts from an empty \
+                 directory. To give what is there its own history, carve it instead: `newgit \
+                 tracker create {name} --git --path {mount}`"
+            )));
+        }
+
+        // The project root's commits reach root first, so the import goes on
+        // top of the root commit its tip stands for.
+        self.sync_project_root()?;
+        let base = self.source.rev_parse(&local_tracker_ref(
+            &self.root.name,
+            &format!("instances/{PROJECT_ROOT_INSTANCE}"),
+        ))?;
+
+        let fetched_ref = format!("refs/newgit/importing/{name}");
+        let view_ref = format!("refs/newgit/importing/{name}-view");
+        let cleanup = || {
+            let _ = self.source.delete_ref(&fetched_ref);
+            let _ = self.source.delete_ref(&view_ref);
+        };
+        let result = (|| {
+            crate::source::run_git_env(
+                &[
+                    "-C",
+                    root.as_str(),
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    "--",
+                    from,
+                    &format!("+{}:{fetched_ref}", branch.unwrap_or("HEAD")),
+                ],
+                &[],
+            )?;
+            let imported = self
+                .source
+                .rev_parse(&format!("{fetched_ref}^{{commit}}"))?;
+            if let Some((commit, path, tracker)) = crate::compose::find_outside_git_under(
+                &root,
+                &[&imported],
+                &[],
+                &all,
+                Some(&mount),
+            )? {
+                return Err(NewgitError::SplitRefused(format!(
+                    "commit {} of {from} adds `{path}`, which belongs to `{tracker}`, a tracker \
+                     outside Git: its files (secrets among them) never come in or leave through \
+                     Git, so nothing was imported",
+                    short(&commit)
+                )));
+            }
+            let commits: usize = crate::source::run_git_env(
+                &["-C", root.as_str(), "rev-list", "--count", &imported],
+                &[],
+            )?
+            .trim()
+            .parse()
+            .unwrap_or(0);
+            let submodules = !crate::source::run_git_env(
+                &[
+                    "-C",
+                    root.as_str(),
+                    "ls-tree",
+                    "--name-only",
+                    &imported,
+                    "--",
+                    ".gitmodules",
+                ],
+                &[],
+            )?
+            .trim()
+            .is_empty();
+
+            let message = format!(
+                "Import `{name}` at {mount} from {}\n",
+                recorded_source(from)
+            );
+            let text = toml::to_string_pretty(&definition.to_file()).map_err(|source| {
+                NewgitError::TomlWrite {
+                    label: format!("tracker `{name}`"),
+                    source,
+                }
+            })?;
+            let pin = (name.to_owned(), imported.clone());
+            let (root_commit, moved) =
+                self.commit_definition(&base, name, &text, &message, &pin)?;
+            let view = self
+                .compose_here(&view_ref, &root_commit)?
+                .ok_or_else(|| NewgitError::Unsupported("the import composes to nothing".into()))?;
+            if !self.source.is_ancestor(&head, &view)? {
+                return Err(NewgitError::Unsupported(format!(
+                    "the import would not go on top of `{project_branch}`, so nothing was imported"
+                )));
+            }
+            crate::source::run_git_env(
+                &["-C", root.as_str(), "merge", "--ff-only", "-q", &view],
+                &[],
+            )
+            .map_err(|error| {
+                NewgitError::Unsupported(format!(
+                    "the project root could not take the import (uncommitted changes in the \
+                     way?), so nothing was imported: {error}"
+                ))
+            })?;
+            self.land_root_commit(PROJECT_ROOT_INSTANCE, &root_commit, &moved, &view)?;
+            self.source
+                .update_ref(&local_tracker_ref(name, "main"), &imported)?;
+            self.publish_carved_refs(name, &["main"])?;
+            Ok(ImportGitTrackerOutcome {
+                path: definition_path.clone(),
+                mount: mount.clone(),
+                main: imported,
+                commits,
+                view,
+                submodules,
+            })
+        })();
+        cleanup();
+        result
+    }
+
+    /// A commit on root commit `base` adding definition `name` (`text`)
+    /// where `base` keeps its definitions: in `access`, a commit of its own
+    /// with the same author, committer, and message, so it composes inline as
+    /// the other half of the same work; before `access` is carved, root's
+    /// own tree — and pinning `pin`, `(tracker, commit)`. Returns the root
+    /// commit and the children it moved.
+    fn commit_definition(
+        &self,
+        base: &str,
+        name: &str,
+        text: &str,
+        message: &str,
+        pin: &(String, String),
+    ) -> Result<(String, Vec<(String, String)>)> {
+        let root = self.store.paths().project_root.clone();
+        let ident = |var: &str| -> Result<Vec<u8>> {
+            Ok(
+                crate::source::run_git_env(&["-C", root.as_str(), "var", var], &[])?
+                    .trim()
+                    .as_bytes()
+                    .to_vec(),
+            )
+        };
+        let author = ident("GIT_AUTHOR_IDENT")?;
+        let committer = ident("GIT_COMMITTER_IDENT")?;
+        let blob = {
+            use std::io::Write as _;
+            let mut child = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root.as_str())
+                .args(["hash-object", "-w", "--stdin"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|source| NewgitError::io(&root, source))?;
+            child
+                .stdin
+                .take()
+                .expect("piped stdin")
+                .write_all(text.as_bytes())
+                .map_err(|source| NewgitError::io(&root, source))?;
+            let output = child
+                .wait_with_output()
+                .map_err(|source| NewgitError::io(&root, source))?;
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        let file = (b"100644".to_vec(), blob);
+        let mut objects = crate::objects::Objects::open(&root)?;
+        let commit = objects.commit(base)?;
+        let pins = crate::compose::pins_in(&mut objects, &commit.tree)?;
+        let access = crate::tracker::ACCESS_TRACKER;
+        let mut moved = Vec::new();
+        let tree = match pins.get(access) {
+            Some(pin) => {
+                let access_commit = objects.commit(pin)?;
+                let file_name = format!("{name}.toml");
+                if objects.entry_at(&access_commit.tree, &file_name)?.is_some() {
+                    return Err(NewgitError::AlreadyExists(Utf8PathBuf::from(format!(
+                        "{}/{file_name}",
+                        crate::tracker::DEFINITIONS_DIR
+                    ))));
+                }
+                let access_tree = objects.set_path(&access_commit.tree, &file_name, Some(file))?;
+                let made = objects.make_commit(
+                    &access_tree,
+                    std::slice::from_ref(pin),
+                    &author,
+                    &committer,
+                    b"",
+                    message.as_bytes(),
+                );
+                moved.push((access.to_owned(), made.clone()));
+                objects.set_path(
+                    &commit.tree,
+                    &format!("{}/{access}", crate::compose::PINS_DIR),
+                    Some((crate::objects::GITLINK_MODE.to_vec(), made)),
+                )?
+            }
+            None => objects.set_path(
+                &commit.tree,
+                &format!("{}/{name}.toml", crate::tracker::DEFINITIONS_DIR),
+                Some(file),
+            )?,
+        };
+        let tree = objects.set_path(
+            &tree,
+            &format!("{}/{}", crate::compose::PINS_DIR, pin.0),
+            Some((crate::objects::GITLINK_MODE.to_vec(), pin.1.clone())),
+        )?;
+        moved.push(pin.clone());
+        let made = objects.make_commit(
+            &tree,
+            &[base.to_owned()],
+            &author,
+            &committer,
+            b"",
+            message.as_bytes(),
+        );
+        objects.flush()?;
+        Ok((made, moved))
+    }
+
+    /// Root commit `commit`, made on instance `slug`'s root branch with the
+    /// children's commits in `children`, becomes that branch here and in the
+    /// store; `view` is what it composed to.
+    fn land_root_commit(
+        &self,
+        slug: &str,
+        commit: &str,
+        children: &[(String, String)],
+        view: &str,
+    ) -> Result<()> {
+        let branch = format!("instances/{slug}");
+        self.source
+            .update_ref(&local_tracker_ref(&self.root.name, &branch), commit)?;
+        self.publish_carved_refs(&self.root.name, &[&branch])?;
+        for (tracker, child) in children {
+            self.source
+                .update_ref(&local_tracker_ref(tracker, &branch), child)?;
+            self.publish_carved_refs(tracker, &[&branch])?;
+        }
+        self.source
+            .update_ref(&format!("refs/newgit/views/instances/{slug}"), view)?;
+        Ok(())
     }
 
     /// The project root's own branch: the one `newgit init` found checked out.
@@ -6857,26 +7318,7 @@ impl BranchManager {
         name: &str,
         options: RemoteExportOptions,
     ) -> Result<RemoteExportOutcome> {
-        let targets = self.export_targets()?;
-        let target = targets
-            .iter()
-            .find(|target| target.name == name)
-            .cloned()
-            .ok_or_else(|| {
-                let known: Vec<&str> = targets.iter().map(|target| target.name.as_str()).collect();
-                NewgitError::Unsupported(if known.is_empty() {
-                    format!(
-                        "no export target `{name}`: define one in .newgit/exports/{name}.toml \
-                         (`newgit reference export`)"
-                    )
-                } else {
-                    format!(
-                        "no export target `{name}` (defined: {}); targets live in \
-                         .newgit/exports/<name>.toml",
-                        known.join(", ")
-                    )
-                })
-            })?;
+        let target = self.export_target(name)?;
 
         self.prepare_projection()?;
         // Only to say what the export leaves behind, so its failing is said,
@@ -6889,12 +7331,20 @@ impl BranchManager {
             Some(link) => Some((link.connect(Acting::Login)?, link.project.clone())),
             None => None,
         };
-        let list = self.branch_list(
-            client
-                .as_ref()
-                .map(|(client, project)| (client.as_ref(), project.as_str())),
-            PROJECT_ROOT_INSTANCE,
-        )?;
+        // Rooted at a tracker, `main` is that tracker's own `main`: a branch
+        // is a ref of the root a view is rooted at.
+        let list = match &target.root {
+            Some(tracker) => self
+                .tracker_branch_commit(tracker, PROJECT_ROOT_INSTANCE)?
+                .map(|commit| BTreeMap::from([(tracker.clone(), commit)]))
+                .unwrap_or_default(),
+            None => self.branch_list(
+                client
+                    .as_ref()
+                    .map(|(client, project)| (client.as_ref(), project.as_str())),
+                PROJECT_ROOT_INSTANCE,
+            )?,
+        };
 
         let (mut trackers, mut view) =
             self.compose_export(&target, &list, PROJECT_ROOT_INSTANCE)?;
@@ -6987,30 +7437,10 @@ impl BranchManager {
     /// target that diverged from the export is left to the push to refuse.
     fn pull_export_target(&self, target: &ExportTarget, tip: &str, dry_run: bool) -> Result<u32> {
         let root = self.store.paths().project_root.clone();
-        let upstream = export_ref(&target.name, "upstream");
-        let fetched = crate::source::run_git_env(
-            &[
-                "-C",
-                root.as_str(),
-                "fetch",
-                "--quiet",
-                "--no-tags",
-                &target.push_url(),
-                &format!("+refs/heads/{}:{upstream}", target.branch),
-            ],
-            &[],
-        );
-        match fetched {
-            Ok(_) => {}
-            // Not exported yet: nothing there to bring in.
-            Err(NewgitError::SourceCommand { stderr, .. })
-                if stderr.contains("couldn't find remote ref") =>
-            {
-                return Ok(0);
-            }
-            Err(error) => return Err(error),
-        }
-        let theirs = self.source.rev_parse(&upstream)?;
+        // Not exported yet: nothing there to bring in.
+        let Some(theirs) = self.fetch_target(target)? else {
+            return Ok(0);
+        };
         if theirs == tip
             || self.source.is_ancestor(&theirs, tip)?
             || !self.source.is_ancestor(tip, &theirs)?
@@ -7018,6 +7448,25 @@ impl BranchManager {
             return Ok(0);
         }
         let commits = self.source.commit_count(&format!("{tip}..{theirs}"))?;
+        // A rooted target's commits are its tracker's own: bringing them in
+        // moves that tracker's `main` and then its pin, which is a commit of
+        // its own, asked for by name.
+        if let Some(tracker) = &target.root {
+            if self.local_main_has(tracker, &theirs)? {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{}` on `{}` has {commits} commit(s) `{tracker}`'s published `main` does \
+                     not, but `main` here already has them (pulled back, not published yet): \
+                     `newgit merge main`, then export again",
+                    target.branch, target.name
+                )));
+            }
+            return Err(NewgitError::Unsupported(format!(
+                "`{}` on `{}` has {commits} commit(s) `{tracker}`'s `main` does not (merged \
+                 there?): `newgit pull --remote {}` brings them in, then export again. \
+                 `--force` replaces the branch instead",
+                target.branch, target.name, target.name
+            )));
+        }
 
         let branch = std::fs::read_to_string(self.store.paths().project_branch_file())
             .map(|branch| branch.trim().to_owned())
@@ -7028,12 +7477,9 @@ impl BranchManager {
                 "`{}` on `{}` has {commits} commit(s) `main` does not (merged there?), and the \
                  project root's `{branch}` cannot fast-forward to them: it has commits of its \
                  own, or the target withholds a tracker, so its commits are not the project's. \
-                 Bring them in by hand — `git pull {} {}` in the project root, then `newgit merge \
-                 main` — or replace the branch with `--force`",
-                target.branch,
-                target.name,
-                target.push_url(),
-                target.branch
+                 `newgit pull --remote {}` brings them in as work in the project root, then \
+                 `newgit merge main` publishes them; or replace the branch with `--force`",
+                target.branch, target.name, target.name
             )));
         }
         if dry_run {
@@ -7064,12 +7510,428 @@ impl BranchManager {
         Ok(commits)
     }
 
+    /// Fetch `target`'s branch into `refs/newgit/exports/<target>/upstream`:
+    /// the commit it is at, or `None` when the target has no such branch.
+    fn fetch_target(&self, target: &ExportTarget) -> Result<Option<String>> {
+        let root = self.store.paths().project_root.clone();
+        let upstream = export_ref(&target.name, "upstream");
+        let fetched = crate::source::run_git_env(
+            &[
+                "-C",
+                root.as_str(),
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                &target.push_url(),
+                &format!("+refs/heads/{}:{upstream}", target.branch),
+            ],
+            &[],
+        );
+        match fetched {
+            Ok(_) => Ok(Some(self.source.rev_parse(&upstream)?)),
+            Err(NewgitError::SourceCommand { stderr, .. })
+                if stderr.contains("couldn't find remote ref") =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Export target `name`, or an error listing the ones there are.
+    fn export_target(&self, name: &str) -> Result<ExportTarget> {
+        let targets = self.export_targets()?;
+        targets
+            .iter()
+            .find(|target| target.name == name)
+            .cloned()
+            .ok_or_else(|| {
+                let known: Vec<&str> = targets.iter().map(|target| target.name.as_str()).collect();
+                NewgitError::Unsupported(if known.is_empty() {
+                    format!(
+                        "no export target `{name}`: define one in .newgit/exports/{name}.toml \
+                         (`newgit reference export`)"
+                    )
+                } else {
+                    format!(
+                        "no export target `{name}` (defined: {}); targets live in \
+                         .newgit/exports/<name>.toml",
+                        known.join(", ")
+                    )
+                })
+            })
+    }
+
+    /// `newgit pull --remote <target>` (#142): bring the commits on export
+    /// target `name`'s branch that are not here into its trackers.
+    ///
+    /// - **Rooted at a tracker** (`root`), they are that tracker's own
+    ///   history: its `main` fast-forwards to them, or really merges them as
+    ///   `newgit merge` would, and then its pin in the project root moves to
+    ///   that `main` as `newgit pull <tracker>` moves it — one commit,
+    ///   composing as a merge that brings them in on top.
+    /// - **Otherwise** they are view commits. The ones that came from here
+    ///   are recognised — by id, by the note naming the root commit an
+    ///   exported commit stands for, or by a canonical id — and the rest
+    ///   come into the project root as ordinary work, with the files of every
+    ///   tracker the target withholds put back as their parent had them, to
+    ///   be split like any other work.
+    ///
+    /// Either way, a history adding a file a tracker outside Git owns is
+    /// refused before anything moves, and nothing is published: `newgit
+    /// merge main` does that.
+    pub fn pull_remote(&self, name: &str) -> Result<PullRemoteOutcome> {
+        self.require_migrated()?;
+        let target = self.export_target(name)?;
+        self.prepare_projection()?;
+        self.sync_project_root()?;
+        let theirs = self.fetch_target(&target)?.ok_or_else(|| {
+            NewgitError::Unsupported(format!(
+                "`{}` has no branch `{}` to pull from yet",
+                target.name, target.branch
+            ))
+        })?;
+        match target.root.clone() {
+            Some(tracker) => self.pull_rooted(&target, &tracker, &theirs),
+            None => self.pull_view(&target, &theirs),
+        }
+    }
+
+    fn pull_rooted(
+        &self,
+        target: &ExportTarget,
+        tracker: &str,
+        theirs: &str,
+    ) -> Result<PullRemoteOutcome> {
+        let project = self.store.paths().project_root.clone();
+        let definition = self
+            .carved
+            .iter()
+            .find(|definition| definition.name == tracker)
+            .cloned()
+            .ok_or_else(|| {
+                NewgitError::Unsupported(format!("`{tracker}` is not a tracker in Git here"))
+            })?;
+        // `main` as published, or as it is here when that is ahead of it
+        // (pulled back before, not merged yet): a pull again finds nothing.
+        let published = self.tracker_branch_commit(tracker, "main")?;
+        let here = self
+            .source
+            .rev_parse(&local_tracker_ref(tracker, "main"))
+            .ok();
+        let ours = match (&published, &here) {
+            (Some(published), Some(here))
+                if published != here && self.source.is_ancestor(published, here)? =>
+            {
+                Some(here.clone())
+            }
+            (None, Some(here)) => Some(here.clone()),
+            _ => published,
+        };
+        let mut new_args = vec![theirs];
+        if let Some(ours) = &ours {
+            new_args.extend(["--not", ours.as_str()]);
+        }
+        let all = self.all_definitions();
+        if let Some((commit, path, owner)) = crate::compose::find_outside_git_under(
+            &project,
+            &new_args,
+            &[],
+            &all,
+            Some(&definition.mount),
+        )? {
+            return Err(NewgitError::SplitRefused(format!(
+                "commit {} on `{}` adds `{path}`, which belongs to `{owner}`, a tracker outside \
+                 Git: its files (secrets among them) never come in or leave through Git, so \
+                 nothing was pulled. It has to come out of that history first",
+                short(&commit),
+                target.name
+            )));
+        }
+        let mut count_args = vec!["-C", project.as_str(), "rev-list", "--count"];
+        count_args.extend(&new_args);
+        let commits: usize = crate::source::run_git_env(&count_args, &[])?
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        let from = format!("{} {}", recorded_source(&target.url), target.branch);
+        let (main, merged) = match &ours {
+            None => (theirs.to_owned(), false),
+            Some(ours) if ours == theirs || self.source.is_ancestor(theirs, ours)? => {
+                (ours.clone(), false)
+            }
+            Some(ours) if self.source.is_ancestor(ours, theirs)? => (theirs.to_owned(), false),
+            Some(ours) => match self.merge_commits(ours, theirs, &format!("Merge {from}"))? {
+                Ok(merged) => (merged, true),
+                Err(files) => {
+                    return Err(NewgitError::Unsupported(format!(
+                        "`{tracker}`'s `main` and `{}` on `{}` both moved, and merging them \
+                         conflicts ({}), so nothing moved: merge them on the target and pull \
+                         again",
+                        target.branch,
+                        target.name,
+                        files.join(", ")
+                    )));
+                }
+            },
+        };
+        // `main` moves with the pin, after the project root has taken it.
+        let mains: Vec<(String, String)> = if ours.as_deref() != Some(main.as_str()) {
+            vec![(tracker.to_owned(), main.clone())]
+        } else {
+            Vec::new()
+        };
+        let pulled = self.move_pin(None, &definition, &main, &from, &mains)?;
+        Ok(PullRemoteOutcome {
+            target: target.name.clone(),
+            url: target.push_url(),
+            branch: target.branch.clone(),
+            root: Some(tracker.to_owned()),
+            commits,
+            merged,
+            pinned: pulled.commits,
+            view: pulled.view,
+        })
+    }
+
+    fn pull_view(&self, target: &ExportTarget, theirs: &str) -> Result<PullRemoteOutcome> {
+        let project = self.store.paths().project_root.clone();
+        let branch = self.project_branch().ok_or_else(|| {
+            NewgitError::Unsupported("the project root has no branch of its own".to_owned())
+        })?;
+        let branch_ref = format!("refs/heads/{branch}");
+        let head = self.source.rev_parse(&branch_ref)?;
+        let outcome = |commits: usize, merged: bool, view: Option<String>| PullRemoteOutcome {
+            target: target.name.clone(),
+            url: target.push_url(),
+            branch: target.branch.clone(),
+            root: None,
+            commits,
+            merged,
+            pinned: 0,
+            view,
+        };
+        if theirs == head || self.source.is_ancestor(theirs, &head)? {
+            return Ok(outcome(0, false, None));
+        }
+
+        // What the target has that no ref of ours reaches, oldest first.
+        let upstream = export_ref(&target.name, "upstream");
+        let walk: Vec<String> = crate::source::run_git_env(
+            &[
+                "-C",
+                project.as_str(),
+                "rev-list",
+                "--topo-order",
+                "--reverse",
+                theirs,
+                "--not",
+                &format!("--exclude={upstream}"),
+                "--all",
+            ],
+            &[],
+        )?
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect();
+        let mut recognise = Recognise::new(&project, &self.root.name)?;
+        let withheld: Vec<TrackerDefinition> = self
+            .carved
+            .iter()
+            .filter(|definition| export_reason(target, definition) == ExportReason::Withheld)
+            .cloned()
+            .collect();
+        let mut objects = crate::objects::Objects::open(&project)?;
+        let mut mapped: BTreeMap<String, String> = BTreeMap::new();
+        for id in &walk {
+            if let Some(ours) = recognise.view_of(self, id)? {
+                mapped.insert(id.clone(), ours);
+                continue;
+            }
+            let commit = objects.commit(id)?;
+            if commit.parents.is_empty() {
+                return Err(NewgitError::Unsupported(format!(
+                    "commit {} on `{}` shares no history with the project, so it cannot be \
+                     brought in as work",
+                    short(id),
+                    target.name
+                )));
+            }
+            let mut parents = Vec::new();
+            for parent in &commit.parents {
+                let ours = match mapped.get(parent) {
+                    Some(ours) => ours.clone(),
+                    None => recognise
+                        .view_of(self, parent)?
+                        .unwrap_or_else(|| parent.clone()),
+                };
+                if !parents.contains(&ours) {
+                    parents.push(ours);
+                }
+            }
+            let first = objects.commit(&parents[0])?;
+            let mut tree = commit.tree.clone();
+            for definition in &withheld {
+                let mount = definition.mount.as_str();
+                if mount == "." {
+                    return Err(NewgitError::Unsupported(format!(
+                        "`{}` withholds `{}`, which is mounted at `.`, so its files cannot be \
+                         put back into the commits that come from there",
+                        target.name, definition.name
+                    )));
+                }
+                if objects.subtree(&commit.tree, mount)?.is_some()
+                    || objects.entry_at(&commit.tree, mount)?.is_some()
+                {
+                    return Err(NewgitError::SplitRefused(format!(
+                        "commit {} on `{}` changes `{mount}`, which belongs to `{}`, a tracker \
+                         that target does not ship, so nothing was pulled",
+                        short(id),
+                        target.name,
+                        definition.name
+                    )));
+                }
+                let theirs_there = objects
+                    .subtree(&first.tree, mount)?
+                    .map(|tree| (crate::objects::TREE_MODE.to_vec(), tree));
+                tree = objects.set_path(&tree, mount, theirs_there)?;
+            }
+            let made = if tree == commit.tree && parents == commit.parents {
+                id.clone()
+            } else {
+                objects.make_commit(
+                    &tree,
+                    &parents,
+                    &commit.author,
+                    &commit.committer,
+                    &crate::objects::Commit::unsigned_headers(&commit.headers),
+                    &commit.message,
+                )
+            };
+            mapped.insert(id.clone(), made);
+        }
+        objects.flush()?;
+        let tip = match mapped.get(theirs) {
+            Some(tip) => tip.clone(),
+            None => recognise
+                .view_of(self, theirs)?
+                .unwrap_or_else(|| theirs.to_owned()),
+        };
+        if tip == head || self.source.is_ancestor(&tip, &head)? {
+            return Ok(outcome(0, false, None));
+        }
+        let all = self.all_definitions();
+        if let Some((commit, path, owner)) =
+            crate::compose::find_outside_git(&project, &[&tip, "--not", &head], &[], &all)?
+        {
+            return Err(NewgitError::SplitRefused(format!(
+                "commit {} on `{}` adds `{path}`, which belongs to `{owner}`, a tracker outside \
+                 Git: its files (secrets among them) never come in or leave through Git, so \
+                 nothing was pulled. It has to come out of that history first",
+                short(&commit),
+                target.name
+            )));
+        }
+        let commits: usize = crate::source::run_git_env(
+            &[
+                "-C",
+                project.as_str(),
+                "rev-list",
+                "--count",
+                &tip,
+                "--not",
+                &head,
+            ],
+            &[],
+        )?
+        .trim()
+        .parse()
+        .unwrap_or(0);
+        let (new_head, merged) = if self.source.is_ancestor(&head, &tip)? {
+            (tip, false)
+        } else {
+            match self.merge_commits(
+                &head,
+                &tip,
+                &format!("Merge {} {}", recorded_source(&target.url), target.branch),
+            )? {
+                Ok(merged) => (merged, true),
+                Err(files) => {
+                    return Err(NewgitError::Unsupported(format!(
+                        "the project root and `{}` on `{}` both moved, and merging them conflicts \
+                         ({}), so nothing moved: `git pull {} {}` in the project root resolves \
+                         it by hand",
+                        target.branch,
+                        target.name,
+                        files.join(", "),
+                        target.push_url(),
+                        target.branch
+                    )));
+                }
+            }
+        };
+        let checked_out = crate::source::run_git_env(
+            &["-C", project.as_str(), "symbolic-ref", "-q", "HEAD"],
+            &[],
+        )
+        .is_ok_and(|current| current.trim() == branch_ref);
+        if checked_out {
+            crate::source::run_git_env(
+                &[
+                    "-C",
+                    project.as_str(),
+                    "merge",
+                    "--ff-only",
+                    "-q",
+                    &new_head,
+                ],
+                &[],
+            )
+            .map_err(|error| {
+                NewgitError::Unsupported(format!(
+                    "the project root could not take what `{}` has (uncommitted changes in the \
+                     way?): {error}",
+                    target.name
+                ))
+            })?;
+        } else {
+            self.source.update_ref(&branch_ref, &new_head)?;
+        }
+        Ok(outcome(commits, merged, Some(new_head)))
+    }
+
+    /// Whether tracker `tracker`'s `main` here already holds `commit`.
+    fn local_main_has(&self, tracker: &str, commit: &str) -> Result<bool> {
+        match self.source.rev_parse(&local_tracker_ref(tracker, "main")) {
+            Ok(here) => Ok(here == commit || self.source.is_ancestor(commit, &here)?),
+            Err(_) => Ok(false),
+        }
+    }
+
     /// Every export target, each checked against this project's trackers:
     /// a target naming a tracker outside Git, or none at all, is an error.
     fn export_targets(&self) -> Result<Vec<ExportTarget>> {
         let targets = self.store.load_export_targets()?;
         let code = self.carved_definitions();
         for target in &targets {
+            if let Some(root) = &target.root
+                && !code.iter().any(|definition| &definition.name == root)
+            {
+                let reason = if self
+                    .trackers
+                    .iter()
+                    .any(|definition| &definition.name == root)
+                {
+                    "is not in Git, and a tracker outside Git never leaves this machine through Git"
+                } else {
+                    "is not a tracker in this project"
+                };
+                return Err(NewgitError::InvalidDefinition {
+                    kind: "export",
+                    name: target.name.clone(),
+                    reason: format!("`root` names `{root}`, which {reason}"),
+                });
+            }
             for listed in &target.trackers {
                 if code.iter().any(|definition| &definition.name == listed) {
                     continue;
@@ -7091,6 +7953,53 @@ impl BranchManager {
             }
         }
         Ok(targets)
+    }
+
+    /// A target rooted at `tracker` ships its own history only while that is
+    /// its view: refuse once any commit of it at `commit` pins a tracker in
+    /// Git, naming the child.
+    fn refuse_rooted_mounts(
+        &self,
+        target: &ExportTarget,
+        tracker: &str,
+        commit: &str,
+    ) -> Result<()> {
+        let root = self.store.paths().project_root.clone();
+        let pinning = crate::source::run_git_env(
+            &[
+                "-C",
+                root.as_str(),
+                "rev-list",
+                "-1",
+                commit,
+                "--",
+                crate::compose::PINS_DIR,
+            ],
+            &[],
+        )?;
+        let pinning = pinning.trim();
+        if pinning.is_empty() {
+            return Ok(());
+        }
+        let mut objects = crate::objects::Objects::open(&root)?;
+        let found = objects.commit(pinning)?;
+        let mut children: BTreeSet<String> = crate::compose::pins_in(&mut objects, &found.tree)?
+            .into_keys()
+            .collect();
+        if let Some(parent) = found.parents.first() {
+            let parent = objects.commit(parent)?;
+            children.extend(crate::compose::pins_in(&mut objects, &parent.tree)?.into_keys());
+        }
+        let named: Vec<String> = children.iter().map(|child| format!("`{child}`")).collect();
+        Err(NewgitError::Unsupported(format!(
+            "`{}` is rooted at `{tracker}`, which mounts {}, a tracker in Git (commit {}), so \
+             its view is not its own history and it cannot be exported as its own root yet. \
+             Export the project instead: drop `root` from .newgit/exports/{}.toml",
+            target.name,
+            named.join(", "),
+            short(pinning),
+            target.name
+        )))
     }
 
     /// Compose `list` (tracker → commit) as `target` sees it — its trackers
@@ -7119,9 +8028,22 @@ impl BranchManager {
             .filter(|tracker| tracker.reason != ExportReason::Withheld)
             .map(|tracker| tracker.name.clone())
             .collect();
+        let root_name = target
+            .root
+            .clone()
+            .unwrap_or_else(|| self.root.name.clone());
         let root_commit = list
-            .get(&self.root.name)
-            .filter(|_| shipped.contains(&self.root.name));
+            .get(&root_name)
+            .filter(|_| shipped.contains(&root_name));
+        if target.root.is_some() {
+            let Some(root_commit) = root_commit else {
+                return Err(NewgitError::Unsupported(format!(
+                    "nothing to export to `{}`: `{root_name}` has no history on `{branch}` yet",
+                    target.name
+                )));
+            };
+            self.refuse_rooted_mounts(target, &root_name, root_commit)?;
+        }
         let Some(root_commit) = root_commit else {
             return Err(NewgitError::Unsupported(format!(
                 "nothing to export to `{}`: `{}` holds the project's history on `{branch}`, and it                  is not public and the target does not name it. Name the trackers to ship in                  .newgit/exports/{}.toml — `trackers = [\"root\"]` mirrors the project's own                  code",
@@ -7134,7 +8056,7 @@ impl BranchManager {
         let may_ship = |tracker: &str| shipped.contains(tracker);
         let view = crate::compose::compose(
             &root,
-            &self.root.name,
+            &root_name,
             &[(export_ref(&target.name, branch), root_commit.clone())],
             &crate::compose::ComposeOptions {
                 readable: &may_ship,
@@ -7153,8 +8075,15 @@ impl BranchManager {
                 target.name
             ))
         })?;
+        // A rooted view holds the tracker's files at its own root: each is
+        // judged where the project's view has it, under the mount.
+        let mount = target
+            .root
+            .as_ref()
+            .and_then(|_| code.iter().find(|definition| definition.name == root_name))
+            .map(|definition| definition.mount.clone());
         if let Some((commit, path, tracker)) =
-            crate::compose::find_outside_git(&root, &[&tip], &[], &all)?
+            crate::compose::find_outside_git_under(&root, &[&tip], &[], &all, mount.as_deref())?
         {
             return Err(NewgitError::SplitRefused(format!(
                 "the export to `{}` would carry commit {}, which adds `{path}`, and `{path}` \
@@ -8651,6 +9580,29 @@ impl BranchManager {
                      mounted tracker's pin"
                 ))
             })?;
+        let new = self.follow_commit(&definition)?.ok_or_else(|| {
+            NewgitError::Unsupported(format!(
+                "`{tracker}` has no `{}` to pull here",
+                definition.follow
+            ))
+        })?;
+        self.move_pin(instance, &definition, &new, &definition.follow, &[])
+    }
+
+    /// Move `definition`'s pin in `instance` (the project root when `None`)
+    /// to `new`, which came from `from` (a ref, or a target): one view
+    /// commit, `Pull <tracker>: N commits from <from>`, authored by whoever
+    /// runs it, composing as a merge that brings the commits in. Nothing
+    /// when the pin already has `new`.
+    fn move_pin(
+        &self,
+        instance: Option<&str>,
+        definition: &TrackerDefinition,
+        new: &str,
+        from: &str,
+        mains: &[(String, String)],
+    ) -> Result<PullOutcome> {
+        let tracker = definition.name.as_str();
         let project = self.store.paths().project_root.clone();
         let (slug, workspace, head) = match instance {
             Some(instance) if instance != PROJECT_ROOT_INSTANCE => {
@@ -8705,16 +9657,16 @@ impl BranchManager {
                 }
             )));
         };
-        let new = self.follow_commit(&definition)?.ok_or_else(|| {
-            NewgitError::Unsupported(format!(
-                "`{tracker}` has no `{}` to pull here",
-                definition.follow
-            ))
-        })?;
+        let new = new.to_owned();
         if new == old || self.source.is_ancestor(&new, &old)? {
+            for (tracker, main) in mains {
+                self.source
+                    .update_ref(&local_tracker_ref(tracker, "main"), main)?;
+                self.publish_carved_refs(tracker, &["main"])?;
+            }
             return Ok(PullOutcome {
                 tracker: tracker.to_owned(),
-                follow: definition.follow.clone(),
+                follow: from.to_owned(),
                 commits: 0,
                 view: None,
             });
@@ -8746,9 +9698,8 @@ impl BranchManager {
             tree
         };
         let message = format!(
-            "Pull {tracker}: {commits} commit{} from {}",
+            "Pull {tracker}: {commits} commit{} from {from}",
             if commits == 1 { "" } else { "s" },
-            definition.follow
         );
         let pulled = crate::source::run_git_env(
             &[
@@ -8765,18 +9716,41 @@ impl BranchManager {
         )?
         .trim()
         .to_owned();
-        let branch = format!("instances/{slug}");
-        self.source
-            .update_ref(&local_tracker_ref(&self.root.name, &branch), &pulled)?;
-        self.source
-            .update_ref(&local_tracker_ref(tracker, &branch), &new)?;
-        self.publish_carved_refs(&self.root.name, &[&branch])?;
-        self.publish_carved_refs(tracker, &[&branch])?;
-        let view_ref = format!("refs/newgit/views/instances/{slug}");
+        // Composed to a ref of its own, and taken by the workspace, before
+        // any branch moves: a working tree that cannot take it leaves every
+        // ref as it was, so the pull can simply run again.
+        let view_ref = format!("refs/newgit/pull/view-{slug}");
         let view = self
             .compose_here(&view_ref, &pulled)?
             .ok_or_else(|| NewgitError::Unsupported("the pull composes to nothing".to_owned()))?;
-        match &workspace {
+        let taken = self.take_pull(workspace.as_deref(), definition, &view_ref, &view);
+        let _ = self.source.delete_ref(&view_ref);
+        taken?;
+        for (tracker, main) in mains {
+            self.source
+                .update_ref(&local_tracker_ref(tracker, "main"), main)?;
+            self.publish_carved_refs(tracker, &["main"])?;
+        }
+        self.land_root_commit(&slug, &pulled, &[(tracker.to_owned(), new.clone())], &view)?;
+        Ok(PullOutcome {
+            tracker: tracker.to_owned(),
+            follow: from.to_owned(),
+            commits,
+            view: Some(view),
+        })
+    }
+
+    /// Fast-forward `workspace` (the project root when `None`) to the pull's
+    /// view commit `view`, composed at `view_ref`.
+    fn take_pull(
+        &self,
+        workspace: Option<&Utf8Path>,
+        definition: &TrackerDefinition,
+        view_ref: &str,
+        view: &str,
+    ) -> Result<()> {
+        let project = self.store.paths().project_root.clone();
+        match workspace {
             Some(workspace) => {
                 GitSource::fetch_refs(
                     &["-C", workspace.as_str()],
@@ -8797,11 +9771,9 @@ impl BranchManager {
                 )
                 .map_err(|error| {
                     NewgitError::Unsupported(format!(
-                        "the pull is {}, but the workspace could not fast-forward to it \
-                         (uncommitted changes under `{}`?): `git merge --ff-only {}` there: {error}",
-                        &view[..12],
-                        definition.mount,
-                        &view[..12]
+                        "the workspace could not take the pull (uncommitted changes under \
+                         `{}`?), so nothing moved: commit or stash them and pull again: {error}",
+                        definition.mount
                     ))
                 })?;
             }
@@ -8814,50 +9786,64 @@ impl BranchManager {
                 .is_ok_and(|head| head.trim() == format!("refs/heads/{branch}"));
                 if checked_out {
                     crate::source::run_git_env(
-                        &["-C", project.as_str(), "merge", "--ff-only", "-q", &view],
+                        &["-C", project.as_str(), "merge", "--ff-only", "-q", view],
                         &[],
-                    )?;
+                    )
+                    .map_err(|error| {
+                        NewgitError::Unsupported(format!(
+                            "the project root could not take the pull (uncommitted changes in \
+                             the way?), so nothing moved: commit or stash them and pull again: \
+                             {error}"
+                        ))
+                    })?;
                 } else {
                     self.source
-                        .update_ref(&format!("refs/heads/{branch}"), &view)?;
+                        .update_ref(&format!("refs/heads/{branch}"), view)?;
                 }
             }
         }
-        Ok(PullOutcome {
-            tracker: tracker.to_owned(),
-            follow: definition.follow.clone(),
-            commits,
-            view: Some(view),
-        })
+        Ok(())
     }
 
     /// The commit `definition`'s `follow` ref names: on the remote, that
     /// branch of its repo; here, its branch in the tracker store.
     fn follow_commit(&self, definition: &TrackerDefinition) -> Result<Option<String>> {
+        self.tracker_branch_commit(&definition.name, &definition.follow)
+    }
+
+    /// The commit branch `branch` of tracker `tracker` is at: on the remote,
+    /// that branch of its repo; here, its branch in the tracker store. The
+    /// store answers only when the remote says it has no such repo (404) or
+    /// no such branch: any other failure is the remote's, and returned, so
+    /// nothing is ever decided on refs that may be stale.
+    fn tracker_branch_commit(&self, tracker: &str, branch: &str) -> Result<Option<String>> {
         let project = self.store.paths().project_root.clone();
         if let Some(link) = &self.remote {
             let client = link.connect(Acting::Login)?;
-            let repo = format!("{}.t.{}", link.project.replace('/', "."), definition.name);
-            if let Ok(credential) = client.credential(&link.project, &repo, Scope::Read) {
-                let target = format!(
-                    "refs/newgit/remote/{}/{}",
-                    definition.name, definition.follow
-                );
-                GitSource::fetch_refs(
-                    &["-C", project.as_str()],
-                    credential.remote.as_deref().unwrap_or_default(),
-                    &[format!("+refs/heads/{}:{target}", definition.follow)],
-                    Some(&basic_auth_header(&credential)),
-                )?;
-                if let Ok(commit) = self.source.rev_parse(&target) {
-                    return Ok(Some(commit));
+            let repo = format!("{}.t.{tracker}", link.project.replace('/', "."));
+            match client.credential(&link.project, &repo, Scope::Read) {
+                Ok(credential) => {
+                    let target = format!("refs/newgit/remote/{tracker}/{branch}");
+                    match GitSource::fetch_refs(
+                        &["-C", project.as_str()],
+                        credential.remote.as_deref().unwrap_or_default(),
+                        &[format!("+refs/heads/{branch}:{target}")],
+                        Some(&basic_auth_header(&credential)),
+                    ) {
+                        Ok(()) => return Ok(Some(self.source.rev_parse(&target)?)),
+                        Err(NewgitError::SourceCommand { stderr, .. })
+                            if stderr.contains("couldn't find remote ref") => {}
+                        Err(error) => return Err(error),
+                    }
                 }
+                Err(NewgitError::Remote { status: 404, .. }) => {}
+                Err(error) => return Err(error),
             }
         }
         self.fetch_carved_trackers()?;
         Ok(self
             .source
-            .rev_parse(&local_tracker_ref(&definition.name, &definition.follow))
+            .rev_parse(&local_tracker_ref(tracker, branch))
             .ok())
     }
 
@@ -11056,9 +12042,17 @@ struct ImportedCode {
 }
 
 /// Whether `target` ships a tracker in Git, and why: the one place that is
-/// decided, for composing an export and for routing `gh` alike. A target that
-/// ships a tracker as its own root (docs/design/roots.md) plugs in here.
+/// decided, for composing an export and for routing `gh` alike. A target
+/// rooted at a tracker ships that tracker alone (one that mounts another in
+/// Git is refused when composed).
 fn export_reason(target: &ExportTarget, definition: &TrackerDefinition) -> ExportReason {
+    if let Some(root) = &target.root {
+        return if root == &definition.name {
+            ExportReason::Root
+        } else {
+            ExportReason::Withheld
+        };
+    }
     if definition.audience == "public" {
         ExportReason::Public
     } else if target.trackers.contains(&definition.name) {
@@ -11105,6 +12099,54 @@ fn route_to_targets<'a>(
         exporting,
         resolved,
     }
+}
+
+/// How a repository a commit names is written into that commit, which may
+/// be published: a URL without its userinfo (a token, a password) or query;
+/// a local path as the URL its `origin` has, written the same way, or failing
+/// that only the directory's name. Never a path on this machine.
+pub fn recorded_source(source: &str) -> String {
+    if let Some(path) = source.strip_prefix("file://") {
+        return recorded_source(path);
+    }
+    if let Some((scheme, rest)) = source.split_once("://") {
+        let (authority, path) = match rest.find('/') {
+            Some(at) => rest.split_at(at),
+            None => (rest, ""),
+        };
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        let path = path.split(['?', '#']).next().unwrap_or_default();
+        return format!("{scheme}://{host}{path}");
+    }
+    let local = Utf8Path::new(source);
+    let path_like = source.starts_with('/') || source.starts_with('.') || local.exists();
+    if !path_like {
+        // `owner/repo` or `git@host:owner/repo`: nothing secret in it.
+        return source.to_owned();
+    }
+    let origin =
+        crate::source::run_git_env(&["-C", source, "config", "--get", "remote.origin.url"], &[])
+            .ok()
+            .map(|url| url.trim().to_owned())
+            .filter(|url| !url.is_empty());
+    if let Some(origin) = origin {
+        let path_too =
+            origin.starts_with('/') || origin.starts_with('.') || origin.starts_with("file:");
+        if !path_too {
+            return recorded_source(&origin);
+        }
+    }
+    local
+        .canonicalize_utf8()
+        .ok()
+        .as_deref()
+        .unwrap_or(local)
+        .file_name()
+        .map(|name| name.trim_end_matches(".git").to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "a local repository".to_owned())
 }
 
 /// Where an export target's view of `branch` is composed in the project repo.

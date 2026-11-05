@@ -270,12 +270,22 @@ enum Command {
     /// Move a mounted tracker's pin to its `follow` ref (default `main`): one
     /// commit, `Pull <tracker>: N commits from <ref>`, that brings its new
     /// history in as a merge. Nothing else moves a pin on anyone's behalf
+    ///
+    /// With --remote <target>, bring the commits on an export target's branch
+    /// (a pull request merged there) back instead: into the tracker a rooted
+    /// target is rooted at, then its pin in the project root; otherwise into
+    /// the project root as work. `newgit merge main` publishes either
+    #[command(group(clap::ArgGroup::new("what").args(["tracker", "remote"]).required(true)))]
     Pull {
         /// The mounted tracker in Git to bring up to date
-        tracker: String,
+        tracker: Option<String>,
         /// Instance (inferred when run inside a workspace; the project root
         /// otherwise)
+        #[arg(conflicts_with = "remote")]
         instance: Option<String>,
+        /// The export target (`.newgit/exports/<name>.toml`) to pull from
+        #[arg(long, value_name = "TARGET", conflicts_with = "tracker")]
+        remote: Option<String>,
     },
     /// Clone a project from a newgit remote: its default branch composed from
     /// the trackers in Git you may read, set up for newgit
@@ -348,12 +358,24 @@ enum TrackerCommand {
         #[arg(long, default_value = "local")]
         storage: String,
         /// A tracker in Git: committed content with its own history, carved out
-        /// of whichever tracker owns its paths now (usually root)
-        #[arg(long, requires = "path")]
+        /// of whichever tracker owns its paths now (usually root), or with
+        /// --from, brought in from another repository
+        #[arg(long, requires = "place")]
         git: bool,
         /// A path a tracker in Git owns (repeatable; set at creation)
-        #[arg(long = "path", value_name = "PATH")]
+        #[arg(long = "path", value_name = "PATH", group = "place")]
         path: Vec<Utf8PathBuf>,
+        /// Where an imported tracker is mounted (with --from): an empty
+        /// directory its files appear under
+        #[arg(long, value_name = "DIR", requires = "from", group = "place")]
+        mount: Option<Utf8PathBuf>,
+        /// Import another repository's history, unchanged, as this tracker's
+        /// `main`: a URL, or a path (relative to here)
+        #[arg(long, value_name = "REPOSITORY", requires = "git")]
+        from: Option<String>,
+        /// The branch of --from to import (default: its HEAD)
+        #[arg(long, value_name = "BRANCH", requires = "from")]
+        from_branch: Option<String>,
     },
     /// Add workspace paths to a tracker outside Git
     Track {
@@ -643,7 +665,13 @@ fn main() -> Result<()> {
         Command::Remote { command } => remote_cmd::remote_command(command),
         Command::Clone { project, dir, url } => remote_cmd::clone(&project, dir, url),
         Command::Merge { instance, into } => merge(instance, &into),
-        Command::Pull { tracker, instance } => pull(instance, &tracker),
+        Command::Pull {
+            remote: Some(target),
+            ..
+        } => pull_remote(&target),
+        Command::Pull {
+            tracker, instance, ..
+        } => pull(instance, &tracker.unwrap_or_default()),
         Command::EndpointCompose => {
             let plan: newgit_core::endpoint::Plan = serde_json::from_reader(std::io::stdin())
                 .context("the plan on stdin is not JSON newgit can read")?;
@@ -1973,6 +2001,60 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             audience,
             git: true,
             path,
+            mount,
+            from: Some(from),
+            from_branch,
+            ..
+        } => {
+            let Some(mount) = mount.filter(|_| path.is_empty()) else {
+                bail!(
+                    "an imported tracker is placed with --mount, not --path (its files keep their \
+                     own root): `newgit tracker create {name} --git --mount <dir> --from {from}`"
+                );
+            };
+            // A local repository named relative to here, not to the project
+            // root the fetch runs in.
+            let from = match std::fs::canonicalize(&from) {
+                Ok(local) => local.to_string_lossy().into_owned(),
+                Err(_) => from,
+            };
+            let manager = manager_here()?;
+            let outcome = manager.import_git_tracker(
+                &name,
+                &audience,
+                &mount,
+                &from,
+                from_branch.as_deref(),
+            )?;
+            let root = manager.store().paths().project_root.clone();
+            println!(
+                "Imported `{name}`, a tracker in Git, at {}",
+                display_path(&root, &outcome.path)
+            );
+            println!(
+                "  history:   {} from {from}, unchanged (its `main` is {})",
+                plural(outcome.commits, "commit"),
+                short_rev(&outcome.main)
+            );
+            println!(
+                "  mounted:   {}, brought in by one merge ({}) on the project root",
+                outcome.mount,
+                short_rev(&outcome.view)
+            );
+            if outcome.submodules {
+                println!(
+                    "  note:      it has a .gitmodules, which Git does not read under a mount, so \
+                     its submodules are not checked out"
+                );
+            }
+            println!("  publish it with: newgit merge main");
+            Ok(())
+        }
+        TrackerCommand::Create {
+            name,
+            audience,
+            git: true,
+            path,
             ..
         } => {
             let manager = manager_here()?;
@@ -3166,9 +3248,21 @@ fn export_to_remote(name: &str, options: RemoteExportOptions) -> Result<()> {
     } else {
         "Would export (dry run)"
     };
-    println!("{verb} `main` → {} (branch {})", outcome.url, target.branch);
+    match &target.root {
+        Some(root) => println!(
+            "{verb} `{root}`'s `main`, as its own root → {} (branch {})",
+            outcome.url, target.branch
+        ),
+        None => println!("{verb} `main` → {} (branch {})", outcome.url, target.branch),
+    }
     let width = column_width(outcome.trackers.iter().map(|t| t.name.len()), "");
-    for tracker in &outcome.trackers {
+    // Rooted at a tracker, the others are not withheld so much as not in
+    // that view at all.
+    let shown = outcome
+        .trackers
+        .iter()
+        .filter(|t| target.root.is_none() || t.reason != ExportReason::Withheld);
+    for tracker in shown {
         let at = tracker
             .commit
             .as_deref()
@@ -3181,6 +3275,10 @@ fn export_to_remote(name: &str, options: RemoteExportOptions) -> Result<()> {
             ExportReason::Listed => println!(
                 "  tracker:  {:<width$}  included (named by .newgit/exports/{}.toml, audience {}) @ {at}",
                 tracker.name, target.name, tracker.audience
+            ),
+            ExportReason::Root => println!(
+                "  tracker:  {:<width$}  the root (named by .newgit/exports/{}.toml), its own files at the top @ {at}",
+                tracker.name, target.name
             ),
             ExportReason::Withheld => println!(
                 "  withheld: {:<width$}  (audience {})",
@@ -3214,10 +3312,11 @@ fn export_to_remote(name: &str, options: RemoteExportOptions) -> Result<()> {
     if let Some(error) = &outcome.project_root_error {
         println!("\n  Could not compare the project root's own work with `main`: {error}");
     }
-    if outcome
-        .trackers
-        .iter()
-        .any(|t| t.reason == ExportReason::Withheld)
+    if target.root.is_none()
+        && outcome
+            .trackers
+            .iter()
+            .any(|t| t.reason == ExportReason::Withheld)
     {
         println!(
             "  Ship a withheld tracker by naming it in .newgit/exports/{}.toml: trackers = [\"<name>\"]",
@@ -4073,6 +4172,47 @@ fn pull(instance: Option<String>, tracker: &str) -> Result<()> {
             &view[..view.len().min(12)]
         ),
     }
+    Ok(())
+}
+
+fn pull_remote(target: &str) -> Result<()> {
+    let manager = BranchManager::open(context_here()?.store)?;
+    let outcome = manager.pull_remote(target)?;
+    let from = format!("{} (branch {})", outcome.url, outcome.branch);
+    let Some(view) = &outcome.view else {
+        match &outcome.root {
+            Some(tracker) if outcome.commits > 0 => println!(
+                "`{tracker}`'s `main` took {} from {from}; its pin here already has them",
+                plural(outcome.commits, "commit")
+            ),
+            _ => println!("Nothing new on {from}"),
+        }
+        return Ok(());
+    };
+    let how = if outcome.merged {
+        "merged"
+    } else {
+        "fast-forwarded"
+    };
+    match &outcome.root {
+        Some(tracker) => {
+            println!(
+                "Pulled {} from {from} into `{tracker}`'s `main` ({how})",
+                plural(outcome.commits, "commit")
+            );
+            println!(
+                "  pinned:   the project root now pins it, one commit bringing {} in ({})",
+                plural(outcome.pinned, "commit"),
+                short_rev(view)
+            );
+        }
+        None => println!(
+            "Pulled {} from {from} into the project root ({how}, {})",
+            plural(outcome.commits, "commit"),
+            short_rev(view)
+        ),
+    }
+    println!("  publish it with: newgit merge main");
     Ok(())
 }
 
