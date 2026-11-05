@@ -21,8 +21,8 @@ export type TrackerList = Record<string, string>;
 interface MergeLock {
 	by: string;
 	until: string;
-	/** The trackers the merge declared when it began: all it may move. */
-	trackers?: string[];
+	/** The index the merge began with: every pin in it was checked then. */
+	target?: TrackerList;
 	/** Write passwords handed out for it. */
 	tokens?: { repo: string; artifactsId: string }[];
 }
@@ -181,7 +181,13 @@ export class ProjectDO extends DurableObject<Env> {
 	 * (someone else merged first: merge again) and no other merge into it is
 	 * in flight. Takes the branch's merge lock for `seconds`.
 	 */
-	beginMerge(name: string, base: TrackerList, by: string, seconds: number, trackers: string[]): MergeStart {
+	beginMerge(
+		name: string,
+		base: TrackerList,
+		by: string,
+		seconds: number,
+		target: TrackerList,
+	): MergeStart {
 		const branch = this.branch(name);
 		if (branch === null) return { ok: false, reason: "missing" };
 		if (!sameList(branch.list, base)) return { ok: false, reason: "moved", list: branch.list };
@@ -195,7 +201,7 @@ export class ProjectDO extends DurableObject<Env> {
 		this.sql.exec(
 			"INSERT OR REPLACE INTO meta VALUES (?, ?)",
 			`merge:${name}`,
-			JSON.stringify({ by, until, trackers, tokens: [] }),
+			JSON.stringify({ by, until, target, tokens: [] }),
 		);
 		return { ok: true, until, stale };
 	}
@@ -230,9 +236,10 @@ export class ProjectDO extends DurableObject<Env> {
 		return { ok: true, branch: this.branch(name)!, tokens: lock.tokens ?? [] };
 	}
 
-	/** Whether the merge in flight into `name` declared `tracker` when it began. */
-	mergeDeclares(name: string, tracker: string): boolean {
-		return this.mergeLock(name)?.trackers?.includes(tracker) ?? false;
+	/** Whether `list` is exactly the index the merge in flight into `name` began with. */
+	mergeTargets(name: string, list: TrackerList): boolean {
+		const target = this.mergeLock(name)?.target;
+		return target !== undefined && sameList(target, list);
 	}
 
 	private mergeLock(name: string): MergeLock | null {
