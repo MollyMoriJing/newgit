@@ -8,10 +8,14 @@
 //! splitting a view commit makes exactly one root commit.
 //!
 //! - [`compose`] walks a root's history and expands every readable pin into
-//!   files under its mount. A child's changes split from the same view
-//!   commit are *inline*; history from anywhere else is *brought in* by a
-//!   `git subtree`-shaped merge. Rebuilt commits come back as the originals
-//!   they were split from, signatures included, wherever their bytes allow.
+//!   files under its mount. That is all a child contributes: its tree at the
+//!   pin, and the author, dates, and message of that one commit when it holds
+//!   the work. A child's parents are never read, so its own history stays in
+//!   its own repo, no view reaches it, and a store holding root's history and
+//!   each pinned commit alone composes the very same ids. A commit that adds
+//!   a mount or moves a pin, from whatever history, is one ordinary view
+//!   commit. Rebuilt commits come back as the originals they were split from,
+//!   signatures included, wherever their bytes allow.
 //! - [`split`] takes view commits (an agent's work, a merge) and makes one
 //!   root commit for each, with a commit in each child the work changed and
 //!   every other pin reused.
@@ -271,37 +275,24 @@ fn graft(objects: &mut Objects, tree: &str, mount: &str, child: &str) -> Result<
     objects.set_path(tree, mount, entry)
 }
 
-/// `tree` with whatever is at `mount` replaced by `child`: a replayed
-/// commit's mount holds exactly that child commit's files. At `.` the mount
-/// is the whole tree, so the files of `previous` (the child commit before
-/// it, what `tree` holds of it) come out first, or a deletion would never
-/// show.
-fn replace(
-    objects: &mut Objects,
-    tree: &str,
-    mount: &str,
-    child: &str,
-    previous: Option<&str>,
-) -> Result<String> {
-    if mount == "." {
-        let mut base = tree.to_owned();
-        if let Some(previous) = previous {
-            for file in objects.files(previous)?.into_keys() {
-                base = objects.set_path(&base, &file, None)?;
-            }
-        }
-        return objects.overlay(&base, child);
-    }
-    let entry = (child != EMPTY_TREE).then(|| (TREE_MODE.to_vec(), child.to_owned()));
-    objects.set_path(tree, mount, entry)
-}
-
 fn depth(mount: &str) -> usize {
     if mount == "." {
         0
     } else {
         mount.split('/').count()
     }
+}
+
+/// `mounts` in the order they are grafted: shallowest first.
+fn by_depth(mounts: &BTreeMap<String, String>) -> Vec<(&String, &String)> {
+    let mut ordered: Vec<(&String, &String)> = mounts.iter().collect();
+    ordered.sort_by(|(left_name, left), (right_name, right)| {
+        depth(left)
+            .cmp(&depth(right))
+            .then_with(|| left.cmp(right))
+            .then_with(|| left_name.cmp(right_name))
+    });
+    ordered
 }
 
 #[derive(Debug, Clone)]
@@ -311,48 +302,29 @@ struct Composed {
     tree: String,
 }
 
-/// Where a child view commit was taken: `(walk position, tracker commit,
-/// view commit)`.
-type TakenAt = (usize, String, String);
-
-/// A tracker commit with its pins and where each readable one is mounted.
+/// A root commit with its pins and where each readable one is mounted.
 type Shape = (Commit, BTreeMap<String, String>, BTreeMap<String, String>);
-
-/// Per tracker: which child view commits its view has taken, and where.
-#[derive(Default)]
-struct Taken {
-    /// `(mount, child view commit)` → every `(position, tracker commit, view
-    /// commit)` that took it inline.
-    inline: HashMap<(String, String), Vec<TakenAt>>,
-    /// The same for replays: where a brought-in child commit was replayed.
-    replayed: HashMap<(String, String), Vec<TakenAt>>,
-}
 
 struct Composer<'a> {
     objects: Objects,
     options: &'a ComposeOptions<'a>,
-    /// Tracker commit → its view commit.
+    /// Root commit → its view commit.
     views: HashMap<String, Composed>,
-    /// Tracker commit → the children its view expanded.
+    /// Pinned child commit → its tree as this reader sees it.
+    children: HashMap<String, String>,
+    /// Root commit → the children its view expanded.
     expanded: HashMap<String, BTreeSet<String>>,
-    /// View commit → its parents and its tree: the view graph, every
-    /// tracker's.
-    graph: HashMap<String, (Vec<String>, String)>,
-    /// Tracker commit → its walk position (ancestors first).
-    position: HashMap<String, usize>,
-    next_position: usize,
-    taken: HashMap<String, Taken>,
-    /// Tips already composed, per tracker: a later walk stops at them.
-    done: HashMap<String, Vec<String>>,
-    /// Trackers being composed right now, outermost first: a cycle guard.
+    /// Trackers being expanded right now, outermost first: a cycle guard.
     composing: Vec<String>,
     notes: Vec<(String, String)>,
     canonical: Vec<(String, String)>,
 }
 
 /// Compose the views rooted at tracker `root`, one per `(view ref, root
-/// commit)` in `tips`, into `repo`, which must hold every tracker commit
-/// the reader may read. Each view ref is set to its view's tip.
+/// commit)` in `tips`, into `repo`, which must hold root's history and, of
+/// every child the reader may read, each commit that history pins (and what
+/// those pin): no child's parents are read. Each view ref is set to its
+/// view's tip.
 pub fn compose(
     repo: &Utf8Path,
     root: &str,
@@ -363,12 +335,8 @@ pub fn compose(
         objects: Objects::open(repo)?,
         options,
         views: HashMap::new(),
+        children: HashMap::new(),
         expanded: HashMap::new(),
-        graph: HashMap::new(),
-        position: HashMap::new(),
-        next_position: 0,
-        taken: HashMap::new(),
-        done: HashMap::new(),
         composing: Vec::new(),
         notes: Vec::new(),
         canonical: Vec::new(),
@@ -383,7 +351,8 @@ pub fn compose(
             .collect());
     }
     let commits: Vec<String> = tips.iter().map(|(_, commit)| commit.clone()).collect();
-    composer.compose_tracker(root, &commits)?;
+    composer.composing.push(root.to_owned());
+    composer.compose_root(root, &commits)?;
     composer.objects.flush()?;
     let mut views = Vec::new();
     for (view_ref, commit) in tips {
@@ -411,13 +380,74 @@ pub fn compose(
 }
 
 impl Composer<'_> {
-    fn compose_tracker(&mut self, name: &str, tips: &[String]) -> Result<()> {
-        let tips: Vec<String> = tips
-            .iter()
-            .filter(|tip| !self.views.contains_key(*tip))
-            .cloned()
+    fn compose_root(&mut self, name: &str, tips: &[String]) -> Result<()> {
+        let mut args = vec![
+            "rev-list".to_owned(),
+            "--topo-order".to_owned(),
+            "--reverse".to_owned(),
+        ];
+        args.extend(tips.iter().cloned());
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let walk: Vec<String> = git(self.objects.repo(), &args)?
+            .lines()
+            .map(ToOwned::to_owned)
             .collect();
-        if tips.is_empty() {
+
+        // First every child this history pins, so a commit always mounts a
+        // tree that is already expanded.
+        let mut shapes: Vec<Shape> = Vec::with_capacity(walk.len());
+        for id in &walk {
+            let commit = self.objects.commit(id)?;
+            let all_pins = pins_in(&mut self.objects, &commit.tree)?;
+            let mounts = self.expand_children(&commit, &all_pins)?;
+            shapes.push((commit, all_pins, mounts));
+        }
+
+        let mut own_trees: HashMap<String, String> = HashMap::new();
+        for (commit, all_pins, mounts) in shapes {
+            self.compose_one(name, &commit, &all_pins, &mounts, &mut own_trees)?;
+        }
+        Ok(())
+    }
+
+    /// Expand each child `commit` pins that this reader gets, and say where
+    /// each of them is mounted.
+    fn expand_children(
+        &mut self,
+        commit: &Commit,
+        all_pins: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, String>> {
+        let mut readable = BTreeMap::new();
+        for (child, pin) in all_pins {
+            if !(self.options.readable)(child) {
+                continue;
+            }
+            // A pin its tracker's own history does not hold (another
+            // tracker's commit under this name, or one never pushed) is left
+            // out at this commit, as for a reader who may not read it: what
+            // the reader gets is never someone else's content.
+            let admitted = self.options.admit.is_none_or(|admit| admit(child, pin));
+            if admitted && self.objects.has_commit(pin)? {
+                readable.insert(child.clone(), pin.clone());
+            }
+        }
+        let mounts = mounts_of(
+            &mut self.objects,
+            &commit.id,
+            &commit.tree,
+            all_pins,
+            &readable,
+        )?;
+        for (child, pin) in &readable {
+            self.expand_child(child, pin)?;
+        }
+        Ok(mounts)
+    }
+
+    /// `pin`'s tree as this reader sees it, kept in `children`: this one
+    /// commit and what it pins, never its parents.
+    fn expand_child(&mut self, name: &str, pin: &str) -> Result<()> {
+        if self.children.contains_key(pin) {
             return Ok(());
         }
         if self.composing.iter().any(|outer| outer == name) {
@@ -427,75 +457,38 @@ impl Composer<'_> {
             )));
         }
         self.composing.push(name.to_owned());
-        let result = self.compose_walk(name, &tips);
+        let result = self.child_tree(pin);
         self.composing.pop();
-        result
+        self.children.insert(pin.to_owned(), result?);
+        Ok(())
     }
 
-    fn compose_walk(&mut self, name: &str, tips: &[String]) -> Result<()> {
-        let mut args = vec![
-            "rev-list".to_owned(),
-            "--topo-order".to_owned(),
-            "--reverse".to_owned(),
-        ];
-        args.extend(tips.iter().cloned());
-        if let Some(done) = self.done.get(name) {
-            args.push("--not".to_owned());
-            args.extend(done.iter().cloned());
-        }
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let walk: Vec<String> = git(self.objects.repo(), &args)?
-            .lines()
-            .map(ToOwned::to_owned)
-            .filter(|commit| !self.views.contains_key(commit))
-            .collect();
-        self.done
-            .entry(name.to_owned())
-            .or_default()
-            .extend(tips.iter().cloned());
+    fn child_tree(&mut self, pin: &str) -> Result<String> {
+        let commit = self.objects.commit(pin)?;
+        let all_pins = pins_in(&mut self.objects, &commit.tree)?;
+        let mounts = self.expand_children(&commit, &all_pins)?;
+        let own = self.objects.set_path(&commit.tree, PINS_DIR, None)?;
+        self.with_children(&own, &by_depth(&mounts), &all_pins)
+    }
 
-        // First every child this history pins, so a parent always mounts a
-        // view that is already composed.
-        let mut shapes: Vec<Shape> = Vec::with_capacity(walk.len());
-        let mut child_tips: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for id in &walk {
-            let commit = self.objects.commit(id)?;
-            let all_pins = pins_in(&mut self.objects, &commit.tree)?;
-            let mut readable = BTreeMap::new();
-            for (child, pin) in &all_pins {
-                if !(self.options.readable)(child) {
-                    continue;
-                }
-                // A pin its tracker's own history does not hold (another
-                // tracker's commit under this name, or one never pushed) is
-                // left out at this commit, as for a reader who may not read
-                // it: what the reader gets is never someone else's content.
-                let admitted = self.options.admit.is_none_or(|admit| admit(child, pin));
-                if !admitted || !self.objects.has_commit(pin)? {
-                    continue;
-                }
-                readable.insert(child.clone(), pin.clone());
-                child_tips
-                    .entry(child.clone())
-                    .or_default()
-                    .insert(pin.clone());
-            }
-            let mounts = mounts_of(&mut self.objects, id, &commit.tree, &all_pins, &readable)?;
-            shapes.push((commit, all_pins, mounts));
+    /// `own` with each child in `ordered` grafted at its mount.
+    fn with_children(
+        &mut self,
+        own: &str,
+        ordered: &[(&String, &String)],
+        all_pins: &BTreeMap<String, String>,
+    ) -> Result<String> {
+        let mut tree = own.to_owned();
+        for (child, mount) in ordered {
+            let pin = &all_pins[*child];
+            let view = self
+                .children
+                .get(pin)
+                .cloned()
+                .ok_or_else(|| missing(pin))?;
+            tree = graft(&mut self.objects, &tree, mount, &view)?;
         }
-        for (child, pins) in child_tips {
-            let pins: Vec<String> = pins.into_iter().collect();
-            self.compose_tracker(&child, &pins)?;
-        }
-
-        let mut own_trees: HashMap<String, String> = HashMap::new();
-        for (commit, all_pins, mounts) in shapes {
-            let position = self.next_position;
-            self.next_position += 1;
-            self.position.insert(commit.id.clone(), position);
-            self.compose_one(name, &commit, &all_pins, &mounts, &mut own_trees)?;
-        }
-        Ok(())
+        Ok(tree)
     }
 
     fn own_tree(&mut self, commit: &Commit, cache: &mut HashMap<String, String>) -> Result<String> {
@@ -516,19 +509,8 @@ impl Composer<'_> {
         own_trees: &mut HashMap<String, String>,
     ) -> Result<()> {
         let own = self.own_tree(commit, own_trees)?;
-        let mut ordered: Vec<(&String, &String)> = mounts.iter().collect();
-        ordered.sort_by(|(left_name, left), (right_name, right)| {
-            depth(left)
-                .cmp(&depth(right))
-                .then_with(|| left.cmp(right))
-                .then_with(|| left_name.cmp(right_name))
-        });
-        let mut tree = own.clone();
-        for (child, mount) in &ordered {
-            let pin = &all_pins[*child];
-            let view = self.views.get(pin).cloned().ok_or_else(|| missing(pin))?;
-            tree = graft(&mut self.objects, &tree, mount, &view.tree)?;
-        }
+        let ordered = by_depth(mounts);
+        let tree = self.with_children(&own, &ordered, all_pins)?;
 
         // A single-parent commit whose only change was to children this
         // reader may not read is dropped: the commit after it moves onto
@@ -568,53 +550,22 @@ impl Composer<'_> {
             }
         }
 
+        // A merge left with nothing of its own by what this reader may not
+        // read: its sides differ in a withheld pin, and the side that only
+        // moved it was dropped, so what is left is one parent, or an
+        // ancestor of it, with this tree.
+        if commit.parents.len() > 1
+            && self.joins_withheld(all_pins, mounts, &parent_commits)?
+            && let Some(parent) = self.empty_merge(&commit.parents, &tree)?
+        {
+            let view = self.views[&parent].clone();
+            let expanded = self.expanded.get(&parent).cloned().unwrap_or_default();
+            self.expanded.insert(commit.id.clone(), expanded);
+            self.views.insert(commit.id.clone(), view);
+            return Ok(());
+        }
+
         let split = parse_split(&commit.message);
-        // Inline, or brought in: per child, the child view commits new at
-        // this commit are the other halves of the same work, or history from
-        // elsewhere, which comes in as a merge.
-        let mut inline: Vec<(String, String, Vec<String>)> = Vec::new();
-        let mut brought: Vec<(String, String)> = Vec::new();
-        for (child, mount) in &ordered {
-            let tip = self.views[&all_pins[*child]].id.clone();
-            let mut before: Vec<String> = Vec::new();
-            for parent in &parent_commits {
-                let parent_pins = pins_in(&mut self.objects, &parent.tree)?;
-                if let Some(pin) = parent_pins.get(*child)
-                    && self
-                        .expanded
-                        .get(&parent.id)
-                        .is_some_and(|expanded| expanded.contains(*child))
-                    && let Some(view) = self.views.get(pin)
-                    && !before.contains(&view.id)
-                {
-                    before.push(view.id.clone());
-                }
-            }
-            if before.contains(&tip) {
-                continue;
-            }
-            let new = self.new_commits(&tip, &before);
-            if new.is_empty() {
-                continue;
-            }
-            let same_work = new.len() == 1 && {
-                let only = self.objects.commit(&new[0])?;
-                only.parents == before
-                    && (commit.parents.len() > 1
-                        || (only.committer == commit.committer && only.message == commit.message))
-            };
-            if split.is_some() || same_work {
-                inline.push(((*mount).clone(), tip, new));
-            } else {
-                brought.push(((*mount).clone(), tip));
-            }
-        }
-        for (mount, tip) in &brought {
-            let replay = self.replay(name, commit, mount, tip)?;
-            if !parents.contains(&replay) {
-                parents.push(replay);
-            }
-        }
 
         // The metadata: the commit's own, or for one split from a view
         // commit, that view commit's, put back from the trailers — taken
@@ -626,18 +577,25 @@ impl Composer<'_> {
                     Some(first) => self.own_tree(first, own_trees)? == own,
                     None => own == EMPTY_TREE,
                 };
-                match inline.first() {
-                    Some((_, tip, _)) if own_unchanged => {
-                        let holder = self.objects.commit(tip)?;
+                let holder = if own_unchanged {
+                    self.work_holder(&ordered, all_pins, &parent_commits)?
+                } else {
+                    None
+                };
+                match holder {
+                    Some(holder) => {
+                        let holder = self.objects.commit(&holder)?;
+                        let message = parse_split(&holder.message)
+                            .map_or(holder.message.clone(), |carried| carried.message);
                         (
                             holder.author,
                             holder.committer,
-                            holder.message,
+                            message,
                             split.headers.clone(),
                             split.source.clone(),
                         )
                     }
-                    _ => (
+                    None => (
                         commit.author.clone(),
                         commit.committer.clone(),
                         split.message.clone(),
@@ -672,19 +630,6 @@ impl Composer<'_> {
             }
             id
         };
-        self.graph
-            .insert(id.clone(), (parents.clone(), tree.clone()));
-        let position = self.position[&commit.id];
-        let taken = self.taken.entry(name.to_owned()).or_default();
-        for (mount, _, new) in inline {
-            for child in new {
-                taken
-                    .inline
-                    .entry((mount.clone(), child))
-                    .or_default()
-                    .push((position, commit.id.clone(), id.clone()));
-            }
-        }
         self.notes
             .push((id.clone(), format!("{name} {}\n", commit.id)));
         self.expanded
@@ -693,144 +638,91 @@ impl Composer<'_> {
         Ok(())
     }
 
-    /// The view commits reachable from `tip` and from none of `before`.
-    fn new_commits(&self, tip: &str, before: &[String]) -> Vec<String> {
-        if let Some((parents, _)) = self.graph.get(tip)
-            && parents == before
-        {
-            return vec![tip.to_owned()];
-        }
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut stack: Vec<String> = before.to_vec();
-        while let Some(current) = stack.pop() {
-            if !seen.insert(current.clone()) {
-                continue;
-            }
-            if let Some((parents, _)) = self.graph.get(&current) {
-                stack.extend(parents.iter().cloned());
-            }
-        }
-        let mut new = Vec::new();
-        let mut visited: HashSet<String> = HashSet::new();
-        let mut stack = vec![tip.to_owned()];
-        while let Some(current) = stack.pop() {
-            if seen.contains(&current) || !visited.insert(current.clone()) {
-                continue;
-            }
-            if let Some((parents, _)) = self.graph.get(&current) {
-                stack.extend(parents.iter().cloned());
-            }
-            new.push(current);
-        }
-        new
-    }
-
-    /// Every commit of `name`'s history behind `commit` (not itself).
-    fn ancestors(&mut self, commit: &Commit) -> Result<HashSet<String>> {
-        let mut seen = HashSet::new();
-        let mut stack: Vec<String> = commit.parents.clone();
-        while let Some(current) = stack.pop() {
-            if !seen.insert(current.clone()) {
-                continue;
-            }
-            stack.extend(self.objects.commit(&current)?.parents);
-        }
-        Ok(seen)
-    }
-
-    /// Child view commit `tip`, brought in under `mount` at `commit` of
-    /// `name`: replayed as `git subtree` would, each child commit with its
-    /// tree under the mount and, beside it, the rest of the tree as its
-    /// first parent holds it. A child commit this view already holds — one
-    /// a commit behind this one took inline, or replayed — is represented by
-    /// that commit, so nothing appears twice. A pure function of the child's
-    /// history and of this commit's own history.
-    fn replay(&mut self, name: &str, commit: &Commit, mount: &str, tip: &str) -> Result<String> {
-        let behind = self.ancestors(commit)?;
-        let position = self.position[&commit.id];
-        let mut made: HashMap<String, String> = HashMap::new();
-        let represented = |composer: &Composer<'_>, child: &str, made: &HashMap<String, String>| {
-            if let Some(id) = made.get(child) {
-                return Some(id.clone());
-            }
-            let taken = composer.taken.get(name)?;
-            let key = (mount.to_owned(), child.to_owned());
-            taken
-                .inline
-                .get(&key)
-                .into_iter()
-                .flatten()
-                .chain(taken.replayed.get(&key).into_iter().flatten())
-                .filter(|(_, at, _)| behind.contains(at))
-                .min_by_key(|(at_position, _, _)| *at_position)
-                .map(|(_, _, view)| view.clone())
-        };
-        // Depth-first over what is not represented yet, iteratively, so a
-        // long history cannot overflow the stack.
-        let mut stack = vec![(tip.to_owned(), false)];
-        while let Some((current, ready)) = stack.pop() {
-            if represented(self, &current, &made).is_some() {
-                continue;
-            }
-            let (parents, child_tree) = self
-                .graph
-                .get(&current)
-                .cloned()
-                .ok_or_else(|| missing(&current))?;
-            if !ready {
-                stack.push((current, true));
-                for parent in parents.iter().rev() {
-                    stack.push((parent.clone(), false));
-                }
-                continue;
-            }
-            let mapped: Vec<String> = parents
-                .iter()
-                .map(|parent| represented(self, parent, &made).ok_or_else(|| missing(parent)))
-                .collect::<Result<_>>()?;
-            let base = match mapped.first() {
-                Some(first) => self.graph.get(first).map(|(_, tree)| tree.clone()),
-                None => None,
-            }
-            .unwrap_or_else(|| EMPTY_TREE.to_owned());
-            let previous = parents
-                .first()
-                .and_then(|parent| self.graph.get(parent))
-                .map(|(_, tree)| tree.clone());
-            let tree = replace(
-                &mut self.objects,
-                &base,
-                mount,
-                &child_tree,
-                previous.as_deref(),
-            )?;
-            let original = self.objects.commit(&current)?;
-            let mut deduped: Vec<String> = Vec::new();
-            for parent in mapped {
-                if !deduped.contains(&parent) {
-                    deduped.push(parent);
+    /// The child commit holding the work of a split commit that changed
+    /// none of its own files: the first child, by mount, whose pin moved at
+    /// this commit. It carries the work's metadata (*Which commit carries the
+    /// message* in docs/design/trackers.md), so it is read as it stands.
+    fn work_holder(
+        &mut self,
+        ordered: &[(&String, &String)],
+        all_pins: &BTreeMap<String, String>,
+        parent_commits: &[Commit],
+    ) -> Result<Option<String>> {
+        for (child, _) in ordered {
+            let tip = &all_pins[*child];
+            let mut moved = true;
+            for parent in parent_commits {
+                let parent_pins = pins_in(&mut self.objects, &parent.tree)?;
+                if parent_pins.get(*child) == Some(tip)
+                    && self
+                        .expanded
+                        .get(&parent.id)
+                        .is_some_and(|expanded| expanded.contains(*child))
+                {
+                    moved = false;
                 }
             }
-            let id = self.objects.make_commit(
-                &tree,
-                &deduped,
-                &original.author,
-                &original.committer,
-                &Commit::unsigned_headers(&original.headers),
-                &original.message,
-            );
-            self.graph.insert(id.clone(), (deduped, tree));
-            made.insert(current.clone(), id.clone());
-            self.taken
-                .entry(name.to_owned())
-                .or_default()
-                .replayed
-                .entry((mount.to_owned(), current))
-                .or_default()
-                .push((position, commit.id.clone(), id));
+            if moved {
+                return Ok(Some(tip.clone()));
+            }
         }
-        represented(self, tip, &made).ok_or_else(|| missing(tip))
+        Ok(None)
     }
+
+    /// Whether a merge's parents differ in the pin of a child not expanded
+    /// here.
+    fn joins_withheld(
+        &mut self,
+        all_pins: &BTreeMap<String, String>,
+        mounts: &BTreeMap<String, String>,
+        parent_commits: &[Commit],
+    ) -> Result<bool> {
+        let mut sides = Vec::with_capacity(parent_commits.len());
+        for parent in parent_commits {
+            sides.push(pins_in(&mut self.objects, &parent.tree)?);
+        }
+        Ok(all_pins
+            .keys()
+            .filter(|child| !mounts.contains_key(*child))
+            .any(|child| {
+                sides
+                    .iter()
+                    .any(|pins| pins.get(child) != sides[0].get(child))
+            }))
+    }
+
+    /// The tracker commit among `parents` whose view has `tree` and is ahead
+    /// of every other parent's, if there is one: a merge adding nothing to it.
+    fn empty_merge(&mut self, parents: &[String], tree: &str) -> Result<Option<String>> {
+        self.objects.flush()?;
+        for candidate in parents {
+            let view = self.views[candidate].clone();
+            if view.tree != tree {
+                continue;
+            }
+            let mut ahead = true;
+            for other in parents {
+                let other = &self.views[other].id;
+                ahead &= other == &view.id || is_ancestor(self.objects.repo(), other, &view.id)?;
+            }
+            if ahead {
+                return Ok(Some(candidate.clone()));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Whether commit `ancestor` is behind commit `descendant`.
+fn is_ancestor(repo: &Utf8Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    Ok(Command::new("git")
+        .arg("-C")
+        .arg(repo.as_str())
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .map_err(|source| NewgitError::io(repo, source))?
+        .status
+        .success())
 }
 
 /// The view tree of `commit` (a tracker commit) for a reader of everything
@@ -957,6 +849,132 @@ pub fn read_root(repo: &Utf8Path, view: &str) -> Result<Option<(String, String)>
 }
 
 // ── Split ────────────────────────────────────────────────────────────────
+
+/// Every definition in view tree `tree` of a project rooted at `root`: what
+/// decides who owns a path.
+pub fn view_definitions(repo: &Utf8Path, root: &str, tree: &str) -> Result<Vec<TrackerDefinition>> {
+    let bound = |_: &str| true;
+    let audience = |_: &str| None;
+    let options = SplitOptions {
+        root,
+        bound: &bound,
+        audience: &audience,
+        newgit_made: None,
+    };
+    Splitter::new(Objects::open(repo)?, &options).flattened(tree, Utf8Path::new("."))
+}
+
+/// Bring commits of an export target that did not come from here into this
+/// project's view: `walk`, oldest first, is what the target has that this
+/// project does not, and `known` says which view commit a commit that came
+/// from here stands for. Each comes back as a view commit on those parents,
+/// with the files of every `withheld` tracker put back as its parents have
+/// them, and a note naming the original, so a split records it and composing
+/// for the target gives that very commit back. Parents that differ there
+/// give the one ahead: a merge of work already here must not undo it. Two
+/// that diverged cannot be told apart, and are refused.
+///
+/// A commit touching a withheld tracker's mount, or sharing no history with
+/// the project, is refused: the mirror holds nothing of a withheld tracker,
+/// so there is no telling what it meant.
+pub fn bring_in(
+    repo: &Utf8Path,
+    target: &str,
+    walk: &[String],
+    withheld: &[TrackerDefinition],
+    known: &mut dyn FnMut(&str) -> Result<Option<String>>,
+) -> Result<BTreeMap<String, String>> {
+    let mut objects = Objects::open(repo)?;
+    let mut mapped: BTreeMap<String, String> = BTreeMap::new();
+    let mut rebuilt: Vec<(String, String)> = Vec::new();
+    for id in walk {
+        if let Some(ours) = known(id)? {
+            mapped.insert(id.clone(), ours);
+            continue;
+        }
+        let commit = objects.commit(id)?;
+        if commit.parents.is_empty() {
+            return Err(NewgitError::Unsupported(format!(
+                "commit {} on `{target}` shares no history with the project, so it cannot be \
+                 brought in as work",
+                short(id),
+            )));
+        }
+        let mut parents = Vec::new();
+        for parent in &commit.parents {
+            let ours = match mapped.get(parent) {
+                Some(ours) => ours.clone(),
+                None => known(parent)?.unwrap_or_else(|| parent.clone()),
+            };
+            if !parents.contains(&ours) {
+                parents.push(ours);
+            }
+        }
+        let mut tree = commit.tree.clone();
+        for definition in withheld {
+            let mount = definition.mount.as_str();
+            if mount == "." {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{target}` withholds `{}`, which is mounted at `.`, so its files cannot be \
+                     put back into the commits that come from there",
+                    definition.name
+                )));
+            }
+            if objects.subtree(&commit.tree, mount)?.is_some()
+                || objects.entry_at(&commit.tree, mount)?.is_some()
+            {
+                return Err(NewgitError::SplitRefused(format!(
+                    "commit {} on `{target}` changes `{mount}`, which belongs to `{}`, a tracker \
+                     that target does not ship, so nothing was pulled",
+                    short(id),
+                    definition.name
+                )));
+            }
+            let mut ahead = parents[0].clone();
+            let ahead_tree = objects.commit(&ahead)?.tree;
+            let mut there = objects.subtree(&ahead_tree, mount)?;
+            for other in &parents[1..] {
+                let other_tree = objects.commit(other)?.tree;
+                let other_there = objects.subtree(&other_tree, mount)?;
+                if other_there == there {
+                    continue;
+                }
+                objects.flush()?;
+                if is_ancestor(repo, &ahead, other)? {
+                    ahead = other.clone();
+                    there = other_there;
+                } else if !is_ancestor(repo, other, &ahead)? {
+                    return Err(NewgitError::SplitRefused(format!(
+                        "commit {} on `{target}` merges two lines of `{}`, which that target \
+                         does not ship, so nothing was pulled: `newgit merge` the work there",
+                        short(id),
+                        definition.name
+                    )));
+                }
+            }
+            let there = there.map(|tree| (TREE_MODE.to_vec(), tree));
+            tree = objects.set_path(&tree, mount, there)?;
+        }
+        let made = if tree == commit.tree && parents == commit.parents {
+            id.clone()
+        } else {
+            let made = objects.make_commit(
+                &tree,
+                &parents,
+                &commit.author,
+                &commit.committer,
+                &Commit::unsigned_headers(&commit.headers),
+                &commit.message,
+            );
+            rebuilt.push((made.clone(), format!("canonical {id}\n")));
+            made
+        };
+        mapped.insert(id.clone(), made);
+    }
+    objects.flush()?;
+    write_notes(repo, CANONICAL_NOTES_REF, "canonical", &rebuilt)?;
+    Ok(mapped)
+}
 
 /// Why a change cannot be split. Each names what to do instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1114,6 +1132,8 @@ struct Splitter<'a> {
     root_history: Option<HashSet<String>>,
     by_trailer: Option<HashMap<String, String>>,
     view_trees: HashMap<String, String>,
+    /// View commit → the blob of its canonical note; read once.
+    canonical: Option<HashMap<String, String>>,
     made: Vec<(String, String)>,
     noted: Vec<(String, String)>,
     sign: HashMap<Vec<u8>, bool>,
@@ -1134,19 +1154,7 @@ pub fn split(
     tip: &str,
     options: &SplitOptions<'_>,
 ) -> std::result::Result<SplitOutcome, SplitError> {
-    let mut splitter = Splitter {
-        objects: Objects::open(repo)?,
-        options,
-        mapped: HashMap::new(),
-        notes: HashMap::new(),
-        notes_loaded: false,
-        root_history: None,
-        by_trailer: None,
-        view_trees: HashMap::new(),
-        made: Vec::new(),
-        noted: Vec::new(),
-        sign: HashMap::new(),
-    };
+    let mut splitter = Splitter::new(Objects::open(repo)?, options);
     // What is not split yet, oldest first: every parent, not only the first.
     let mut order: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -1188,7 +1196,56 @@ pub fn split(
     })
 }
 
-impl Splitter<'_> {
+impl<'a> Splitter<'a> {
+    fn new(objects: Objects, options: &'a SplitOptions<'a>) -> Self {
+        Splitter {
+            objects,
+            options,
+            mapped: HashMap::new(),
+            notes: HashMap::new(),
+            notes_loaded: false,
+            root_history: None,
+            by_trailer: None,
+            view_trees: HashMap::new(),
+            canonical: None,
+            made: Vec::new(),
+            noted: Vec::new(),
+            sign: HashMap::new(),
+        }
+    }
+
+    /// The commit a view commit's trailers should name, and its headers:
+    /// itself, or for a view commit rebuilt from another commit ([`bring_in`]
+    /// notes it) that original, so composing the same trackers gives the
+    /// original back, signature included.
+    fn origin(&mut self, commit: &Commit) -> Result<(String, Vec<u8>)> {
+        if self.canonical.is_none() {
+            let repo = self.objects.repo().to_path_buf();
+            let listing =
+                git(&repo, &["notes", "--ref", CANONICAL_NOTES_REF, "list"]).unwrap_or_default();
+            self.canonical = Some(
+                listing
+                    .lines()
+                    .filter_map(|line| line.split_once(' '))
+                    .map(|(blob, view)| (view.to_owned(), blob.to_owned()))
+                    .collect(),
+            );
+        }
+        let note = self
+            .canonical
+            .as_ref()
+            .and_then(|notes| notes.get(&commit.id));
+        if let Some(blob) = note.cloned() {
+            let text = read_blob_text(&mut self.objects, &blob)?;
+            if let Some(original) = text.trim().strip_prefix("canonical ")
+                && let Some(found) = self.objects.try_commit(original)?
+            {
+                return Ok((found.id, found.headers));
+            }
+        }
+        Ok((commit.id.clone(), commit.headers.clone()))
+    }
+
     /// The root commit view commit `view` already stands for: by its note,
     /// by being the root's own history (a project's history before any pin,
     /// which is its own view), or by a root commit naming it.
@@ -1348,8 +1405,9 @@ impl Splitter<'_> {
                 }));
             }
         }
+        let (source, headers) = self.origin(&commit)?;
         let message = if on_root {
-            with_split_trailers(&commit.message, view, &commit.headers)
+            with_split_trailers(&commit.message, &source, &headers)
         } else {
             let names: Vec<&str> = made_here
                 .iter()
@@ -1359,8 +1417,8 @@ impl Splitter<'_> {
                 .collect();
             with_split_trailers(
                 format!("Update {}\n", names.join(", ")).as_bytes(),
-                view,
-                &commit.headers,
+                &source,
+                &headers,
             )
         };
         let made = self.make(&tree, &parents, &commit, &message)?;

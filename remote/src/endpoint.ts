@@ -11,12 +11,26 @@
 // (docs/design/remote.md, *Measurements*). The runtime's inactivity timeout
 // is the backstop, in case the alarm never runs.
 //
+// A view needs root's history and each commit it pins, so a fetch waits only
+// for those, in this request (docs/design/remote.md, *Fetching what a view
+// needs*). Where root itself is the large history it waits for all of it.
+// `info/refs` starts its response first, since a request with none started is
+// cut off at five minutes.
+//
 // A merge's checks (`newgit endpoint-ancestry`, `newgit endpoint-index`) run
 // in the background: the first time a large history is here (t3code, 365
 // MiB) fetching it takes many minutes, longer than any one request should
 // wait. The first request starts the check and is answered 202; the merge's
 // client asks again every few seconds, each request also keeping this object
 // alive, and the one after the check ends gets its answer (`BackgroundChecks`).
+//
+// An instance's fork of a tracker in Git is made the same way (`newgit
+// endpoint-copy`): the Worker creates an empty repo, and this copies every
+// branch of the tracker's repo into it, in the background. Artifacts' own
+// fork never finished on t3code; a stepped fetch and a stepped push do.
+//
+// A GitHub webhook's pull (`newgit endpoint-pull`, src/webhook.ts) runs the
+// same way, with `ProjectDO`'s alarm doing the asking again.
 //
 // A snapshot is the whole container, the `newgit` binary included, and the
 // views it composed. So a snapshot, or a running container, from an image
@@ -51,6 +65,55 @@ export interface IndexPlan {
 	list: Record<string, string>;
 }
 
+/**
+ * `newgit endpoint-copy`'s input: copy every branch of `from` (a tracker's
+ * repo, read) into `to` (an instance's fork, write).
+ */
+export interface CopyPlan {
+	dir: string;
+	from: { url: string; auth: string };
+	to: { url: string; auth: string };
+}
+
+/** Every branch the copy made, at its commit. */
+export interface CopyAnswer {
+	branches: Record<string, string>;
+}
+
+export type BackgroundKind = "ancestry" | "index" | "copy" | "pull";
+
+/**
+ * `newgit endpoint-pull`'s input: bring `mirror.commit` into `main`, whose
+ * index is `list`. `repos` carry a write password for `writable`, a read
+ * password for the rest.
+ */
+export interface PullPlan {
+	dir: string;
+	repos: Record<string, { url: string; auth: string }>;
+	list: Record<string, string>;
+	writable: string[];
+	target: string;
+	mirror: { url: string; branch: string; commit: string };
+	/** Instances whose work in a withheld tracker may be behind this commit. */
+	instances: MirrorInstance[];
+	/** Only say whether there is anything to land: no lock, and nothing moves. */
+	peek?: boolean;
+}
+
+/** An instance, and what it holds of each withheld tracker it forked. */
+export interface MirrorInstance {
+	name: string;
+	pins: Record<string, string>;
+}
+
+/** How a pull ended. A refusal is an answer: running it again refuses again. */
+export type PullAnswer =
+	| { outcome: "nothing" }
+	| { outcome: "work" }
+	| { outcome: "moved"; why: string }
+	| { outcome: "landed"; list: Record<string, string>; commits: number }
+	| { outcome: "refused"; why: string };
+
 export interface IndexAnswer {
 	matches: boolean;
 	actual: Record<string, string>;
@@ -77,6 +140,13 @@ export const CHECK_RESULT_MS = 5 * 60_000;
  */
 export const CHECK_LIMIT_MS = 45 * 60_000;
 
+/**
+ * A copy running longer than this counts as failed. A copy is a check's
+ * fetch and then a push of the same history in 64 MiB steps, so it may run
+ * well past one; asked again, it carries on from what got there.
+ */
+export const COPY_LIMIT_MS = 2 * 60 * 60_000;
+
 /** The body of every answer to a check that is still running. */
 export const CHECKING = { checking: true } as const;
 
@@ -85,6 +155,7 @@ export type CheckOutcome = { ok: true; json: string } | { ok: false; why: string
 
 interface CheckEntry {
 	startedAt: number;
+	limitMs: number;
 	outcome?: CheckOutcome;
 	finishedAt?: number;
 	run?: Promise<void>;
@@ -115,10 +186,10 @@ export class BackgroundChecks {
 	}
 
 	/** Start check `key`, unless it already is; resolves when it ends. */
-	start(key: string, run: () => Promise<CheckOutcome>): Promise<void> {
+	start(key: string, run: () => Promise<CheckOutcome>, limitMs = CHECK_LIMIT_MS): Promise<void> {
 		const known = this.entries.get(key);
 		if (known?.run) return known.run;
-		const entry: CheckEntry = { startedAt: this.now() };
+		const entry: CheckEntry = { startedAt: this.now(), limitMs };
 		this.entries.set(key, entry);
 		entry.run = run()
 			.catch((error: unknown): CheckOutcome => ({
@@ -146,10 +217,10 @@ export class BackgroundChecks {
 		for (const [key, entry] of this.entries) {
 			if (entry.outcome) {
 				if (now - (entry.finishedAt ?? now) > CHECK_RESULT_MS) this.entries.delete(key);
-			} else if (now - entry.startedAt > CHECK_LIMIT_MS) {
+			} else if (now - entry.startedAt > entry.limitMs) {
 				entry.outcome = {
 					ok: false,
-					why: `the check ran longer than ${CHECK_LIMIT_MS / 60_000} minutes; merge again to start it over`,
+					why: `it ran longer than ${entry.limitMs / 60_000} minutes; ask again to start it over`,
 				};
 				entry.finishedAt = now;
 			}
@@ -171,6 +242,28 @@ export async function checkKey(
 	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
 	return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
+
+/**
+ * The key of a copy: the fork it fills. One copy into a fork at a time,
+ * whatever credentials each request carries.
+ */
+export function copyKey(plan: { to: { url: string } }): string {
+	return `copy ${plan.to.url}`;
+}
+
+/** The key of a pull: what it brings in, on top of what. */
+export function pullKey(plan: Pick<PullPlan, "list" | "mirror" | "peek">): string {
+	return `pull${plan.peek ? " peek" : ""} ${plan.mirror.url} ${plan.mirror.commit} ${plan.list.root}`;
+}
+
+/**
+ * 4 GiB, half a vCPU, 8 GB of disk, for a store holding a large tracker. It
+ * goes on every start, a restore included, since a Durable Object-managed
+ * container takes its size here and wrangler.jsonc refuses `instance_type`.
+ */
+const ENDPOINT_INSTANCE = "standard-1";
+
+const COULD_NOT_COMPOSE = "newgit could not compose this view; the remote logged why";
 
 /** Snapshot at most this often, after a compose changed what is on disk. */
 const SNAPSHOT_EVERY_MS = 10 * 60_000;
@@ -336,14 +429,15 @@ export class GitEndpoint extends DurableObject<Env> {
 				container.start({
 					containerSnapshot: { id: snapshot },
 					enableInternet: true,
+					instance: ENDPOINT_INSTANCE,
 				});
 			} catch {
 				await storage.delete(["snapshot", "snapshot_image"]);
-				container.start({ image, enableInternet: true });
+				container.start({ image, enableInternet: true, instance: ENDPOINT_INSTANCE });
 			}
 		} else {
 			await storage.delete(["snapshot", "snapshot_image"]);
-			container.start({ image, enableInternet: true });
+			container.start({ image, enableInternet: true, instance: ENDPOINT_INSTANCE });
 		}
 		const deadline = Date.now() + 60_000;
 		for (;;) {
@@ -422,14 +516,16 @@ export class GitEndpoint extends DurableObject<Env> {
 	}
 
 	/**
-	 * A merge check, in the background: started by the first request with
+	 * A merge check or a fork's copy, in the background: started by the first request with
 	 * its plan, answered 202 while it runs, and its answer handed to the
 	 * first request after it ends. A `peek` carries no credentials: it only
 	 * asks after a check already known, and is answered 404 when there is
-	 * none, so the Worker mints read passwords only for a check it starts.
+	 * none, so the Worker mints passwords only for a check it starts.
 	 */
-	private async check(kind: "ancestry" | "index", plan: string, peek: boolean): Promise<Response> {
-		const key = await checkKey(kind, JSON.parse(plan));
+	private async check(kind: BackgroundKind, plan: string, peek: boolean): Promise<Response> {
+		const parsed = JSON.parse(plan);
+		const key =
+			kind === "copy" ? copyKey(parsed) : kind === "pull" ? pullKey(parsed) : await checkKey(kind, parsed);
 		const known = this.checks.collect(key);
 		if (known === "running") return Response.json(CHECKING, { status: 202 });
 		if (known?.ok)
@@ -442,11 +538,13 @@ export class GitEndpoint extends DurableObject<Env> {
 		if (peek) return new Response("no such check\n", { status: 404 });
 		// Held by `checks` and by `waitUntil`: the object stays up while the
 		// merger's polls keep arriving, and the promise is what they collect.
-		this.ctx.waitUntil(this.checks.start(key, () => this.runCheck(kind, plan)));
+		this.ctx.waitUntil(
+			this.checks.start(key, () => this.runCheck(kind, plan), kind === "copy" ? COPY_LIMIT_MS : CHECK_LIMIT_MS),
+		);
 		return Response.json(CHECKING, { status: 202 });
 	}
 
-	private async runCheck(kind: "ancestry" | "index", plan: string): Promise<CheckOutcome> {
+	private async runCheck(kind: BackgroundKind, plan: string): Promise<CheckOutcome> {
 		const container = await this.ensureRunning();
 		const check = await container.exec(["newgit", `endpoint-${kind}`], {
 			stdin: new Response(plan).body!,
@@ -471,50 +569,19 @@ export class GitEndpoint extends DurableObject<Env> {
 
 	private async serve(request: Request): Promise<Response> {
 		const url = new URL(request.url);
-		const kind = url.pathname.slice(1) as EndpointKind | "ancestry" | "index";
+		const kind = url.pathname.slice(1) as EndpointKind | BackgroundKind;
 		const encoded = request.headers.get(PLAN_HEADER);
 		if (!encoded) return new Response("no plan\n", { status: 400 });
 		const plan = atob(encoded);
-		if (kind === "ancestry" || kind === "index") return this.check(kind, plan, url.searchParams.has("peek"));
-		const container = await this.ensureRunning();
-
-		const compose = await container.exec(["newgit", "endpoint-compose"], {
-			stdin: new Response(plan).body!,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const composed = await compose.output();
-		if (composed.exitCode !== 0) {
-			const why = new TextDecoder().decode(composed.stderr).trim();
-			console.error("endpoint-compose failed", why);
-			return new Response("newgit could not compose this view; the remote logged why\n", { status: 502 });
-		}
-		const view = new TextDecoder().decode(composed.stdout).trim();
-		await this.ctx.storage.put("composed_at", Date.now());
-		await this.snapshotSoon();
-
+		if (kind === "ancestry" || kind === "index" || kind === "copy" || kind === "pull")
+			return this.check(kind, plan, url.searchParams.has("peek"));
 		const protocol = request.headers.get("git-protocol");
 		const env: Record<string, string> = protocol ? { GIT_PROTOCOL: protocol } : {};
-		if (kind === "advertise") {
-			const process = await container.exec(["git", "upload-pack", "--stateless-rpc", "--advertise-refs", view], {
-				env,
-				stdout: "pipe",
-				stderr: "ignore",
-			});
-			const { stdout } = await process.output();
-			// Protocol v2 answers with its capability advertisement directly;
-			// v0 needs the service preamble first.
-			const body =
-				protocol && protocol.includes("version=2")
-					? new Uint8Array(stdout)
-					: concat(pkt("# service=git-upload-pack\n"), new TextEncoder().encode("0000"), new Uint8Array(stdout));
-			return new Response(body, {
-				headers: {
-					"content-type": "application/x-git-upload-pack-advertisement",
-					"cache-control": "no-cache",
-				},
-			});
-		}
+		if (kind === "advertise") return this.advertise(plan, protocol, env);
+
+		const container = await this.ensureRunning();
+		const view = await this.compose(container, plan);
+		if (view === undefined) return new Response(`${COULD_NOT_COMPOSE}\n`, { status: 502 });
 
 		let input = request.body ?? new ReadableStream();
 		if (request.headers.get("content-encoding") === "gzip") input = input.pipeThrough(new DecompressionStream("gzip"));
@@ -527,6 +594,70 @@ export class GitEndpoint extends DurableObject<Env> {
 		return new Response(process.stdout, {
 			headers: {
 				"content-type": "application/x-git-upload-pack-result",
+				"cache-control": "no-cache",
+			},
+		});
+	}
+
+	/** Compose `plan` and return the view's path, or nothing when it failed, which is logged. */
+	private async compose(container: Container, plan: string): Promise<string | undefined> {
+		const compose = await container.exec(["newgit", "endpoint-compose"], {
+			stdin: new Response(plan).body!,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const composed = await compose.output();
+		if (composed.exitCode !== 0) {
+			console.error("endpoint-compose failed", new TextDecoder().decode(composed.stderr).trim());
+			return undefined;
+		}
+		const view = new TextDecoder().decode(composed.stdout).trim();
+		await this.ctx.storage.put("composed_at", Date.now());
+		await this.snapshotSoon();
+		return view;
+	}
+
+	/**
+	 * Answer `info/refs`, the request a first fetch waits on while the view is
+	 * composed: minutes, the first time after a deploy. A request with no
+	 * response started is cut off at five minutes (`Network connection lost`),
+	 * so the headers go now and the body when the view is ready. The status is
+	 * spent by then, so a failure is an `ERR` line, which Git prints as a
+	 * `remote error`.
+	 */
+	private advertise(plan: string, protocol: string | null, env: Record<string, string>): Response {
+		const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+		const writer = writable.getWriter();
+		const answer = async (): Promise<Uint8Array> => {
+			const container = await this.ensureRunning();
+			const view = await this.compose(container, plan);
+			if (view === undefined) return pkt(`ERR ${COULD_NOT_COMPOSE}\n`);
+			const process = await container.exec(["git", "upload-pack", "--stateless-rpc", "--advertise-refs", view], {
+				env,
+				stdout: "pipe",
+				stderr: "ignore",
+			});
+			const { stdout } = await process.output();
+			// Protocol v2 answers with its capability advertisement directly;
+			// v0 needs the service preamble first.
+			return protocol && protocol.includes("version=2")
+				? new Uint8Array(stdout)
+				: concat(pkt("# service=git-upload-pack\n"), new TextEncoder().encode("0000"), new Uint8Array(stdout));
+		};
+		this.ctx.waitUntil(
+			answer()
+				.catch((error: unknown) => {
+					console.error("endpoint advertise failed", error);
+					return pkt(`ERR ${COULD_NOT_COMPOSE}\n`);
+				})
+				.then((body) => writer.write(body))
+				.then(() => writer.close())
+				// The client left: compose has kept what it fetched for next time.
+				.catch(() => {}),
+		);
+		return new Response(readable, {
+			headers: {
+				"content-type": "application/x-git-upload-pack-advertisement",
 				"cache-control": "no-cache",
 			},
 		});

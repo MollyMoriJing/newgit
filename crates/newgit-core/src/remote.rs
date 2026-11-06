@@ -345,7 +345,7 @@ impl HttpRemote {
     ) -> Result<T> {
         let reply = self.request_with(method, path, body)?;
         if !(200..300).contains(&reply.status) {
-            return Err(remote_error(reply.status, &reply.text));
+            return Err(remote_error_on(method, path, reply.status, &reply.text));
         }
         parse(&reply.text, reply.status)
     }
@@ -361,6 +361,25 @@ impl HttpRemote {
         method: &str,
         path: &str,
         body: serde_json::Value,
+    ) -> Result<T> {
+        self.send_waiting(
+            method,
+            path,
+            body,
+            "checking the merge",
+            "a first look at a large tracker takes several minutes",
+        )
+    }
+
+    /// [`Self::send_checked`] for anything the remote answers `202` while it
+    /// works: asked again until it is done, saying `doing` once a minute.
+    fn send_waiting<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        path: &str,
+        body: serde_json::Value,
+        doing: &str,
+        why: &str,
     ) -> Result<T> {
         let started = std::time::Instant::now();
         let mut checking = false;
@@ -384,7 +403,7 @@ impl HttpRemote {
             unreachable = 0;
             if reply.status != 202 {
                 if !(200..300).contains(&reply.status) {
-                    return Err(remote_error(reply.status, &reply.text));
+                    return Err(remote_error_on(method, path, reply.status, &reply.text));
                 }
                 return parse(&reply.text, reply.status);
             }
@@ -394,7 +413,7 @@ impl HttpRemote {
                 return Err(NewgitError::Remote {
                     status: reply.status,
                     message: format!(
-                        "{} was still checking the merge after {} minutes; the check carries on there, so running the merge again picks it up",
+                        "{} was still {doing} after {} minutes; it carries on there, so running this again picks it up",
                         self.host(),
                         CHECK_LIMIT.as_secs() / 60
                     ),
@@ -403,10 +422,7 @@ impl HttpRemote {
             let minutes = elapsed.as_secs() / 60;
             if minutes > said_minutes {
                 said_minutes = minutes;
-                eprintln!(
-                    "{} is still checking the merge ({minutes} min); a first look at a large tracker takes several minutes",
-                    self.host()
-                );
+                eprintln!("{} is still {doing} ({minutes} min); {why}", self.host());
             }
             let wait = reply
                 .retry_after
@@ -494,6 +510,18 @@ fn parse<T: DeserializeOwned>(text: &str, status: u16) -> Result<T> {
             text.chars().take(200).collect::<String>()
         ),
     })
+}
+
+/// [`remote_error`], naming the call when the remote failed on its side: a
+/// 5xx says nothing about which of a command's requests it was.
+fn remote_error_on(method: &str, path: &str, status: u16, text: &str) -> NewgitError {
+    match remote_error(status, text) {
+        NewgitError::Remote { status, message } if status >= 500 => NewgitError::Remote {
+            status,
+            message: format!("{message} (on {method} {path})"),
+        },
+        error => error,
+    }
 }
 
 fn remote_error(status: u16, text: &str) -> NewgitError {
@@ -624,7 +652,10 @@ impl Remote for HttpRemote {
     }
 
     fn fork(&self, project: &str, instance: &str, tracker: &str) -> Result<RepoLocation> {
-        self.send(
+        // The remote copies the tracker's repository into the fork in the
+        // background (t3code's 365 MiB takes many minutes); it answers 202
+        // until the copy is done.
+        self.send_waiting(
             "POST",
             &format!(
                 "/v1/projects/{}/instances/{}/trackers/{}/fork",
@@ -632,7 +663,9 @@ impl Remote for HttpRemote {
                 segment(instance),
                 segment(tracker)
             ),
-            None,
+            serde_json::json!({}),
+            &format!("forking `{tracker}` for `{instance}`"),
+            "the remote copies a tracker's repository the first time an instance changes it",
         )
     }
 

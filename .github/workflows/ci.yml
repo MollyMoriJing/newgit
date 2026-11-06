@@ -25,10 +25,16 @@ jobs:
     # ports, so its tests are integration tests by nature. They have to run
     # on both platforms it claims to support — a unit-test-only CI would
     # prove almost nothing about this codebase.
+    #
+    # macOS runs on main, not on pull requests. The suite is thousands of git
+    # spawns, and GitHub's 3-vCPU macOS runners take ~12 minutes on it, CPU
+    # bound, against ~3 on Ubuntu. A macOS-only break is rare and shows up on
+    # the next main run; to check a branch on macOS before merging, run this
+    # workflow by hand on it (workflow_dispatch runs both).
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -39,6 +45,9 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
 
       - name: Check changelog fragments
         # A misnamed fragment is not picked up by the release script's
@@ -55,6 +64,12 @@ jobs:
           git config --global user.name "newgit ci"
           git config --global user.email "ci@newgit.invalid"
           git config --global init.defaultBranch main
+          # The suite runs thousands of git commands, and git follows fetches
+          # and commits with its own background maintenance. That is pure
+          # overhead in throwaway repos and slows macOS most of all, where
+          # starting a process is expensive.
+          git config --global maintenance.auto false
+          git config --global gc.auto 0
           git --version
 
       - name: Format
@@ -64,7 +79,12 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace --all-targets
+        # nextest, not `cargo test`: `cargo test` runs the ~110 test binaries
+        # one after another, and most hold only a few tests that spend their
+        # time waiting on git, so the runner's cores sit idle. nextest runs
+        # tests from every binary at once, which matters most on macOS,
+        # where every git spawn is slow.
+        run: cargo nextest run --workspace --all-targets --no-fail-fast
 
       - name: Release build
         run: cargo build --release --locked
