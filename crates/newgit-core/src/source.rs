@@ -1498,6 +1498,94 @@ impl GitSource {
             }
         }
     }
+
+    /// Fetch exactly `commits` from `url`, each one commit deep, each to
+    /// `<prefix><commit>`, and return those the remote refused.
+    ///
+    /// The store this fetches into stays shallow on purpose, so it must
+    /// never see [`Self::fetch_refs`], which takes a shallow store for a
+    /// stepped fetch that stopped part way and deepens it to the end.
+    ///
+    /// `--depth` also makes Git ask the remote even for a commit the store
+    /// holds already, where a plain fetch would see the object and ask
+    /// nothing. So a ref under `prefix` proves `url` has the commit, however
+    /// many other repos' commits share the store.
+    ///
+    /// A refusal does not prove the repo lacks a commit: a remote may hold it
+    /// and only serve what a branch names. Only a whole fetch can tell.
+    ///
+    /// They come in one fetch, so what the commits share comes once. A
+    /// fetch the remote dropped or refused is halved, down to one commit,
+    /// which is what finds the commit it refused. Anything else (a password
+    /// it will not take, a repo that is not there) is the same for every
+    /// commit, so it is returned at once.
+    pub fn fetch_snapshots(
+        location: &[&str],
+        url: &str,
+        prefix: &str,
+        commits: &[String],
+        auth: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let mut absent = Vec::new();
+        for batch in commits.chunks(SNAPSHOT_BATCH) {
+            Self::fetch_snapshot_batch(location, url, prefix, batch, auth, &mut absent)?;
+        }
+        Ok(absent)
+    }
+
+    fn fetch_snapshot_batch(
+        location: &[&str],
+        url: &str,
+        prefix: &str,
+        commits: &[String],
+        auth: Option<&str>,
+        absent: &mut Vec<String>,
+    ) -> Result<()> {
+        let refspecs: Vec<String> = commits
+            .iter()
+            .map(|commit| format!("+{commit}:{prefix}{commit}"))
+            .collect();
+        let fetch = || {
+            let mut args: Vec<&str> = location.to_vec();
+            args.extend([
+                "fetch",
+                "--quiet",
+                "--no-write-fetch-head",
+                "--no-tags",
+                "--depth=1",
+                "--",
+                url,
+            ]);
+            args.extend(refspecs.iter().map(String::as_str));
+            run_git_env(&args, &auth_env(auth)).map(|_| ())
+        };
+        if let [commit] = commits {
+            let mut tries = WHOLE_FETCH_BACKOFF.iter();
+            loop {
+                match fetch() {
+                    Ok(()) => return Ok(()),
+                    Err(error) if not_there(&error) => {
+                        absent.push(commit.clone());
+                        return Ok(());
+                    }
+                    Err(error) if dropped(&error) => match tries.next() {
+                        Some(wait) => std::thread::sleep(*wait),
+                        None => return Err(error),
+                    },
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        match fetch() {
+            Ok(()) => Ok(()),
+            Err(error) if dropped(&error) || not_there(&error) => {
+                let (left, right) = commits.split_at(commits.len() / 2);
+                Self::fetch_snapshot_batch(location, url, prefix, left, auth, absent)?;
+                Self::fetch_snapshot_batch(location, url, prefix, right, auth, absent)
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 /// Git config for one command, carrying an `Authorization` header. Passed in
@@ -1570,6 +1658,9 @@ const WHOLE_FETCH_BACKOFF: [std::time::Duration; 2] = [
 /// The commits a stepped fetch asks for first, and deepens by.
 const FIRST_BAND: u32 = 2048;
 
+/// The most commits one snapshot fetch asks for: what fits a command line.
+const SNAPSHOT_BATCH: usize = 256;
+
 /// Where a push too big for the remote is staged step by step, deleted
 /// once the real push lands.
 const STAGING_REF: &str = "refs/heads/newgit-staging";
@@ -1595,6 +1686,22 @@ fn dropped(error: &NewgitError) -> bool {
         "expected 'packfile'",
         "early EOF",
         "bad pack header",
+    ]
+    .iter()
+    .any(|sign| stderr.contains(sign))
+}
+
+/// Whether the remote refused to serve a commit by id: it has none, or will
+/// not say. Anything else is a failure, not an answer: a pin left out of a
+/// view stays out of it for as long as the view is cached.
+fn not_there(error: &NewgitError) -> bool {
+    let NewgitError::SourceCommand { stderr, .. } = error else {
+        return false;
+    };
+    [
+        "not our ref",
+        "couldn't find remote ref",
+        "unadvertised object",
     ]
     .iter()
     .any(|sign| stderr.contains(sign))
