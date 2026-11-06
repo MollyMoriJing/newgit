@@ -293,6 +293,74 @@ tracker store's refs do.
 **Trackers outside Git may have a `mount`** but are never pinned. Their state
 stays in the instance's binding record and in checkpoints.
 
+### Snapshots
+
+A view needs a child's files at each commit root pins, never the child's
+history, so `newgit clone` fetches root's whole history and each commit it
+pins `--depth=1`, by id. `--full` fetches every history up front instead,
+for someone who knows they will work in a child.
+
+- **The project repo is the shallow store.** It is where composing and
+  splitting run, and it has to be able to push, so it holds a real `shallow`
+  file: Git then treats a pin as a commit with no parents everywhere, `gc`
+  and `fsck` included. `refs/newgit/snapshots/<tracker>/<commit>` keeps each
+  pin alive and says whose it is. This differs from the remote's
+  `compose.git` + `snapshots.git` ([remote.md](remote.md), *Fetching what a
+  view needs*) for a reason: `compose.git` reads through an alternate and
+  never fetches, and the project repo fetches all the time. A store that
+  fetches must not have a shallow alternate.
+- **`trackers.git` is never shallow**, so a tracker held as snapshots has no
+  refs there until its history arrives. A workspace is a clone of view
+  commits, none of which reach a child commit, so it is whole. A project
+  with a `shallow` file is cloned over Git's pack transport rather than by
+  hardlinks, which costs the first spawn a copy of the view.
+- **A tracker is held as snapshots while one of its snapshot refs is in
+  `shallow`.** There is no second record to disagree with Git, and a project
+  that never had snapshots is never shallow, so a full clone and every
+  project cloned before this behave as they always did.
+- **A snapshot does not deepen by accident.** `fetch_refs` carries on
+  deepening a store left shallow by a stepped fetch; it ignores commits
+  under `refs/newgit/snapshots/`, so an ordinary fetch leaves them alone. A
+  fetch into the project stops at a shallow commit, so bringing `main` on top
+  of a pin costs its new commits. Bringing any other branch of a tracker
+  would cost its whole history, so a project holding snapshots fetches only
+  the branches a command asks about.
+- **A commit already here is never fetched `--depth=1`**: root's own history
+  is fetched first, and a commit root shares with a child stays whole. A
+  shallow commit that later lands on root's history would end it, so root's
+  walk checks for one and fetches that tracker's history.
+- **A new pin arrives before it is composed.** Composing leaves out a pin it
+  cannot find, so before composing, `bring_pins` fetches every snapshot root's
+  history lacks.
+
+- **A remote may refuse a push from a shallow repo.** `git push` names every
+  entry in `shallow`. When one that looks refused fails, every tracker held as
+  snapshots gets its history, which empties the file, and the push runs once
+  more, saying so. Pushing from the outbox instead is no way round it: it
+  borrows these objects through alternates without the `shallow` file.
+
+**History arrives in one place, `need_history`.** It fetches the tracker
+whole into `trackers.git`, where a dropped fetch steps and resumes as any
+whole fetch does, and `--unshallow`s the project from there, which deepens
+only what that store knows, so every other tracker stays a snapshot. It says
+`fetching t3code's history from newgit.dev; this happens once`, and it does.
+
+The rule for what calls it: Git's "yes" is right on a snapshot, since a commit
+reachable from another is an ancestor however short the walk. Its "no" means
+nothing. An instance commit under a mount needs only its pin as a parent, so
+split, checkpoint, push, and an ordinary merge fetch no history.
+
+| Asks about history | What happens on a snapshot |
+|---|---|
+| A child's `main` moved past the pin, and the merge has to join them | Asks both ways round; neither → `need_history`, then `git merge-tree` |
+| A split where a view merge joins two lines of a child, with a tree equal to one of them | Asks whether that one descends from the other; "no" → `need_history` |
+| `newgit pull <tracker>` | Fast-forward: no history, `follow` lands on the pin and is counted. Otherwise `need_history`, so a pin is never moved backwards |
+| `newgit pull --remote` from a rooted target, a rooted export, `newgit log <tracker>`, `tracker migrate` | `need_history` first: each walks the history itself |
+| `spawn --from-checkpoint` | A plain fetch from the author's fork stops at the pin, so the checkpoint's commits are whole enough to push on; other pins come from the tracker's repo; no history unless root's walk reaches a snapshot |
+| A tracker's commits judged before a push | Stops at the pin, which is what the remote already holds |
+| Which tracker an instance touched, for where its branch is exported | Asks both ways round; neither → `need_history`. A false "touched" would send the branch to the wrong repo |
+| "Is this tracker behind?" at spawn, an export's "unmerged" | Advisory: a false "no" says less or names a tracker it need not. Decides nothing |
+
 ### Compose
 
 Compose walks one history, the root's. A child is expanded at each commit

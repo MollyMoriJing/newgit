@@ -442,10 +442,16 @@ impl GitSource {
 
     /// Make the outbox's branches and tags exactly what `url` has now.
     pub fn sync_outbox(outbox: &Utf8Path, url: &str, auth: Option<&str>) -> Result<()> {
+        // The outbox borrows the project repo's objects. Git would send that
+        // repo's refs as `have`s, and a snapshot among them is not the
+        // complete history a `have` promises: the remote would leave out
+        // what the outbox lacks.
         run_git_env(
             &[
                 "-C",
                 outbox.as_str(),
+                "-c",
+                "core.alternateRefsCommand=true",
                 "fetch",
                 "--quiet",
                 "--prune",
@@ -1447,11 +1453,10 @@ impl GitSource {
             args.extend(refspecs.iter().map(String::as_str));
             run_git_env(&args, &auth_env(auth)).map(|_| ())
         };
-        let shallow_store = |location: &[&str]| -> Result<bool> {
-            let mut args: Vec<&str> = location.to_vec();
-            args.extend(["rev-parse", "--is-shallow-repository"]);
-            Ok(run_git_env(&args, &[])? == "true")
-        };
+        // Snapshots are shallow on purpose (`crate::snapshots`): deepening
+        // them here is how a snapshot clone would end up fetching every
+        // history on its next ordinary fetch.
+        let left_shallow = crate::snapshots::left_shallow;
         // A whole fetch is by far the fastest way to get a large history
         // (t3code's 365 MiB: five minutes whole, against half an hour in
         // bands), and a dropped one often comes through on a second try. So
@@ -1462,7 +1467,7 @@ impl GitSource {
         let mut tries = WHOLE_FETCH_BACKOFF.iter();
         let mut started = loop {
             match fetch(None) {
-                Ok(()) if !shallow_store(location)? => return Ok(()),
+                Ok(()) if !left_shallow(location)? => return Ok(()),
                 Ok(()) => break true,
                 Err(error) if dropped(&error) => match tries.next() {
                     Some(wait) => std::thread::sleep(*wait),
@@ -1488,7 +1493,7 @@ impl GitSource {
             match fetch(Some(&flag)) {
                 Ok(()) => {
                     started = true;
-                    if !shallow_store(location)? {
+                    if !left_shallow(location)? {
                         return Ok(());
                     }
                     depth = (depth * 2).min(4 * FIRST_BAND);
@@ -1686,6 +1691,29 @@ fn dropped(error: &NewgitError) -> bool {
         "expected 'packfile'",
         "early EOF",
         "bad pack header",
+    ]
+    .iter()
+    .any(|sign| stderr.contains(sign))
+}
+
+/// Whether a push may have failed because it came from a shallow repository:
+/// the remote objecting to its `shallow` lines, in Git's words or as a request
+/// it would not take. A credential or a lease that failed is neither. A 500 is
+/// here because it is what a push that is dropped ends as once smaller pushes
+/// have failed too, and by then there is nothing left to try.
+pub fn refused_shallow(error: &NewgitError) -> bool {
+    let NewgitError::SourceCommand { stderr, .. } = error else {
+        return false;
+    };
+    [
+        "shallow",
+        "protocol error",
+        "bad line length",
+        "HTTP 400",
+        "HTTP 415",
+        "HTTP 422",
+        "HTTP 500",
+        "HTTP 501",
     ]
     .iter()
     .any(|sign| stderr.contains(sign))
