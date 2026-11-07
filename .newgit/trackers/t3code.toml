@@ -4,3 +4,4 @@ merge_with_source = true
 mount = "apps/t3code"
 paths = ["."]
 git = true
+priority = -1
