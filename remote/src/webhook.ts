@@ -28,7 +28,7 @@ import {
 	type TrackerFacts,
 } from "./index";
 import { pausedBy } from "./budget";
-import type { MirrorInstance, PullPlan } from "./endpoint";
+import type { MirrorInstance, PullPlan, WalkedCommit } from "./endpoint";
 import { decide, mayMaintain, type ProjectId, projectKey, repoName } from "./names";
 
 /** Who a pull lands as, in `main`'s log. Not a login: logins have no spaces. */
@@ -76,9 +76,6 @@ export interface MirrorPull {
 	pusher: string;
 	/** The trackers this pull may change: what the pusher maintains. */
 	writable: string[];
-	/** What the event says landed, and the subject of its last commit: which instance it was. */
-	commits: string[];
-	subject?: string;
 	/** The trackers the mirror withholds. */
 	withheld: string[];
 	/** Instances GitHub says this came from that hold withheld work, known once it has said. */
@@ -95,8 +92,8 @@ export interface MirrorPull {
 	lastError?: string;
 	/** After a failure, not tried again before this. */
 	retryAt?: number;
-	/** A look found something to land. */
-	peeked?: boolean;
+	/** What a look found this pull would land beyond `main`; unset until one has. */
+	beyond?: Beyond;
 	/** Read passwords handed out for looks, to cancel when the pull ends. */
 	tokens?: { repo: string; artifactsId: string }[];
 	/** `main`'s index when this pull began to land; unset until then. */
@@ -196,8 +193,54 @@ export const PULL_INDEX_ASK_MS = 30_000;
 const GITHUB_TIMEOUT_MS = 10_000;
 
 /** The branch GitHub's merge commit subject names, if it is one. */
-function mergedBranch(subject: string | undefined): string | undefined {
-	return subject?.match(/^Merge pull request #\d+ from [^/\s]+\/(\S+)/)?.[1];
+function mergedBranch(subject: string): string | undefined {
+	return subject.match(/^Merge pull request #\d+ from [^/\s]+\/(\S+)/)?.[1];
+}
+
+/**
+ * What a pull would land beyond `main`, as far as whose work it is goes: the
+ * branches GitHub's merge commits there name, and the commits no such merge
+ * brought in, which GitHub is asked about. Every one of them, whichever
+ * event's payload it came in (#399): a commit refused once stays on the
+ * mirror, and the next event's pull would otherwise land it unasked. `count`
+ * is how many commits there are to ask about; past `PULLS_ASKED`, only that
+ * many are kept.
+ */
+export interface Beyond {
+	branches: string[];
+	commits: string[];
+	count: number;
+}
+
+/**
+ * `walk`, as a look reports it, reduced to what says whose work it is. A
+ * merge commit whose subject names a branch speaks for itself and for what
+ * it merged: the commits its other parents reach that its first does not.
+ */
+export function beyondMain(walk: WalkedCommit[]): Beyond {
+	const parents = new Map(walk.map((walked) => [walked.commit, walked.parents]));
+	const reach = (from: string[]) => {
+		const seen = new Set<string>();
+		const stack = [...from];
+		for (let commit = stack.pop(); commit !== undefined; commit = stack.pop()) {
+			if (seen.has(commit) || !parents.has(commit)) continue;
+			seen.add(commit);
+			stack.push(...(parents.get(commit) ?? []));
+		}
+		return seen;
+	};
+	const branches = new Set<string>();
+	const accounted = new Set<string>();
+	for (const walked of walk) {
+		const named = mergedBranch(walked.subject);
+		if (named === undefined) continue;
+		branches.add(named);
+		accounted.add(walked.commit);
+		const before = reach(walked.parents.slice(0, 1));
+		for (const merged of reach(walked.parents.slice(1))) if (!before.has(merged)) accounted.add(merged);
+	}
+	const asked = walk.map((walked) => walked.commit).filter((commit) => !accounted.has(commit));
+	return { branches: [...branches], commits: asked.slice(0, PULLS_ASKED + 1), count: asked.length };
 }
 
 /**
@@ -238,9 +281,10 @@ export type Implicated =
 	| { unknown: string; retry: boolean };
 
 /**
- * The instances among `work` whose withheld work this pull's commits hold.
- * A mirror's branch is named for its instance, and a push to `main` does not
- * say which branch it merged, so GitHub's merge subject says, or else GitHub.
+ * The instances among `work` whose withheld work this pull would land: what
+ * it brings in `beyond` `main`. A mirror's branch is named for its instance,
+ * and a push to `main` does not say which branch it merged, so GitHub's merge
+ * subjects say, or else GitHub.
  * Only an instance GitHub names counts: one whose branch is not on GitHub
  * yet, or that merely has a fork, is no part of this. `unlisted` says GitHub
  * listed nothing for some commit, which may be a direct push, or may be
@@ -249,23 +293,23 @@ export type Implicated =
  */
 export async function implicated(
 	deps: Deps,
-	pull: Pick<MirrorPull, "repo" | "commit" | "commits" | "subject">,
+	pull: Pick<MirrorPull, "repo" | "commit">,
+	beyond: Beyond,
 	work: MirrorInstance[],
 ): Promise<Implicated> {
 	if (work.length === 0) return { instances: [], unlisted: false };
-	let branches: string[];
+	if (beyond.count > PULLS_ASKED)
+		return {
+			unknown: `it would land ${beyond.count} commits beyond \`${PULL_BRANCH}\` that no merge commit accounts for, and GitHub is asked about at most ${PULLS_ASKED}`,
+			retry: false,
+		};
+	let branches = beyond.branches;
 	let unlisted = false;
-	const named = mergedBranch(pull.subject);
-	if (named !== undefined) branches = [named];
-	else {
-		const commits = [...new Set([...pull.commits, pull.commit])];
-		if (commits.length > PULLS_ASKED)
-			return {
-				unknown: `the event landed ${commits.length} commits, and GitHub is asked about at most ${PULLS_ASKED}`,
-				retry: false,
-			};
+	if (beyond.commits.length > 0) {
 		try {
-			({ branches, unlisted } = await pullRequestBranches(deps.fetcher, pull.repo, commits));
+			const asked = await pullRequestBranches(deps.fetcher, pull.repo, beyond.commits);
+			branches = [...branches, ...asked.branches];
+			unlisted = asked.unlisted;
 		} catch (error) {
 			const why = error instanceof Error ? error.message : String(error);
 			console.error(JSON.stringify({ webhook: "GitHub could not say which pull request this is", repo: pull.repo, commit: pull.commit, why }));
@@ -309,8 +353,6 @@ export async function githubWebhook(request: Request, env: Env, deps: Deps): Pro
 		deleted?: boolean;
 		repository?: { full_name?: string; private?: boolean };
 		pusher?: { name?: string };
-		head_commit?: { message?: string };
-		commits?: { id?: string }[];
 	};
 	try {
 		payload = JSON.parse(new TextDecoder().decode(raw));
@@ -375,8 +417,6 @@ export async function githubWebhook(request: Request, env: Env, deps: Deps): Pro
 		commit,
 		pusher,
 		writable,
-		commits: (payload.commits ?? []).flatMap((pushed) => pushed.id ?? []),
-		...(payload.head_commit?.message === undefined ? {} : { subject: payload.head_commit.message }),
 		withheld,
 		queuedAt: Date.now(),
 		attempts: 0,
@@ -532,7 +572,10 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 	}
 
 	// First a look: every export comes back as an event, and most end here.
-	if (!pull.peeked) {
+	// It also says everything this pull would land beyond `main`, which is
+	// what GitHub is asked about below, not just what the event pushed.
+	let beyond = pull.beyond;
+	if (beyond === undefined) {
 		const list = (await project.branch(PULL_BRANCH))?.list;
 		if (list === undefined) throw new HttpError(404, `no branch \`${PULL_BRANCH}\` in ${key}`);
 		const seen = await deps.pull(key, { ...plan(list), peek: true }, async () => {
@@ -542,7 +585,12 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 		});
 		if (isChecking(seen)) return false;
 		if (seen.outcome === "nothing" || seen.outcome === "refused") return await ended(seen);
-		await project.markPeeked(pull);
+		// A container older than this Worker says nothing of the walk:
+		// landing unasked is what #399 was, so that is a failed attempt.
+		if (seen.outcome !== "work" || !Array.isArray(seen.commits))
+			throw new Error(`a look answered \`${seen.outcome}\` without the commits it would land`);
+		beyond = beyondMain(seen.commits);
+		await project.markPeeked(pull, beyond);
 	}
 
 	// Asked only now: our own exports end above, and cost GitHub no call.
@@ -553,7 +601,7 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 			const wait = lookup.failed !== undefined ? retryDelay(lookup.failures ?? 1, PULL_INDEX_ASK_MS) : PULL_INDEX_ASK_MS;
 			if (now - lookup.last < wait) return false;
 		}
-		const found = await implicated(deps, pull, await project.withheldWork(pull.withheld));
+		const found = await implicated(deps, pull, beyond, await project.withheldWork(pull.withheld));
 		if ("unknown" in found) {
 			// Not knowing is not a refusal: nobody is named, and the pull
 			// waits for GitHub, asking again later each time, until

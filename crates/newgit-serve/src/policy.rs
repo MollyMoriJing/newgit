@@ -62,7 +62,6 @@ pub struct Facts {
     pub paths: Vec<String>,
     /// The tracker whose history holds this definition's file.
     pub source: String,
-    pub history_pins: bool,
     pub pinned: bool,
     /// Another project is its home: `<owner>/<project>[/<path>]`.
     pub link: Option<String>,
@@ -81,7 +80,6 @@ pub fn implicit_facts(tracker: &str) -> Option<Facts> {
         mount: mount.to_owned(),
         paths: vec![".".to_owned()],
         source: "access".to_owned(),
-        history_pins: false,
         pinned: false,
         link: None,
     };
@@ -116,7 +114,6 @@ pub fn parse_facts(text: &str, source: &str) -> Option<Facts> {
         mount: normalize_path(string("mount").unwrap_or(".")),
         paths,
         source: source.to_owned(),
-        history_pins: string("history") == Some("pins"),
         pinned: table.get("pinned").and_then(toml::Value::as_bool) == Some(true),
         link: string("link").map(str::to_owned),
     })

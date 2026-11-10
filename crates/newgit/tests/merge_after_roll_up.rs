@@ -1,9 +1,10 @@
-//! An instance merges again after root rolled its last merge up as a `pins`
-//! snapshot: a commit of root's own, not descending from the merger's, so
-//! the composed `main` holds none of the instance's commits. Merged in the
-//! view, that met an old base and "conflicted" on files only the instance
-//! had changed (seen on the dev remote). Merged tracker by tracker, as it
-//! is when root's own files are untouched, it goes through.
+//! An instance merges again after root rolled its last merge up as a commit
+//! of root's own, not descending from the merger's (the roll-up could not
+//! keep the merge's own commit, as when another landing moved root's head
+//! first), so the composed `main` holds none of the instance's commits.
+//! Merged in the view, that met an old base and "conflicted" on files only
+//! the instance had changed (seen on the dev remote). Merged tracker by
+//! tracker, as it is when root's own files are untouched, it goes through.
 //!
 //! New tests live in their own file per AGENTS.md's "Working in parallel".
 
@@ -12,7 +13,7 @@
 include!("support/fake_remote.rs");
 
 #[test]
-fn a_second_merge_after_a_pins_roll_up_goes_through() {
+fn a_second_merge_after_a_roll_up_commit_of_roots_own_goes_through() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
     std::fs::create_dir_all(fixture.store.join("docs")).expect("mkdir");
@@ -43,8 +44,9 @@ fn a_second_merge_after_a_pins_roll_up_goes_through() {
     let before = git(&root, &["rev-parse", "main"]);
     fixture.ok(&fixture.store, &["merge", "feature-a"]);
 
-    // As a `pins` parent rolls it up: root's tree as merged, but a commit of
-    // root's own on the head before, keeping none of the merger's history.
+    // As a roll-up that kept nothing rolls it up: root's tree as merged, but
+    // a commit of root's own on the head before, keeping none of the
+    // merger's history.
     let tree = git(&root, &["rev-parse", "main^{tree}"]);
     let snapshot = git(
         &root,

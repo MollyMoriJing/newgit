@@ -958,11 +958,12 @@ pub struct PullPlan {
     /// say which trackers the mirror ships.
     pub target: String,
     pub mirror: Mirror,
-    /// Instances this commit came from, as GitHub names their branches, with
-    /// what they hold of each tracker the mirror withholds. The mirror never
-    /// saw that work, so landing the commit alone would leave it out. Only
-    /// an instance positively named is here: the Worker waits for GitHub
-    /// rather than guess.
+    /// Instances whose branches this commit brings in, as GitHub names them
+    /// for any commit between `main` and it, with what they hold of each
+    /// tracker the mirror withholds. The mirror never saw that work, so
+    /// landing the commit alone would leave it out. Only an instance
+    /// positively named is here: the Worker waits for GitHub rather than
+    /// guess.
     #[serde(default)]
     pub instances: Vec<MirrorInstance>,
     /// Only say whether there is anything to land: no lock is held and
@@ -998,8 +999,11 @@ pub struct Mirror {
 pub enum PullAnswer {
     /// The commit is `main`'s already: an export of ours, or a redelivery.
     Nothing,
-    /// A peek found something to land.
-    Work,
+    /// A peek found something to land: every commit landing would bring in
+    /// beyond `main`, oldest first. The Worker asks GitHub whose work each
+    /// is, whichever event's payload it came in, so a commit refused once is
+    /// not landed later, unasked, under the next event's.
+    Work { commits: Vec<WalkedCommit> },
     /// Ready to land: every commit is at its landing ref. The Worker lands
     /// `list` as `main`'s index, then moves root's `main` and makes `moves`.
     Landed {
@@ -1014,6 +1018,15 @@ pub enum PullAnswer {
     },
     /// Nothing moved, for this reason.
     Refused { why: String },
+}
+
+/// One commit a pull would bring in beyond `main`, as a look reports it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WalkedCommit {
+    pub commit: String,
+    pub parents: Vec<String>,
+    /// The first line of its message: GitHub's merge commits name their branch there.
+    pub subject: String,
 }
 
 /// Pull a mirror's commit into `main`. Safe to run again: a run that stopped
@@ -1153,12 +1166,12 @@ fn land(plan: &PullPlan, store: &Utf8Path) -> Result<PullAnswer> {
                 .is_some_and(|main| !pin.is_empty() && is_ancestor(pin, main));
             if !on_main {
                 return Err(NewgitError::SplitRefused(format!(
-                    "commit {commit} on `{target}` came from `{name}`'s branch, and `{name}` has \
-                     work in `{tracker}`, which `{target}` does not ship, so landing the commit \
-                     alone would leave that work out. Nothing moved. To land it with that work, \
-                     `newgit merge {name}`, then redeliver this event; to land only what \
-                     `{target}` has, run `newgit pull --remote {target}` from the project root, \
-                     and `{name}`'s work in `{tracker}` stays on its fork",
+                    "commit {commit} on `{target}` brings in `{name}`'s branch, and `{name}` \
+                     has work in `{tracker}`, which `{target}` does not ship, so landing the \
+                     commit alone would leave that work out. Nothing moved. To land it with \
+                     that work, `newgit merge {name}`, then redeliver this event; to land only \
+                     what `{target}` has, run `newgit pull --remote {target}` from the project \
+                     root, and `{name}`'s work in `{tracker}` stays on its fork",
                     target = target.name,
                     name = instance.name,
                 )));
@@ -1166,7 +1179,30 @@ fn land(plan: &PullPlan, store: &Utf8Path) -> Result<PullAnswer> {
         }
     }
     if plan.peek {
-        return Ok(PullAnswer::Work);
+        let commits = git(&[
+            "log",
+            "--topo-order",
+            "--reverse",
+            "--format=%H%x1f%P%x1f%s",
+            commit,
+            "--not",
+            &exported,
+        ])?
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '\x1f');
+            Some(WalkedCommit {
+                commit: fields.next()?.to_owned(),
+                parents: fields
+                    .next()?
+                    .split_whitespace()
+                    .map(ToOwned::to_owned)
+                    .collect(),
+                subject: fields.next().unwrap_or_default().to_owned(),
+            })
+        })
+        .collect();
+        return Ok(PullAnswer::Work { commits });
     }
 
     let main_view = view_of("refs/mirrors/view/main", base, &everything)?;

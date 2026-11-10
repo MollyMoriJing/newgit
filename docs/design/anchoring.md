@@ -39,8 +39,7 @@ Agreed with Jack, 2026-11-06:
    merges with the tracker's head when no file overlaps. No rebasing.
 3. **A parent rolls up when something needs it,** not on a schedule and not at a
    boundary. See *When a parent catches up*.
-4. **History is a choice each parent makes about each mount:** `commits` or
-   `pins`. See *How much history rolls up*.
+4. **A parent records every change as a commit.** See *How much history rolls up*.
 5. **A failed roll-up serves the last commit, and says it is behind.** A read
    never fails because a parent has not caught up.
 
@@ -98,14 +97,11 @@ written yet" never reads as "out of date".
 
 ## How much history rolls up
 
-A mount is the parent's to define, so this is the parent's choice:
+One commit per change, so the parent's `git log` is complete. (A definition once
+had a `history` key to roll up as `pins` instead, one snapshot of where a child is
+now. Its output depended on when a parent was read, so it was deleted.)
 
-| `history` | The parent records | Fits |
-|---|---|---|
-| `commits` (default) | One commit per change, so `git log` is complete | Directories that change together: `t3code` in `newgit` |
-| `pins` | A snapshot of pin moves, with no child's messages | Things that merely sit together: `/remote/users` |
-
-**`commits` merges the root commits `split` already made.** A change arrives with
+**It merges the root commits `split` already made.** A change arrives with
 a root commit of its own, based on whatever it started from. Rolling up
 fast-forwards to it, or merges it into the parent's head when that moved, which
 is what parallel instances produce today. A view is built per root commit, so
@@ -116,11 +112,6 @@ the same commit.
 **Batching is at the head, not in the history.** A roll-up makes one commit per
 change and moves the head once: a thousand changes are a thousand commits and one
 compare-and-swap.
-
-**`pins` skips what nobody saw.** A roll-up writes the latest heads as one
-snapshot, so its cost doesn't grow with what is queued. Its history depends on
-when it was read: a week unread is one snapshot, so that parent can't say what it
-pinned on Tuesday. Each child's own history still can.
 
 A roll-up cannot conflict: below the anchor it moves only pins, and a pin's new
 value is that tracker's head.
@@ -204,15 +195,15 @@ the source of truth, and a mirror may trail it.
      sweep's first form.
    - Subscriptions wait for exports to live on the remote: today the client
      exports.
-5. `history`, and the sweep. **Done.**
-   - A definition's `history` (`commits` by default, or `pins`) is how its
-     parent records it. A `pins` child rolls up as one snapshot of where it
-     is now, with none of its messages; `commits` children still get one
-     commit per change (`remote/src/rollup.ts`).
+5. The sweep. **Done.** (This step also added a definition's `history`, `commits`
+   or `pins`. `pins` was deleted: its output depended on when a parent was read.
+   Every parent records one commit per change.)
    - The client merges tracker by tracker when the instance changed nothing
-     of root's own but pins (`merge_by_pins`). Under `pins`, root's history
-     never descends from the merger's, so a merge in the composed view met
-     an old base and conflicted on files only the instance had changed.
+     of root's own but pins (`merge_by_pins`). A roll-up that cannot keep the
+     change's own commit (another landing moved the head first) writes a root
+     commit that does not descend from the merger's, so a merge in the
+     composed view met an old base and conflicted on files only the instance
+     had changed.
    - The sweep (`remote/src/sweep.ts`) runs from `ProjectDO`'s alarm within
      the hour of a landing or an upload, and again while anything is left.
      It rolls up every pending branch. It deletes landing refs whose commit
@@ -344,8 +335,8 @@ from its inbox, and moving its head puts an entry in its own outbox.
 
 - **Reservations across trees.** How long may one be held, and what breaks one a
   dead client left behind?
-- **Pins and privacy.** A `pins` parent carries no messages, but a pin still says
-  a tree exists (#201, "the registry leaks shape").
+- **Pins and privacy.** A pin says a tree exists even where its child's messages
+  are not carried (#201, "the registry leaks shape").
 - **The webhook.** Resolved: a pull lands at its anchor, as a merge does.
 - **Permission to anchor.** Who may land at a tracker when the change was reviewed
   on a mirror that sees only one view?
