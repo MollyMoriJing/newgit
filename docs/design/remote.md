@@ -625,9 +625,7 @@ remote from before uploads, takes the old way: `begin` hands passwords, and
 asks as for a landing at root since it cannot read the commits. A finish
 that finds the merge touching more than `begin` saw is refused.
 
-A child's definition says how its parent records it (`history`): every
-change (`commits`, the default), or one snapshot of where it is now
-(`pins`), which carries none of the child's messages. A sweep from
+A parent records every change of a child as a commit. A sweep from
 `ProjectDO`'s alarm, within the hour of a landing or an upload, rolls up
 what nobody has read and clears the landing refs merges leave
 (`remote/src/sweep.ts`). A merge's uploads are sent at once, one thread each. `begin` compares the base only for the trackers the merge

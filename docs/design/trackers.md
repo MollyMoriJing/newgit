@@ -107,7 +107,6 @@ authoritative list; in short:
 | `paths` | Its claims, relative to the mount. `!` excludes: `[".", "!dist/"]`. The most specific owner of a path wins (see *Ownership*). |
 | `role` | Trackers with the same role are mutually exclusive alternatives: an instance binds exactly one per role. A tracker without a role is its own slot. |
 | `priority` | Which alternative is picked by default: highest readable wins. **Negative: never picked automatically** — only by `--use` or a personal setting. |
-| `history` | How its parent records it rolling up (docs/design/anchoring.md): `commits` (the default), one commit per change so the parent's `git log` is complete; or `pins`, one snapshot of where it is now, carrying none of its messages. The parent's choice, as the mount is. Written only when `pins`. |
 | `pinned` | Whether its parent holds it where it is (docs/design/anchoring.md, *Follow and pinned*): a change landing at it never rolls up into the parent, and moving the parent's pin is a change to the parent, approved by the parent's maintainers; rollback is a revert. For what must not move by itself: a private dependency, `/env/prod`. Default `false`. |
 | `link` | Where it lives when it lives in another project: `"<owner>/<project>[/<path>]"` (see *Links*). Its history, heads, repo, and policy are its home's; only where it is mounted is this project's. Only a tracker in Git. Written by `newgit tracker link`. |
 | `resources` | Resources this tracker brings. A resource is bound iff a bound tracker brings it. |

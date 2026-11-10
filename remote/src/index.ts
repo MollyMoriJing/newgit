@@ -1516,11 +1516,6 @@ export interface TrackerFacts {
 	/** The tracker whose history holds this definition's file. */
 	source: string;
 	/**
-	 * How its parent records it rolling up: one commit per change, or one
-	 * snapshot of where it is now (docs/design/anchoring.md).
-	 */
-	history?: "commits" | "pins";
-	/**
 	 * Its parent holds it where it is: never rolled up, and moving its pin
 	 * is a change to the parent (docs/design/anchoring.md, *Follow and pinned*).
 	 */
@@ -1568,7 +1563,6 @@ function parseFacts(text: string, source: string): TrackerFacts | undefined {
 		maintainers?: unknown;
 		mount?: unknown;
 		paths?: unknown;
-		history?: unknown;
 		pinned?: unknown;
 		link?: unknown;
 	};
@@ -1588,8 +1582,6 @@ function parseFacts(text: string, source: string): TrackerFacts | undefined {
 	const mount = normalizePath(typeof definition.mount === "string" ? definition.mount : ".");
 	const paths = Array.isArray(definition.paths) ? definition.paths.filter((path) => typeof path === "string") : [];
 	// `git` defaults to false, and is written only when true.
-	// `history` defaults to `commits`, and is written only when `pins`.
-	const history = definition.history === "pins" ? "pins" : "commits";
 	return {
 		audience,
 		git: definition.git === true,
@@ -1597,7 +1589,6 @@ function parseFacts(text: string, source: string): TrackerFacts | undefined {
 		mount,
 		paths,
 		source,
-		history,
 		pinned: definition.pinned === true,
 		...(typeof definition.link === "string" ? { link: definition.link } : {}),
 	};
@@ -2217,11 +2208,11 @@ async function makeFork(
 /** What rolling up needs of a project's `ProjectDO`. */
 function rollupStore(project: DurableObjectStub<ProjectDO>, deps: Deps, id: ProjectId): RollupStore {
 	return {
-		// Its definition's `history`: the parent's choice, read as policy is,
+		// Its definition's `pinned`: the parent's choice, read as policy is,
 		// from each holder's `main`.
-		historyOf: async (tracker) => {
+		isPinned: async (tracker) => {
 			const facts = await definitionFacts(deps.repos, id, tracker, await listedTrackers(project));
-			return facts?.pinned === true ? "pinned" : (facts?.history ?? "commits");
+			return facts?.pinned === true;
 		},
 		head: (branch, tracker) => project.head(branch, tracker),
 		trackers: async (branch) => Object.keys((await project.branch(branch))?.list ?? {}),
