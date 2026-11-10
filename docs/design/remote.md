@@ -830,9 +830,14 @@ definition is itself a file, `.newgit/trackers/<name>.toml`, owned by
 `access`, which only the project's owner maintains, so changing who may read
 or merge anything is an owner's merge. Governance layers the same way: a
 tracker that claims some definitions governs them, resolved on the Worker
-from the branch's own `access` before any credential is minted. A merge
-moves only the trackers the merger's instance binds; a dropped tracker stays
-where the branch had it.
+from each holder's `main` (`access`'s, or the governing tracker's) before
+any credential is minted, whichever branch is in question, so a branch
+cannot widen its own audience or maintainers by editing its copy of a
+definition. So a tracker created in a merge is not known to the remote
+until that merge lands its definition on `main`: until then it has no
+policy to read, and the merge admits it by its seeded repo and by whoever
+governs its definition file. A merge moves only the trackers the merger's
+instance binds; a dropped tracker stays where the branch had it.
 
 **Known hole ([#228]):** nothing checks a *new* claim on a definition file
 against that file's current holder, so a tracker handed one definition can
@@ -876,7 +881,17 @@ credentials.
 **What happens.** The event is queued on the project and answered 202.
 Only `ProjectDO`'s alarm moves the queue on, a second later and then every
 15 seconds, which is also what keeps the endpoint awake: unlike a merge
-check, nobody else is asking. First `newgit endpoint-pull` looks, with read
+check, nobody else is asking. The alarm sets its next one before it does
+any work, and nothing it runs can stop it: a step that throws (a deploy
+resetting the object under it, Artifacts down during the sweep) is logged,
+said on the pull at the queue's head, and the queue moves on 15 seconds
+later. It used to set the next alarm last, so such a throw left a queued
+pull with nothing to move it, and Cloudflare retries a failed alarm only a
+few times: the event had its 202 and never landed, until a redelivery
+queued it again and so set an alarm
+([#353](https://github.com/Spheroman/newgit/issues/353)). Reading the
+project's state (what `newgit status` asks) also sets one when pulls are
+queued and none is set, and says the queue was stalled. First `newgit endpoint-pull` looks, with read
 passwords and no lock: it fetches the mirror's branch, confirms the event's
 commit is on it, composes `main` as the target sees it, and walks what the
 mirror has beyond that. If that is nothing, the event was our own export or
@@ -900,8 +915,11 @@ pusher does not maintain: refused, logged, nothing moved.
 **Work the mirror never saw.** A branch exported for a pull request leaves
 out what the target withholds, so an instance's edit under `apps/t3code` is
 on its fork and not on the mirror. Landing the merged pull request would keep
-the rest of that commit and lose the edit without a word, so it is refused,
-saying to run `newgit merge <instance>` and redeliver the event. A mirror's
+the rest of that commit and leave the edit out without a word, so it is
+refused, saying both ways on: `newgit merge <instance>` and redeliver the
+event, to land it with that work, or `newgit pull --remote <target>` from the
+project root, to land only what the mirror has, the edit staying on the
+instance's fork. A mirror's
 branch is named for its instance, but a push to `main` does not say which
 branch it merged. Once a look has found work to land, and only if some
 instance holds withheld work at all, the subject of GitHub's merge commit
@@ -916,10 +934,24 @@ one too soon would land a squash without the withheld work of the instance it
 came from. So while some instance holds such work, a commit with no pull
 request listed waits: the pull stays queued, holding no lock, and GitHub is
 asked again every 30 seconds for two minutes. Only then does it count as a
-direct push, which has no instance, and land. If GitHub cannot answer (a rate limit, a 5xx, more than 20 commits),
-that is logged and every instance with such work counts, which is the one
-case that does; the refusal can be redelivered. Those calls are
-unauthenticated, 60 an hour across whatever shares the Worker's address.
+direct push, which has no instance, and land.
+
+Only an instance GitHub names counts, never one that merely holds such
+work. If GitHub cannot answer (a rate limit, a 5xx, a 404 for a commit it
+has not indexed yet, no connection), nobody is named and nothing is
+refused: the pull stays queued, holding no lock and spending no attempt,
+and GitHub is asked again 30 seconds later, then a minute, doubling to
+every ten minutes. `newgit status` says the pull is asking GitHub and why
+it could not. If GitHub has not answered within the pull's two hours, it
+gives up saying so, and that redelivering the event or `newgit pull
+--remote <target>` from the project root brings it in. It used to count
+every instance with such work, and on 2026-11-09, with api.github.com out of
+reach for half an hour, that refused two merges that could lose nothing,
+naming an instance whose branch was not on GitHub yet
+([#392](https://github.com/Spheroman/newgit/issues/392)). An event of more
+than 20 commits cannot be asked about, so it gives up at once, naming
+nobody, and says to pull by hand. Those calls are unauthenticated, 60 an
+hour across whatever shares the Worker's address.
 The instance's pins come from its last checkpoint, and only the forks it made
 of withheld trackers are looked at; the container asks whether each pin is on
 that tracker's `main`, so an instance merely behind `main`, or already merged,
@@ -928,13 +960,27 @@ merge <instance>` the redelivered event recognises the instance's commits and
 brings in only the mirror's merge, which keeps the edit: a merge takes a
 withheld tracker's files from whichever parent is ahead.
 
-**When it fails.** A failure (GitHub or Artifacts down, the container gone)
-is logged and tried again, five times. If root's ref is not what `main`'s
-index names, or the index moved under the pull, it starts over from what
-`main` is now rather than retrying a base that cannot work. A wait, on
-someone else's merge or on that, gives up after two hours. After that it is dropped, loudly, and redelivering the
-event from GitHub's *Recent Deliveries* starts it again. Everything is in
-the Worker's logs under `webhook`. GitHub's own page shows only the 202.
+**When it fails.** A failure (GitHub or Artifacts down, the container gone,
+`Network connection lost` from the endpoint) is logged and tried again, up
+to ten times, waiting 15 seconds after the first and twice as long after
+each, up to ten minutes: about three quarters of an hour, so an outage or a
+deploy is over before it gives up. The queue waits with it, in order. If
+root's ref is not what `main`'s index names, or the index moved under the
+pull, it starts over from what `main` is now rather than retrying a base
+that cannot work. A wait, on the container, on GitHub, or on any of that,
+gives up after two hours. A pull that gives up is dropped, loudly, and
+always says so where `newgit status` reads it, with why and what to do:
+redeliver the event from GitHub's *Recent Deliveries*, or `newgit pull
+--remote <target>` from the project root. (One that waited two hours
+without a failed attempt used to be dropped without a word.) Every way a
+pull ends is kept there, the last ten: `landed`, `nothing` (its commit was
+on `main` already), `refused`, `gave up`. `newgit status` says each pull
+refused or given up since its target's last that landed or found nothing,
+so trouble stays said until the mirror's commits are on `main`, however
+they got there. While a pull waits, it says what on: looking at the mirror,
+asking GitHub, landing, or behind another, and when a failed one is tried
+again. Everything is in the Worker's logs under `webhook`. GitHub's own
+page shows only the 202.
 
 **What it trusts.** GitHub, to say who pushed what: the signature proves an
 event came from someone holding the secret, and the payload is taken at its

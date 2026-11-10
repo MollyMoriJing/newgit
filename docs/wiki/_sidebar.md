@@ -7,6 +7,7 @@
 - [Trackers](trackers.md)
 - [Adopting it](adopting.md)
 - [Behavior worth knowing](behavior.md)
+- [Your own remote](serve.md)
 - [Commands](commands.md)
 
 **With your agent**

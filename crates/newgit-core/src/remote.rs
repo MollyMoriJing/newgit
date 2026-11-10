@@ -1288,6 +1288,20 @@ pub struct PullState {
     pub queued_at: String,
     pub attempts: u32,
     pub last_error: Option<String>,
+    /// What it is doing: `queued` behind another, `looking`, `asking
+    /// GitHub`, `landing`, `tagging`. None from a remote that does not say.
+    #[serde(default)]
+    pub step: Option<String>,
+    /// Waiting out a failure until then.
+    #[serde(default)]
+    pub retry_at: Option<String>,
+    /// Why GitHub could not say which pull request the commit came from,
+    /// while it is asked again.
+    #[serde(default)]
+    pub lookup_failed: Option<String>,
+    /// Nothing was moving the queue on; reading the state started it again.
+    #[serde(default)]
+    pub stalled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1335,41 +1349,76 @@ impl RemoteState {
             }
         }
         for pull in &self.pulls {
+            let mut parts = Vec::new();
+            match pull.step.as_deref() {
+                Some("looking") => parts.push("looking at the mirror".to_owned()),
+                Some("asking GitHub") => {
+                    parts.push("asking GitHub which pull request it came from".to_owned())
+                }
+                Some("queued") => parts.push("behind another".to_owned()),
+                Some(step) => parts.push(step.to_owned()),
+                None => {}
+            }
+            if let Some(why) = &pull.last_error {
+                parts.push(if pull.attempts > 0 {
+                    let attempts = if pull.attempts == 1 {
+                        "attempt"
+                    } else {
+                        "attempts"
+                    };
+                    format!("{} failed {attempts}; last: {why}", pull.attempts)
+                } else {
+                    format!("last: {why}")
+                });
+            }
+            if let Some(why) = &pull.lookup_failed {
+                parts.push(format!(
+                    "GitHub could not say ({why}), so it waits and asks again"
+                ));
+            }
+            if let Some(at) = &pull.retry_at {
+                parts.push(format!("tried again at {at}"));
+            }
+            if pull.stalled {
+                parts.push("nothing was moving it on; asking for this started it again".to_owned());
+            }
             let mut note = format!(
                 "the webhook's pull from `{}` at {} is waiting",
                 pull.target,
                 short_commit(&pull.commit)
             );
-            if let Some(why) = &pull.last_error {
-                note.push_str(&format!(
-                    " ({} failed attempts; last: {why})",
-                    pull.attempts
-                ));
+            if !parts.is_empty() {
+                note.push_str(&format!(" ({})", parts.join("; ")));
             }
             notes.push(note);
         }
-        // A target's last pull only: one that landed since says the trouble
-        // is over.
-        let mut last: std::collections::BTreeMap<&str, &PullEnded> =
+        // Per target, what was refused or given up since its last pull that
+        // landed or found its commit on `main` already: that one says the
+        // trouble is over. A redelivery refused again is said once.
+        let mut troubles: std::collections::BTreeMap<&str, Vec<&PullEnded>> =
             std::collections::BTreeMap::new();
         for ended in &self.ended {
-            last.insert(ended.target.as_str(), ended);
-        }
-        for ended in last.values() {
+            let since = troubles.entry(ended.target.as_str()).or_default();
             if ended.outcome == "refused" || ended.outcome == "gave up" {
-                notes.push(format!(
-                    "the webhook's pull from `{}` at {} {} ({}): {}",
-                    ended.target,
-                    short_commit(&ended.commit),
-                    if ended.outcome == "refused" {
-                        "was refused"
-                    } else {
-                        "gave up"
-                    },
-                    ended.at,
-                    ended.why.as_deref().unwrap_or("no reason given")
-                ));
+                since.retain(|earlier| earlier.commit != ended.commit);
+                since.push(ended);
+            } else {
+                since.clear();
             }
+        }
+        for ended in troubles.values().flatten() {
+            notes.push(format!(
+                "the webhook's pull from `{}` at {} {} ({}): {}",
+                ended.target,
+                short_commit(&ended.commit),
+                if ended.outcome == "refused" {
+                    "was refused"
+                } else {
+                    "gave up"
+                },
+                ended.at,
+                ended.why.as_deref().unwrap_or("no reason given")
+            ));
         }
         notes
     }

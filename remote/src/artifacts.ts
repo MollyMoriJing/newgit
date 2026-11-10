@@ -183,7 +183,10 @@ export class ArtifactsRepos implements Repos {
 	async branchHead(name: string, branch: string) {
 		try {
 			using repo = await this.artifacts.get(name);
-			const [head] = await repo.log({ ref: `refs/heads/${branch}`, limit: 1 });
+			// `log` takes a branch by its short name: `refs/heads/main`
+			// resolves to nothing, and answers an empty log (seen against the
+			// live service), which read as every branch having no head.
+			const [head] = await repo.log({ ref: branch, limit: 1 });
 			return head?.hash ?? null;
 		} catch (error) {
 			if (isNotFound(error)) return null;
