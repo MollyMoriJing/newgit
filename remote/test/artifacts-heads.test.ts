@@ -30,7 +30,8 @@ function binding(repos: Record<string, { commits: StoredCommit[]; branches: Reco
 			if (repo === undefined) throw Object.assign(new Error(`${name} not found`), { code: "NOT_FOUND" });
 			const byHash = new Map(repo.commits.map((commit) => [commit.hash, commit]));
 			return {
-				[Symbol.dispose]() {},
+				// The real binding is disposable (`using`); the test lib types lack `Symbol.dispose`.
+				[(Symbol as unknown as { dispose: symbol }).dispose]() {},
 				async readCommit(hash: string) {
 					return byHash.get(hash) ?? null;
 				},
