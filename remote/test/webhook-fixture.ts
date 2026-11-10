@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { beforeEach, expect } from "vitest";
 
 import { LOGIN_TTL_SECONDS } from "../src/auth";
-import { CHECKING, type PullAnswer, type PullPlan } from "../src/endpoint";
+import { CHECKING, type PullAnswer, type PullPlan, type WalkedCommit } from "../src/endpoint";
 import { type Deps, handle, issue } from "../src/index";
 import { advancePulls } from "../src/webhook";
 import { FakeRepos, noEndpoint } from "./fake-repos";
@@ -45,6 +45,19 @@ const githubFetch = (async (input: RequestInfo | URL) => {
 	return github(commit);
 }) as typeof fetch;
 
+/** The last event delivered: a look's walk, by default, is what it pushed. */
+let delivered: { commits?: { id?: string }[]; head_commit?: { message?: string } } = {};
+
+/** What a look says lies beyond `main` by default: the event's commits, in a line, the last with its subject. */
+function pushedWalk(commit: string): WalkedCommit[] {
+	const ids = [...new Set([...(delivered.commits ?? []).flatMap((pushed) => pushed.id ?? []), commit])];
+	return ids.map((id, at) => ({
+		commit: id,
+		parents: at === 0 ? [main.root] : [ids[at - 1]],
+		subject: id === commit ? (delivered.head_commit?.message ?? "").split("\n")[0] : "",
+	}));
+}
+
 /** The plans the container was asked to land, and to look at. */
 export let plans: PullPlan[];
 export let peeks: PullPlan[];
@@ -55,7 +68,7 @@ const pull: Deps["pull"] = async (_project, plan, credentials) => {
 	if (plan.peek) {
 		peeks.push(plan);
 		await credentials();
-		const look = looks.shift() ?? { outcome: "work" };
+		const look = looks.shift() ?? { outcome: "work", commits: pushedWalk(plan.mirror.commit) };
 		if (look instanceof Error) throw look;
 		return look as PullAnswer;
 	}
@@ -124,6 +137,7 @@ interface Delivery {
 
 export async function deliver({ event = "push", payload = push(), signature, query, useEnv = secretEnv, hold = false }: Delivery = {}) {
 	const body = JSON.stringify(payload);
+	if (typeof payload === "object" && payload !== null) delivered = payload;
 	const headers = new Headers({ "x-github-event": event });
 	const signed = signature === undefined ? await sign(SECRET, body) : signature;
 	if (signed !== null) headers.set("x-hub-signature-256", signed);
@@ -148,6 +162,7 @@ beforeEach(async () => {
 	looks = [];
 	github = () => Response.json([]);
 	asked = [];
+	delivered = {};
 	plans = [];
 	peeks = [];
 	started = [];

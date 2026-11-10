@@ -924,10 +924,17 @@ project root, to land only what the mirror has, the edit staying on the
 instance's fork. A mirror's
 branch is named for its instance, but a push to `main` does not say which
 branch it merged. Once a look has found work to land, and only if some
-instance holds withheld work at all, the subject of GitHub's merge commit
-says; a squash, which is how most pull requests merge, has no such subject,
-so `GET /repos/{owner}/{repo}/commits/{sha}/pulls` does, for each commit the
-event landed, and each pull request's `head.ref` names an instance. Only
+instance holds withheld work at all, every commit the pull would bring in
+beyond `main` is checked: the look says which they are, with their parents
+and subjects. That is the walk from `main` to the pushed commit, not the
+event's payload, because a commit refused once stays on the mirror and the
+next push there carries it; asking only about what that event pushed let it
+land unasked ([#399](https://github.com/Spheroman/newgit/issues/399)). The
+subject of a GitHub merge commit says its branch, for itself and for the
+commits it merged; a squash, which is how most pull requests merge, has no
+such subject, so `GET /repos/{owner}/{repo}/commits/{sha}/pulls` does, for
+each commit no such merge accounts for, and each pull request's `head.ref`
+names an instance. Only
 those instances are checked, so an unrelated squash lands while another
 instance holds such work. A pull request listed there counts whether or not
 it is marked merged yet, because the event can beat the mark. One from a fork
@@ -950,9 +957,11 @@ gives up saying so, and that redelivering the event or `newgit pull
 every instance with such work, and on 2026-11-09, with api.github.com out of
 reach for half an hour, that refused two merges that could lose nothing,
 naming an instance whose branch was not on GitHub yet
-([#392](https://github.com/Spheroman/newgit/issues/392)). An event of more
-than 20 commits cannot be asked about, so it gives up at once, naming
-nobody, and says to pull by hand. Those calls are unauthenticated, 60 an
+([#392](https://github.com/Spheroman/newgit/issues/392)). A walk with more
+than 20 commits no merge commit accounts for cannot be asked about, so it
+gives up at once, naming nobody, and says to pull by hand. Nothing remembers
+a refusal: once `newgit merge <instance>` has put the work on `main`, the
+instance has nothing to lose, and the next pull lands. Those calls are unauthenticated, 60 an
 hour across whatever shares the Worker's address.
 The instance's pins come from its last checkpoint, and only the forks it made
 of withheld trackers are looked at; the container asks whether each pin is on
