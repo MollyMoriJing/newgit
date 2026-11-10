@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { PULL_ATTEMPTS } from "../src/webhook";
+import { PULL_ATTEMPTS, PULL_RETRY_MAX_MS } from "../src/webhook";
 import { advance, call, deliver, jack, main, path, setAnswers, sha, stub } from "./webhook-fixture";
 
 // What the remote has not written down yet, read without rolling it up
@@ -50,7 +50,15 @@ describe("the remote's state", () => {
 		const waiting = (await state()).pulls;
 		expect(waiting).toHaveLength(1);
 		expect(waiting[0].lastError).toContain("GitHub said 500");
-		for (let attempt = 1; attempt < PULL_ATTEMPTS; attempt++) await advance();
+		vi.useFakeTimers({ toFake: ["Date"] });
+		try {
+			for (let attempt = 1; attempt < PULL_ATTEMPTS; attempt++) {
+				vi.setSystemTime(Date.now() + PULL_RETRY_MAX_MS);
+				await advance();
+			}
+		} finally {
+			vi.useRealTimers();
+		}
 		quiet.mockRestore();
 		const now = await state();
 		expect(now.pulls).toEqual([]);

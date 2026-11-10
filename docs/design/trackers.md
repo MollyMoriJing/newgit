@@ -1234,12 +1234,14 @@ something:
   a commit of its own, which merges.
 - **A mirror's event lands as a merge by whoever pushed it:** they must be a
   member and maintain what it changes (*The GitHub webhook*).
-- **A mirror's commit that may hold withheld work is refused.** A pull
+- **A mirror's commit that holds withheld work is refused.** A pull
   request's branch leaves out what the target withholds, so landing it would
-  lose an instance's edit there. The merge goes through `newgit merge
-  <instance>` instead, and a mirror's merge then takes each withheld tracker's
-  files from whichever parent is ahead, not its first
-  ([remote.md](remote.md), *The GitHub webhook*).
+  lose an instance's edit there. Only an instance GitHub names as the pull
+  request's branch counts; when GitHub cannot say, the pull waits for it
+  rather than refuse. The merge goes through `newgit merge <instance>`
+  instead, and a mirror's merge then takes each withheld tracker's files from
+  whichever parent is ahead, not its first ([remote.md](remote.md), *The
+  GitHub webhook*).
 - **`git push` in a linked project root publishes.** Fetch stays on the
   endpoint; a push goes through the outbox and `push-receive-pack`, as a
   workspace's does. Pushing the project root's branch is `newgit merge main`,
