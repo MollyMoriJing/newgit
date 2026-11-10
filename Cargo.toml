@@ -4,6 +4,9 @@ members = [
     "crates/newgit-core",
     "crates/newgit-serve",
 ]
+# The `t3code` tracker, mounted here, has its own crates (native/*): they
+# build on their own, not as members of newgit's workspace.
+exclude = ["apps/t3code"]
 resolver = "2"
 
 [workspace.package]
