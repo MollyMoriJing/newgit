@@ -11,6 +11,7 @@ import { DurableObject } from "cloudflare:workers";
 import { within } from "./anchor";
 import { type TrackerDO, type TrackerRef, trackerPath } from "./tracker-do";
 import { liveDeps } from "./index";
+import { projectKey } from "./names";
 import type { MirrorInstance } from "./endpoint";
 import { SWEEP_EVERY_MS, sweep } from "./sweep";
 import { type MirrorPull, PULL_BRANCH, PULL_POLL_MS, PULL_START_MS, advancePulls } from "./webhook";
@@ -784,13 +785,28 @@ export class ProjectDO extends DurableObject<Env> {
 		return work;
 	}
 
-	/** Count a failure. How many there have been. */
-	pullFailed(pull: MirrorPull, why = ""): number {
+	/** Count a failure, and wait until `retryAt` before the next attempt. How many there have been. */
+	pullFailed(pull: MirrorPull, why = "", retryAt?: number): number {
 		const attempts = (this.pulls().find((known) => samePull(known, pull))?.attempts ?? 0) + 1;
 		this.writePulls(
-			this.pulls().map((known) => (samePull(known, pull) ? { ...known, attempts, lastError: why } : known)),
+			this.pulls().map((known) =>
+				samePull(known, pull)
+					? { ...known, attempts, lastError: why, ...(retryAt === undefined ? {} : { retryAt }) }
+					: known,
+			),
 		);
 		return attempts;
+	}
+
+	/**
+	 * Something outside a pull's own step went wrong while the queue moved
+	 * on (this object reset by a deploy, Artifacts down): say so on the pull
+	 * at its head, without counting an attempt, so a queue that is not moving
+	 * says why.
+	 */
+	notePullTrouble(why: string): void {
+		const [head, ...rest] = this.pulls();
+		if (head !== undefined) this.writePulls([{ ...head, lastError: why }, ...rest]);
 	}
 
 	/** How a webhook pull ended, kept (the last ten) for `newgit status` to say. */
@@ -821,6 +837,13 @@ export class ProjectDO extends DurableObject<Env> {
 	 */
 	async report(): Promise<ProjectState> {
 		const ended = this.sql.exec<{ value: string }>("SELECT value FROM meta WHERE key = 'pulls_ended'").toArray()[0];
+		// A queue with no alarm has nothing to move it on: say so, and start
+		// it again, so asking is enough to unstick it.
+		const stalled = this.pulls().length > 0 && (await this.ctx.storage.getAlarm()) === null;
+		if (stalled) {
+			console.error(JSON.stringify({ webhook: "the queue had no alarm; starting it again", project: this.info()?.name ?? null }));
+			await this.ctx.storage.setAlarm(Date.now() + PULL_START_MS);
+		}
 		const all = await this.branches();
 		const counts = new Map<string, Record<string, number>>();
 		for (const branch of all) {
@@ -844,12 +867,29 @@ export class ProjectDO extends DurableObject<Env> {
 					...(failed ? { rollupFailed: JSON.parse(failed.value) as { at: string; why: string } } : {}),
 				};
 			}),
-			pulls: this.pulls().map((pull) => ({
+			pulls: this.pulls().map((pull, place) => ({
 				target: pull.target,
 				commit: pull.commit,
 				queuedAt: new Date(pull.queuedAt).toISOString(),
 				attempts: pull.attempts,
 				...(pull.lastError ? { lastError: pull.lastError } : {}),
+				step:
+					place > 0
+						? "queued"
+						: pull.tag !== undefined
+							? "tagging"
+							: !pull.peeked
+								? "looking"
+								: pull.instances === undefined
+									? "asking GitHub"
+									: "landing",
+				...(pull.retryAt !== undefined && pull.retryAt > Date.now()
+					? { retryAt: new Date(pull.retryAt).toISOString() }
+					: {}),
+				...(pull.lookup?.failed !== undefined && pull.instances === undefined
+					? { lookupFailed: pull.lookup.failed }
+					: {}),
+				...(stalled && place === 0 ? { stalled: true } : {}),
 			})),
 			ended: ended ? (JSON.parse(ended.value) as PullEnded[]) : [],
 		};
@@ -879,6 +919,12 @@ export class ProjectDO extends DurableObject<Env> {
 	/**
 	 * What keeps a pull going: nothing else polls the container once GitHub
 	 * has had its 202. Stops when the queue is empty.
+	 *
+	 * The next alarm is set before any work, and nothing here throws: a step
+	 * that did (a deploy resetting this object or the endpoint under it,
+	 * Artifacts down during the sweep) used to leave no next alarm, and
+	 * Cloudflare retries a failed alarm only a few times, so a queued pull sat
+	 * there until another event happened to set one (#353).
 	 */
 	async alarm(): Promise<void> {
 		const info = this.info();
@@ -886,18 +932,35 @@ export class ProjectDO extends DurableObject<Env> {
 		const id = { owner: info.owner, name: info.name };
 		const deps = liveDeps(this.env, (promise) => this.ctx.waitUntil(promise));
 		const now = Date.now();
-		let next = Number.POSITIVE_INFINITY;
-		if (this.pulls().length > 0 && (await advancePulls(this.env, deps, id))) next = now + PULL_POLL_MS;
+		if (this.pulls().length > 0) await this.ctx.storage.setAlarm(now + PULL_POLL_MS);
+		const log = { project: projectKey(id) };
+		if (this.pulls().length > 0) {
+			try {
+				await advancePulls(this.env, deps, id);
+			} catch (error) {
+				const why = error instanceof Error ? error.message : String(error);
+				console.error(JSON.stringify({ webhook: "the queue could not move on; trying again", ...log, why }));
+				this.notePullTrouble(why);
+			}
+		}
 		const due = this.sweepAt();
 		if (due !== null && due <= now) {
 			this.sql.exec("DELETE FROM meta WHERE key = 'sweep_at'");
 			// Still something to do (landing refs not yet old enough, a roll-up
-			// that failed): again later.
-			if (await sweep(this.env, deps, id)) this.writeSweepAt(now + SWEEP_EVERY_MS);
+			// that failed), or it failed: again later.
+			let again = true;
+			try {
+				again = await sweep(this.env, deps, id);
+			} catch (error) {
+				console.error(JSON.stringify({ sweep: "failed", ...log, why: error instanceof Error ? error.message : String(error) }));
+			}
+			if (again) this.writeSweepAt(now + SWEEP_EVERY_MS);
 		}
+		let next = this.pulls().length > 0 ? now + PULL_POLL_MS : Number.POSITIVE_INFINITY;
 		const sweepAt = this.sweepAt();
 		if (sweepAt !== null) next = Math.min(next, sweepAt);
 		if (Number.isFinite(next)) await this.ctx.storage.setAlarm(next);
+		else await this.ctx.storage.deleteAlarm();
 	}
 
 	/**
@@ -1171,7 +1234,21 @@ export interface PullEnded {
 /** `ProjectDO.state`: what is not written down yet, and the webhook's pulls. */
 export interface ProjectState {
 	branches: { name: string; pending: Record<string, number>; rollupFailed?: { at: string; why: string } }[];
-	pulls: { target: string; commit: string; queuedAt: string; attempts: number; lastError?: string }[];
+	pulls: {
+		target: string;
+		commit: string;
+		queuedAt: string;
+		attempts: number;
+		lastError?: string;
+		/** What it is doing: `queued` behind another, `looking`, `asking GitHub`, `landing`, `tagging`. */
+		step: string;
+		/** Waiting out a failure until then. */
+		retryAt?: string;
+		/** Why GitHub could not say which pull request it came from, while it is asked again. */
+		lookupFailed?: string;
+		/** Nothing was moving the queue on; this read started it again. */
+		stalled?: boolean;
+	}[];
 	ended: PullEnded[];
 }
 

@@ -958,9 +958,11 @@ pub struct PullPlan {
     /// commit says which trackers the mirror ships.
     pub target: String,
     pub mirror: Mirror,
-    /// Instances whose work in a tracker the mirror withholds may be behind
-    /// this commit. The mirror never saw that work, so landing the commit
-    /// would drop it.
+    /// Instances this commit came from, as GitHub names their branches, with
+    /// what they hold of each tracker the mirror withholds. The mirror never
+    /// saw that work, so landing the commit alone would leave it out. Only
+    /// an instance positively named is here: the Worker waits for GitHub
+    /// rather than guess.
     #[serde(default)]
     pub instances: Vec<MirrorInstance>,
     /// Only say whether there is anything to land: no lock is held and
@@ -1157,10 +1159,14 @@ fn land(plan: &PullPlan, store: &Utf8Path) -> Result<PullAnswer> {
                 .is_some_and(|main| !pin.is_empty() && is_ancestor(pin, main));
             if !on_main {
                 return Err(NewgitError::SplitRefused(format!(
-                    "commit {commit} on `{}` may hold `{}`'s work, and that instance has work in \
-                     `{tracker}`, which that target does not ship, so landing it would lose that \
-                     work. Nothing moved: `newgit merge {}`, then redeliver this event",
-                    target.name, instance.name, instance.name
+                    "commit {commit} on `{target}` came from `{name}`'s branch, and `{name}` has \
+                     work in `{tracker}`, which `{target}` does not ship, so landing the commit \
+                     alone would leave that work out. Nothing moved. To land it with that work, \
+                     `newgit merge {name}`, then redeliver this event; to land only what \
+                     `{target}` has, run `newgit pull --remote {target}` from the project root, \
+                     and `{name}`'s work in `{tracker}` stays on its fork",
+                    target = target.name,
+                    name = instance.name,
                 )));
             }
         }
