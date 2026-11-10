@@ -10655,9 +10655,19 @@ impl BranchManager {
             // the remote says which it may move.
             let mut sends: Vec<(&str, &str)> =
                 vec![(self.root.name.as_str(), merged_root.as_str())];
+            // A tracker new to the branch is not sent: its repo was seeded
+            // with its commit just above, and the remote reads definitions
+            // from `access`'s `main`, which has no definition for it until
+            // this very merge lands, so it refuses the upload.
+            let seeded: BTreeSet<&str> = moved
+                .iter()
+                .filter(|merge| merge.action == TrackerMergeAction::New)
+                .map(|merge| merge.tracker.as_str())
+                .collect();
             sends.extend(
                 mains
                     .iter()
+                    .filter(|(tracker, _, _)| !seeded.contains(tracker.as_str()))
                     .map(|(tracker, _, caught_up)| (tracker.as_str(), caught_up.as_str())),
             );
             if into != "main" {
