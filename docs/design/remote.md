@@ -830,9 +830,14 @@ definition is itself a file, `.newgit/trackers/<name>.toml`, owned by
 `access`, which only the project's owner maintains, so changing who may read
 or merge anything is an owner's merge. Governance layers the same way: a
 tracker that claims some definitions governs them, resolved on the Worker
-from the branch's own `access` before any credential is minted. A merge
-moves only the trackers the merger's instance binds; a dropped tracker stays
-where the branch had it.
+from each holder's `main` (`access`'s, or the governing tracker's) before
+any credential is minted, whichever branch is in question, so a branch
+cannot widen its own audience or maintainers by editing its copy of a
+definition. So a tracker created in a merge is not known to the remote
+until that merge lands its definition on `main`: until then it has no
+policy to read, and the merge admits it by its seeded repo and by whoever
+governs its definition file. A merge moves only the trackers the merger's
+instance binds; a dropped tracker stays where the branch had it.
 
 **Known hole ([#228]):** nothing checks a *new* claim on a definition file
 against that file's current holder, so a tracker handed one definition can

@@ -16,6 +16,7 @@ lanes.
 - [Trackers](trackers.md): what owns which files, and what an instance binds
 - [Adopting it in a project](adopting.md): `init`, what to commit, and what installs cost
 - [Behavior worth knowing](behavior.md): export, GitHub, tags, `[[render]]`, `cleanup`
+- [Running your own remote](serve.md): `newgit serve`, and pointing a project at it
 - [Commands](commands.md): every command, in one list
 
 ## With your agent
