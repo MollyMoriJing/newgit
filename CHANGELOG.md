@@ -12,6 +12,640 @@ time by `scripts/release-changelog.sh`, which then deletes the fragments.
 Two changes never touch the same lines, so nothing queues behind whichever
 branch landed first.
 
+## [0.10.0] — 2026-11-10
+
+`newgit serve` runs a newgit remote as one binary, with Git repositories on
+the machine's own disk and project state in SQLite, answering the same API as
+newgit.dev. Trackers now nest inside trackers and are named by their path, a
+tracker can be linked into a second root, and `pinned = true` holds a
+dependency where it is. Where a tracker ships is said in its own definition
+(`export`, with `"inherit"` for its children), so carving a directory out of a
+mirrored tracker can no longer drop it from the mirror. Tags reach the remote
+and its mirrors. newgit.dev has a wiki at `/docs`.
+
+On newgit.dev, merges land without a lock, two at once at different trackers
+both land whole, and a merge's checks no longer wait on a container. A pull
+request merged on GitHub comes back reliably: a failed lookup waits instead of
+refusing, the queue can no longer stall silently, every commit a pull lands
+is checked for withheld work, and a branch made before `main` moved a
+withheld tracker now lands. Checkpoints, spawns and pushes are several times
+faster on large projects.
+
+How changes will land on `newgit serve` is decided in
+`docs/design/landing.md`; the Worker's roll-ups (`docs/design/anchoring.md`)
+stay as built until newgit.dev moves to it.
+
+**This release needs migrating** if you export to GitHub. `.newgit/exports/`
+is gone; export targets are declared with an `export` key in tracker
+definitions (*Changed* below has the details). Upgrade the client and the
+remote together: a client or endpoint from before 0.10.0 refuses a definition
+that says `export`. A definition that says `history` is refused too; that key
+appeared only in this release's development and is removed.
+
+### Added
+
+- `newgit merge` merges tracker by tracker when an instance changed only
+  pins in root. That keeps working when root's history does not descend
+  from the instance's, as after a roll-up that could not keep the merge's
+  own commit.
+- The remote sweeps each project within the hour of a landing. It rolls up
+  what nobody has read yet and clears the landing refs that merges leave
+  behind.
+- A merge sends its commits to the remote in parallel.
+
+- A tracker carved inside a mounted tracker in Git is now that tracker's
+  child ([#201](https://github.com/Spheroman/newgit/issues/201)).
+
+  `newgit tracker create vendored --git --path apps/t3code/.repos` defines
+  it in `apps/t3code/.newgit/trackers/`, and `t3code`'s commits pin it, so a
+  workspace can leave a directory out (`priority = -1`) while the parent's
+  repository stays whole. An export with `root = "t3code"` ships what t3code
+  mounts, where it used to be refused or lose those files: the only
+  difference on the fork is the one definition file. `newgit pull --remote`
+  splits what comes back, so an upstream change under a child's mount
+  reaches the child rather than sitting hidden in the parent. The remote
+  reads these definitions from the parent, whose maintainers govern them;
+  `access` keeps any name it has a file for. The remote has to be deployed
+  before a project merges one.
+
+  A child is bound only where its parent is: dropping the parent drops it,
+  and asking for it brings the parent. With its parent bound, its own
+  `priority` decides, so `-1` keeps it out until asked for.
+
+  This replaces the decision that such a tracker is a deeper mount of
+  root's. A tracker carved that way before this release keeps working as
+  one.
+
+- A tracker's definition can say `pinned = true`
+  ([#201](https://github.com/Spheroman/newgit/issues/201)). Its parent then
+  holds it where it is: a change to it never rolls up into the parent by
+  itself. Moving its pin is a change to the parent, approved by the parent's
+  maintainers, and rolling back is a revert. It's for what must not move on
+  its own, like a private dependency or `/env/prod`.
+  - `newgit status` says when a pinned tracker's own `main` has moved past
+    its pin.
+
+- `newgit status` says what the remote hasn't written down yet: changes
+  landed below a tracker that hasn't rolled up to them, and why its last
+  roll-up failed
+  ([#201](https://github.com/Spheroman/newgit/issues/201)). It also says
+  which webhook pulls are waiting or failing, and which were refused or
+  given up. It prints this only when there is something, and asks the
+  remote for no more than three seconds. `newgit remote show` always shows
+  it, along with the last webhook pull.
+- A change merged on a GitHub mirror lands on the remote at its anchor, as
+  `newgit merge` does, rather than always at root.
+
+- One tracker in two roots: `link = "<owner>/<project>[/<path>]"` in a
+  tracker's definition, written by `newgit tracker link <name> <home>
+  --mount <path>`
+  ([#201](https://github.com/Spheroman/newgit/issues/201)).
+
+  A linked tracker is its home's: one history, one repo, one `main`, and
+  the home's policy, judged by membership there. Each root that links it
+  pins its own commit of it, and a change merged from any of them lands at
+  the home and rolls up in all of them. See docs/design/trackers.md,
+  *Links*, for what is clean and what is not yet.
+
+- A tracker is named by its path, read as a filesystem reads one
+  ([#201](https://github.com/Spheroman/newgit/issues/201)).
+
+  A child's name is local to its parent, as a file's is to its directory:
+  `newgit tracker create repos --git --path apps/t3code/.repos` makes
+  `t3code/repos`, and two parents can each have a `docs`. Commands take a path
+  from where they run: at the top of a project that is `t3code/repos`, inside
+  `apps/t3code` it is `repos`, `..` goes up, and a leading `/` starts from the
+  top of the one namespace, `/remote/<owner>/<project>/t3code/repos`, or
+  `/user/<project>/...` for a project on no remote. `tracker list` shows what
+  is here. A name is never looked for further up, so it means one thing
+  wherever it is typed. `requires` in a nested definition, and `root` and
+  `trackers` in an export target, take paths too. `__` is reserved in a
+  tracker's name, and a name cannot start or end with `_`.
+
+- `newgit serve` runs a newgit remote as one binary: Git repositories on
+  the machine's own disk, project state in one SQLite database, and the
+  same API newgit.dev answers, so the CLI works against either
+  ([#344](https://github.com/Spheroman/newgit/issues/344)).
+
+  The Worker's slowness was mostly Artifacts and the hops around it. On one
+  machine, without them, `remote add` takes 0.85 s (9.4 s on newgit.dev),
+  a plain `git clone` 0.4 s, a checkpoint and push 1.7 s (15 s), a merge
+  1.2 s (6.4 s), and `spawn --from-checkpoint` 1.1 s (8.4 s). Those are
+  local numbers, with no internet round trips. A fork is a Git namespace
+  inside the tracker's repo, so making one costs nothing, and the
+  password for every repo is the caller's own newgit token, checked on
+  each request. It does not take GitHub webhooks yet, and newgit.dev still
+  runs on the Worker until moving its data across is designed and tested.
+
+- A dev remote for trying remote changes before they merge: `newgit-dev`
+  on workers.dev, with its own Artifacts namespace, Durable Objects, and
+  container.
+  - `remote/scripts/dev.sh` deploys the working tree in about a minute. It
+    reuses prod's newest container image, so it needs no Docker.
+  - `remote/scripts/dev-login.sh` logs in without a browser, through a
+    route that only the dev remote answers.
+
+- Git requests to a remote say where their time went, in a `Server-Timing`
+  header: `GIT_TRACE_CURL=1 git ls-remote origin` shows the time in each stage
+  and how many Artifacts calls the request made. Durations and counts only.
+
+- Tags reach the remote, and come back from it.
+
+  The remote kept no tags: a release tagged on GitHub never reached a clone
+  of newgit.dev, and `git push origin v1` from a linked project root was
+  refused. A tag is now a name for one root commit on `main`, frozen with
+  what it pins, as a checkpoint is.
+  - `git push origin main v1.0` (or `--follow-tags`) in a linked project root
+    tags that point on the remote, then on each export target, each at its
+    own view of the commit. An annotated tag keeps its tagger and message;
+    its signature, which covers one object, does not carry.
+  - The Git endpoint serves tags as `refs/tags/<name>`, composed for each
+    reader as branches are, so `git fetch` brings them.
+  - A tag made on a mirror, as a GitHub release makes one, comes back
+    through the webhook at the root commit it names. Our own export of a
+    tag comes back too, and finds it made.
+  - A tag never moves: the same tag again is a retry, another commit is
+    refused. A tag on a commit `main` does not have yet is refused, saying
+    to push `main` with it. Whoever may merge into root makes them.
+  - A tag pushed from a workspace on a newgit remote used to vanish without
+    a word; it is now refused, saying to merge and tag from the project
+    root.
+
+  The remote has to be deployed before a project root pushes a tag. Tags
+  made on GitHub before this release come in when their webhook event is
+  redelivered from the repository's *Recent Deliveries*.
+
+- `newgit tracker list --json` lists every tracker with what a new
+  instance binds by default (`default_bound`) and what this instance binds
+  (`bound`), so a tool can offer the choice `spawn --use`/`--drop` make.
+  T3 Code's new-worktree panel uses it: a checkbox per tracker and a
+  dropdown per role, and its agents choose the same way through MCP.
+
+- newgit.dev has a wiki at [`/docs`](https://newgit.dev/docs), in the
+  landing page's style, and the landing page is its home: both carry the
+  same top bar and sidebar. Its pages are the Markdown in `docs/wiki/`,
+  which replaces `docs/guide.md`: one page per section, readable on GitHub
+  too, and live within a minute of merging. The Worker's `LANDING_PAGE`
+  setting is now `SITE`, which names the landing page, the wiki's
+  directory, and the template its pages are poured into.
+
+
+### Changed
+
+- `newgit merge` sends its commits to the remote before the merge begins
+  ([#201](https://github.com/Spheroman/newgit/issues/201)).
+  - Each commit goes as a thin pack, and the remote pushes it to its landing
+    ref itself.
+  - The remote can therefore read the commits when the merge begins. It
+    asks only the maintainers of what the merge touches, so a change to
+    `t3code` no longer needs root's approval.
+  - It hands out no write passwords: the remote moves every ref.
+  - A pack over 90 MiB, or an older remote, takes the old path.
+
+- Where a tracker ships is now said by its own definition, with `export`,
+  and `.newgit/exports/` is gone
+  ([#201](https://github.com/Spheroman/newgit/issues/201)). A target listed
+  its trackers, so carving a directory out of a mirrored tracker silently
+  dropped it from the mirror until someone added it by hand, which nearly
+  happened to `serve` and `cloudflare`. Now root says
+  `export = { url = "github.com/acme/widget", branches = true }`, a child
+  says `export = "inherit"` to ship wherever its parent ships, a list ships
+  one tracker in several places (`["inherit", "github.com/acme/lib"]`), and
+  no key means it never ships. `tracker create --git --path` writes
+  `"inherit"`, unless the new tracker's audience is narrower than its
+  parent's. A target declared by a tracker other than root is rooted at it.
+  Definitions live in `access`, so widening where anything ships is now an
+  owner's merge.
+
+  Upgrading: move each `.newgit/exports/<name>.toml` into the definitions.
+  A target with `root = "<t>"` becomes `export` in `<t>`'s definition, and
+  `"inherit"` goes on every tracker it mounts; a target listing `trackers`
+  becomes `export` in root's and `"inherit"` in each other one. `url`,
+  `branch` and `branches` move as they are. A target is named after its
+  repository now; add `name = "github"` to keep an old name. A bare
+  `owner/repo` URL is refused: write `github.com/owner/repo`. A
+  `public` tracker no longer ships just for being public. The GitHub
+  webhook finds its target by the repository the event came from, so its
+  URL needs no `&target=`. The endpoint must be deployed before a project
+  whose definitions say `export` lands anything: older ones refuse the key.
+- A project's tags go only to the export target root declares, never to one
+  rooted at a child tracker. That target is the child's own history with
+  versions of its own (t3code's `v0.1.x`), and a tag never moves, so a
+  project's `v0.9.0` there would take that name from it for good. Tags from
+  such a target were already refused coming in.
+
+- `newgit merge` lands a change at its anchor: the lowest tracker covering
+  everything it touched
+  ([#201](https://github.com/Spheroman/newgit/issues/201)).
+  - A merge that only changes `t3code` no longer moves root. Root rolls up
+    to it afterwards, on the remote, keeping the merge's own commit when
+    nothing landed between.
+  - Two merges at different anchors no longer wait on each other.
+  - Approving a change is up to the maintainers of the trackers it touches.
+    Root's maintainers are no longer asked about a change below root.
+  - Every read of a branch rolls up first. If root can't roll up, the read
+    serves root's last commit and marks the branch `behind`.
+  - `newgit merge` says where the change landed when that's below root.
+
+- Merges and webhook pulls land without a lock
+  ([#201](https://github.com/Spheroman/newgit/issues/201)). A merge pushes
+  its commits to landing refs (`refs/newgit/landing/<commit>`) that nothing
+  reads. The remote then moves the branch's list in one compare-and-swap,
+  and moves the repos' branches itself afterwards with a ref-only push. Two
+  merges can now run side by side: whichever lands second is told `main`
+  moved and merges again. The ten-minute merge lock is gone. A merge that
+  stopped before its finish no longer leaves root's ref ahead of the list.
+  If a child's `main` can't catch up, `merge` says so as a warning, and the
+  merge still stands.
+
+- Every tracker on the remote keeps its own heads and log, in a Durable
+  Object named by its path, such as `spheroman/newgit/t3code/repos`
+  ([#201](https://github.com/Spheroman/newgit/issues/201)). A project's
+  object keeps only what a project owns.
+  - A change to one tracker is one compare-and-swap in that tracker's own
+    object.
+  - A change across several trackers reserves each, then commits them all
+    at once, so no read sees half of it.
+  - Existing projects move over by themselves, the first time each head is
+    read.
+- `git clone https://newgit.dev/<owner>/<name>/<path>.git` clones the view
+  rooted at the tracker at that path, for example `/spheroman/newgit/t3code.git`.
+
+- `git push` stops recomposing the remote's `main` when it has not moved,
+  and stops routing exports when nothing takes branches.
+
+  Whenever the project root held commits the remote had not merged, every
+  push composed all of `main` twice, once in the checkpoint's sync and once
+  in the push. Now the push reads where `main` is from the project record
+  it already fetched, and composes (and fetches trackers) only when that
+  root has moved since the last composition. Export routing returns at
+  once when no target takes branches, and a push routes once instead of
+  twice. `spawn --from-checkpoint` fetches a fork's branch and the
+  checkpoint in one fetch. On the newgit project with `t3code` bound, a
+  push to a local `newgit serve` went from about 5 s to 2.4 s.
+
+- A checkpoint and a merge make fewer, faster requests to the remote.
+  - Every password a checkpoint or merge needs comes in one request
+    (`POST /credentials` with `repos`), minted at once.
+  - The remote reads tracker definitions in parallel and keeps them until a
+    definition holder's `main` moves.
+  - A checkpoint moves the instance's head in the same request.
+  - `newgit` asks who you are and reads the project once per run.
+  - A merge's finish answers as soon as the list lands. The branches follow
+    after the answer, and what can't catch up is logged rather than shown.
+  - A new instance's fork of root starts when the instance is made, so its
+    first checkpoint finds the fork made or under way instead of waiting
+    for the copy.
+
+- Copying refs between the project repo, the tracker store, and a workspace
+  is a ref move when the destination already holds the history, and a
+  fetch only when it does not.
+
+  A `git fetch` between two repos on one machine costs 25–40 ms of process
+  start-up and negotiation even when there is nothing to transfer, and a
+  `spawn` ran three, an `undo` two, one per tracker per landing. Now newgit
+  runs Git's own completeness check and one `update-ref --stdin`, about
+  3 ms, and lands every tracker's branch to the store in one call. Nothing
+  borrows objects (no alternates): each repo still holds a real copy, so a
+  deleted workspace or a `gc` elsewhere cannot take anything away.
+
+  These copies also stop following tags. A project's tag used to land in
+  `.newgit/local/trackers.git` and come back into the project on the next
+  spawn after it was deleted.
+
+- A merge's checks no longer wait on the remote's container. The remote
+  checks the index and where each pin moves itself, reading commits and
+  trees straight from Artifacts. Before, it started the Git endpoint's
+  container and fetched histories, while `newgit merge` asked again every
+  ten seconds. That wait was about 10 of a live merge's 18 seconds. The
+  container still answers when a commit can't be read or a walk runs past
+  200 commits. When it does, a request now waits up to 20 seconds for the
+  answer before saying "still checking".
+
+- The remote keeps each tracker's head as its own record, and logs every move.
+
+  A branch's list was one value, rewritten whole by each merge. It is now built
+  from a head per tracker, and every head that moves is logged with who moved
+  it and when. Nothing a client sees changes: this is the first step of landing
+  at anchors (`docs/design/anchoring.md`). Branches from before are adopted
+  from their lists the first time they are read.
+
+
+### Fixed
+
+- A merge below root now really lands at its anchor. The remote was working
+  out the anchor at `begin`, before the client had sent its commits. It
+  couldn't read them, so every merge landed at root, and two merges begun
+  together still met there. The anchor is now worked out at the finish.
+  `begin` compares the base only for the trackers the merge moves.
+  - Approval is unchanged from before anchors: while `begin` can't read the
+    commits, it still asks root's maintainers.
+
+- Two merges at once, at different anchors, both land and leave `main`
+  whole ([#201](https://github.com/Spheroman/newgit/issues/201)).
+  - Commits that root already has below its head no longer count as a
+    change touching root.
+  - A merge that lands below root waits for root to roll up, then brings
+    root's new head into the project root, so the next spawn has every
+    landing and not just its own.
+  - Two merges from one project root no longer fail on each other's notes
+    or tracking refs.
+
+- After a merge below root, the next merge from the same instance no longer
+  conflicts with `main`. Root's roll-up kept a client's root commit only if
+  it had one parent, so a client's merge commit was replaced by one of the
+  roll-up's own. The merger's history was left off `main`, and the next
+  merge three-wayed against an old base. Root now keeps the merge commit.
+  - Instead, the remote checks every commit a merge brings to a tracker
+    above its anchor, not only the end result. A root file edited and then
+    edited back makes the change root's to approve.
+
+- The `supabase` template's checkpoint and restore pass its own
+  `checkpoint --verify`
+  ([#241](https://github.com/Spheroman/newgit/issues/241)).
+
+  The checkpoint swaps pg_dump's per-run random `\restrict` key for a fixed
+  one, but matched only a line that starts with the backslash, and since
+  CLI 2.41.2 `supabase db dump` writes the pair as SQL comments:
+  `-- \restrict <key>`. The key stayed random, no two checkpoints of one
+  database were the same bytes, and every verify failed. The match now
+  takes the line either way.
+
+  The restore resets the database, which replays the migrations and the
+  seed and creates the buckets `config.toml` declares, and then emptied
+  only `public` before loading the dump. The dump carries `auth` and
+  `storage` too, so a bucket a migration makes or a user the seed makes
+  was already there when the load reached the dump's copy of it, and the
+  INSERT for that table failed on the duplicate key. The CLI writes all of
+  a table's rows in one INSERT, so every bucket or user made since went
+  too, and psql carried on, so the undo reported success. The restore now
+  empties `auth` and `storage` as well, except the migration history the
+  dump never carries (`auth.schema_migrations`, `storage.migrations`). It
+  no longer restarts sequences, which the load sets anyway and which
+  `postgres` does not own in `auth`, and it stops before the load if a
+  truncate fails. Existing resource files copied from the template are not
+  changed — make the same two edits by hand.
+
+- `spawn --from-checkpoint` leaves the new instance's workspace on its own
+  branch again
+  ([#315](https://github.com/Spheroman/newgit/issues/315)).
+
+  Since 0.8.0 a checkpoint records the branch its workspace had checked
+  out, and an undo puts the workspace back on it. The undo that finishes
+  the spawn put the new workspace on the author's branch instead: after
+  `spawn review --from-checkpoint feature-a/ckpt_001`, `review`'s
+  workspace was on `feature-a`, work committed there never reached
+  `review`, and each checkpoint there warned that `review` stayed put.
+  The imported checkpoint now reads as taken on the new instance's
+  branch, so the spawn starts there, as it did before 0.8.0. That holds
+  too when the author's workspace was on another branch, such as
+  `try-x`, or detached: `spawn` makes the new branch at the checkpoint's
+  commit either way.
+
+- A GitHub merge answered 202 always lands or says why it did not
+  ([#353](https://github.com/Spheroman/newgit/issues/353)).
+
+  The queue of webhook pulls is moved on only by the project's alarm, which
+  set its next alarm last. Anything that threw first (a deploy resetting the
+  object mid-step, Artifacts down during the sweep) left the pull queued
+  with nothing to move it, until another event happened to set an alarm,
+  which is why redelivering the event "fixed" it. The alarm is now set
+  before any work, and nothing it runs can stop it. Asking for the
+  project's state, as `newgit status` does, also starts a queue that has
+  none and says it was stalled. A pull that waited two hours without a
+  failed attempt used to be dropped without a word; every pull that ends is
+  now kept, with why. `newgit status` says what a waiting pull waits on and
+  when a failed one is tried again, and every pull refused or given up since
+  its target last landed, until the mirror's commits are on `main`.
+
+- A GitHub merge is no longer refused because GitHub's API could not be
+  reached ([#392](https://github.com/Spheroman/newgit/issues/392)).
+
+  To find whose withheld work a merged commit carries, the webhook asks
+  GitHub which pull request it came from. When that failed, every instance
+  holding withheld work counted, so on 2026-11-09 half an hour of
+  api.github.com being out of reach refused two merges that could lose
+  nothing, telling people to `newgit merge` an instance whose branch was not
+  on GitHub yet. Now only an instance GitHub names counts. Until GitHub
+  answers, the pull waits, asking again with a growing gap, spends no
+  attempt, and `newgit status` says why. After two hours it gives up saying
+  so, and says to redeliver the event or `newgit pull --remote <target>`. A
+  refusal for an instance GitHub did name gives both ways on, not only
+  `newgit merge`. A failed attempt is now retried up to ten times, waiting
+  longer each time (about 45 minutes in all, where five tries used to take
+  about a minute), so a `Network connection lost` from the endpoint during a
+  deploy or an outage is retried until the pull finishes.
+
+- A mirror commit refused for an instance's withheld work is no longer
+  landed by the next GitHub event's pull
+  ([#399](https://github.com/Spheroman/newgit/issues/399)).
+
+  A webhook pull lands every mirror commit beyond `main`, but GitHub was
+  only asked which pull request a commit came from for the commits in that
+  event's own payload. A commit refused once stays on the mirror, so the
+  next push there carried it in unasked, and the instance's work in a
+  tracker the mirror does not ship was lost after all. Now the look the
+  container makes before landing says every commit the pull would bring in,
+  and that whole walk is checked: a GitHub merge commit's subject speaks
+  for itself and the commits it merged, and GitHub is asked about the rest.
+  Later pulls are refused the same way until `newgit merge <instance>` puts
+  the work on `main` (or `newgit pull --remote <target>` lands only what the
+  mirror has); nothing remembers the refusal, so the first pull after that
+  lands. A walk of more than 20 commits no merge commit accounts for gives
+  up at once, as an event of more than 20 commits did.
+
+- After a merge lands below root, the anchor tracker's repo `main` now
+  follows its head on the remote, as root's always did. Before, it moved
+  only when the merging client asked with the right old commit, so a
+  client with a stale view could leave it behind, and the next merge fetched
+  a stale `main`.
+
+- A tracker can no longer be carved around another, and an export no longer
+  loses the files of a tracker mounted inside its root by something else.
+
+  Carved around `lib`, `a` would not hold it, so a view rooted at `a`, and an
+  export of it, silently lacked `apps/a/lib`. Both now refuse, naming the
+  tracker. Found by a new fuzz test of compose and split, which any change to
+  either can run harder with `NEWGIT_FUZZ_SEEDS=500`.
+
+- `newgit checkpoint` no longer reads every tracked file to snapshot
+  uncommitted work.
+
+  The snapshot started from an index with no stat data, so `git add -A`
+  hashed the whole tree. That was invisible at a few hundred files and took
+  seconds once a project held thousands: on newgit with t3code mounted (29,164
+  files), a checkpoint went from 2.3s to 0.45s and `undo` from 2.8s to 0.9s.
+  It now starts from a copy of the real index, so only files that changed
+  are hashed. What a snapshot contains is unchanged.
+
+  `undo` in an instance that leaves a tracker out had the same problem in
+  the tree it restores from, and no longer rehashes either.
+
+- A tracker whose history merges in a large upstream copies into an
+  instance's fork on the remote. Stepping a push past Artifacts' 64 MiB
+  limit went along the first-parent line and never split its last
+  commit, so a merge that brought more than 64 MiB was one push it could
+  not make: copying `t3code` (a "merge upstream" of 1,626 commits) failed
+  after 23 minutes. A merge too big for one push now has its other
+  parents' history sent first, in steps of its own, and the tip is staged
+  like every other commit.
+
+- A step of a stepped push that Artifacts drops with an HTTP 500 is a
+  smaller step, or the same one again, rather than the end of the push.
+  Git says it as `The requested URL returned error: 500`, which newgit did
+  not recognise as a drop, so copying `t3code` into an instance's fork
+  died 43 minutes in. A one-commit step the remote keeps dropping is now
+  tried a few more times before the push gives up.
+
+- A view rooted at a child tracker (`/<owner>/<name>/<child>.git`) now
+  composes the same commits whatever the endpoint composed before it.
+
+  The Worker's endpoint container runs this code, so newgit.dev served
+  rooted views, such as `t3code`'s, that either failed with a 500 (when
+  root's view had been composed first, the child's history was walked from
+  its one-commit-deep snapshots and ended at the cut) or lacked a nested
+  tracker's content at older commits (its pins were looked up as root's,
+  `repos` rather than `t3code__repos`, so they were never fetched). Views
+  already cached on newgit.dev stay wrong until their cache is cleared.
+
+- A branch exported from a workspace keeps the ids of what was merged on a
+  mirror.
+
+  A commit merged on GitHub lands on the remote rebuilt, without GitHub's
+  signature, under a root commit naming the original. A workspace that pulled
+  it split it again, losing that, so every later commit had ids the mirror had
+  never seen, and GitHub showed its pull request as conflicting. Instances now
+  learn what the remote made of `main` before splitting, using the workspace's
+  own token, and say so if they can't.
+
+- `spawn` and `checkpoint` on a project linked to a remote are several seconds
+  faster.
+
+  A spawn fetched every `branches = true` target's exported branch, which for
+  a target rooted at a tracker the instance leaves out is that tracker's whole
+  history: 6.6s of an 8.6s spawn here, for t3code. It now fetches it only when
+  the instance binds that tracker. A checkpoint asked for a credential and
+  pushed every tracker it syncs, changed or not, and asked for a fork it had
+  already made; it now sends only what changed, and the remote reuses a
+  credential it minted. A warm checkpoint went from 8.4s to 3.0s.
+  `NEWGIT_TRACE=1` prints each call to the remote and how long it took.
+
+- `newgit merge` says where a change actually landed. It used to report
+  `begin`'s anchor, which is always root because `begin` can't read the
+  merge's commits yet.
+- Two merges begun at once no longer fail with `cannot copy ...: File
+  exists`. Both of their checks ran `git init` on the same new store in the
+  remote's container. The store is now made beside it and renamed into
+  place.
+
+- `newgit merge main` brings in a tracker in Git that was carved in the
+  project root after it was linked.
+
+  The merge seeded the new tracker's repo with its commit, then uploaded
+  that commit again ahead of the merge. The remote reads each tracker's
+  definition from `access`'s `main`, which has no definition for the new
+  tracker until this merge lands, so it refused the upload (404, "not
+  defined"), and nothing could carve a tracker out of a linked project.
+  Found carving `serve` and `cloudflare` out of newgit's own root.
+
+- A pull request merged on a mirror from a branch made before `main` moved a
+  tracker the mirror withholds now lands, with `main`'s pin. The pull
+  refused it as "merges two lines of `t3code`" unless one side's whole commit
+  was an ancestor of the other, so any pull request branched before a
+  `newgit pull t3code`, a Dependabot bump among them, was refused, and every
+  webhook pull queued behind it waited. It now asks which side changed that
+  tracker since the two forked, as Git's three-way merge would, and refuses
+  only when both did.
+
+- Git requests to a remote reuse a read password for its lifetime, where each
+  request used to mint and record one per tracker, which was most of its time.
+  What a caller may read is still decided on every request.
+
+- `newgit spawn` no longer checks out what the binding leaves out.
+
+  It wrote every file and then deleted the ones the instance does not bind,
+  so leaving a tracker out made a spawn slower than bringing it. The sparse
+  patterns now go in before the first checkout, and on macOS each binding
+  has a template of its own beside `.source-template`. `newgit cleanup`
+  removes a template no live binding uses.
+
+- A tag on a commit of `main` is made, not refused as off `main`.
+
+  The remote asked Artifacts for each branch's head as `refs/heads/main`,
+  which it resolves to nothing, so every branch read as having no head. A
+  tag pushed from the project root, or made by a GitHub release, was
+  refused for every commit, the tip of `main` included, saying to push
+  `main` first. A merge took every pin it moved as off that tracker's
+  `main`: a move along it, root's maintainers' to make, was asked of the
+  tracker's maintainers instead, refusing someone who maintains only root,
+  and the merge was handed a write to the tracker it did not need. Trackers'
+  definitions were read again on every request, never kept. The head is now
+  asked for by the branch's name. A release tagged on GitHub before tags
+  came back from mirrors comes in when its webhook event is redelivered.
+
+
+### Security
+
+- A tracker handed one definition can no longer take `access`'s and lock
+  the project's owner out
+  ([#228](https://github.com/Spheroman/newgit/issues/228)).
+
+  The remote gave a definition file to whichever tracker claimed it most
+  specifically, and a claim is a change only the claimant's governors
+  approve. So a tracker handed `web`'s definition could make `web` claim
+  `access.toml`, write an `access` maintained by them alone, and take
+  every definition in the project, `root`'s included. Governance now only
+  delegates downward: a claim on `<T>.toml` counts only when the claiming
+  tracker's own definition is held by whoever holds `<T>.toml`,
+  `access.toml` is always `access`'s, and no tracker holds its own
+  definition. The remote ignores any other claim. The client refuses a
+  definition claiming `access.toml` or its own, which `newgit` used to
+  accept; move such a claim to another tracker.
+
+- A render no longer writes through a link
+  ([#283](https://github.com/Spheroman/newgit/issues/283)).
+
+  A `[[render]]` wrote this instance's ports and exports into its file in
+  place. It followed a symlink at the path or at a directory above it, and
+  wrote into a hard link there. So once anything put a link there (you, a
+  script, a tool), `resource rebind`, `tracker use`, and the re-render
+  after `undo`, `tracker pull`, or `tracker checkout` rewrote whatever the
+  link pointed at, even a file outside the workspace, and a dangling link
+  created its target. Taking the values back out, before a capture or
+  when a resource is unbound, wrote through a hard link or a symlinked
+  directory the same way. Now the render refuses a symlink at the path or
+  above it before writing any of the resource's files, naming the path,
+  the link, and its target; a link that stays inside the workspace is
+  refused too, since it reaches some other file. A rendered file with more
+  than one name, a hard link, is replaced with a new file rather than
+  written into, so its other names keep what they held; any other is
+  still rewritten in place. If a render now fails on a link you meant,
+  replace the link with the real file or directory, and `newgit resource
+  rebind` renders it again.
+
+
+### Documentation
+
+- The remote's design document now says where governance is read from:
+  each definition holder's `main`, never a branch's own copy, so a branch
+  cannot widen its own audience or maintainers.
+
+  It said "the branch's own `access`", which is not what the Worker or
+  `newgit serve` do, and not what was meant. One consequence: a tracker
+  created in a merge is not known to the remote until that merge lands its
+  definition on `main`.
+
+- `docs/design/landing.md` says how changes will land on `newgit serve`:
+  `merge` lands or doesn't, every view shows it when it returns, refusals
+  name a real conflict, and plain `git push` semantics hold. Every tracker
+  keeps its own history, held in one object store per audience and never in
+  a store shared across audiences. `anchoring.md` now describes the Worker
+  as built. The nixpkgs-scale benchmark behind it, with its independent
+  review, is in `docs/research/nixpkgs-bench.md`.
+
+- The wiki has a page for `newgit serve`: running it, pointing a project at
+  it, and what it does and does not do compared with newgit.dev.
+
 ## [0.9.0] — 2026-11-06
 
 Outside repositories can now be trackers. `newgit tracker create --mount
@@ -3531,7 +4165,8 @@ themselves and neither of which is a reason to re-spawn:
   fresh field it has not. One successful `undo`, or one `newgit checkpoint
   --verify`, clears it for good.
 
-[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/Spheroman/newgit/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/Spheroman/newgit/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/Spheroman/newgit/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/Spheroman/newgit/compare/v0.7.0...v0.8.0
