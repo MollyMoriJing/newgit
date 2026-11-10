@@ -2,5 +2,5 @@
 # through exports/t3code.toml. Each workspace push lands its branch here for
 # `gh pr create`.
 url = "Spheroman/newgit"
-trackers = ["root", "access"]
+trackers = ["root", "access", "serve", "cloudflare"]
 branches = true
