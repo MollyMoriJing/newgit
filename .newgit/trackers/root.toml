@@ -3,3 +3,4 @@ storage = "local"
 merge_with_source = true
 paths = ["."]
 git = true
+export = { url = "github.com/Spheroman/newgit", name = "github", branches = true }

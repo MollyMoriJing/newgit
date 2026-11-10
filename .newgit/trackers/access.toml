@@ -5,3 +5,4 @@ mount = ".newgit/trackers"
 paths = ["."]
 git = true
 maintainers = "owner"
+export = "inherit"

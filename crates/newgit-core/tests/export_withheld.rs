@@ -36,15 +36,12 @@ fn mirrored(temp: &Utf8Path) -> (MetadataStore, Utf8PathBuf, Utf8PathBuf, Utf8Pa
             Some("newgit"),
         )
         .expect("import");
-    define_target(
-        &store,
-        "github",
-        &format!("url = \"{mirror}\"\ntrackers = [\"root\", \"access\"]\n"),
-    );
-    define_target(
+    set_export(&store, "root", Some(&export_to(&mirror, "github", "")));
+    set_export(&store, "access", Some("\"inherit\""));
+    set_export(
         &store,
         "t3code",
-        &format!("url = \"{t3code}\"\nbranch = \"newgit\"\nroot = \"t3code\"\n"),
+        Some(&export_to(&t3code, "t3code", "branch = \"newgit\"")),
     );
     let repo = store.paths().project_root.clone();
     git(&repo, &["add", "-A"]);
@@ -118,11 +115,7 @@ fn a_target_naming_no_trackers_still_ships_the_public_ones() {
             Some("newgit"),
         )
         .expect("import");
-    define_target(
-        &store,
-        "open",
-        &format!("url = \"{mirror}\"\nroot = \"t3code\"\n"),
-    );
+    set_export(&store, "t3code", Some(&export_to(&mirror, "open", "")));
     let repo = store.paths().project_root.clone();
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "target"]);

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{NewgitError, Result};
+use crate::export_target::{ExportEntry, export_value, parse_export};
 
 /// A named, versioned lane of file content. Parsed from
 /// `.newgit/trackers/<name>.toml`; the name comes from the filename.
@@ -71,6 +72,10 @@ pub struct TrackerDefinition {
     pub requires: Vec<String>,
     /// Resources it brings: they bind only while it is bound.
     pub resources: Vec<String>,
+    /// Where it ships (`export`): targets it declares, rooted at it, and
+    /// `"inherit"`, its parent's. Empty means it never ships, which fails
+    /// closed. Only a tracker in Git has one.
+    pub export: Vec<ExportEntry>,
     /// Paths inside this tracker's own that a more specific tracker owns, so
     /// they are not this tracker's to capture, restore, or clear. Computed
     /// from the full set of definitions ([`resolve_ownership`]); not part of
@@ -177,6 +182,8 @@ pub struct TrackerDefinitionFile {
     requires: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     resources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    export: Option<toml::Value>,
 }
 
 /// How a parent records a child rolling up: every change (`commits`, the
@@ -269,6 +276,7 @@ impl TrackerDefinition {
             link: None,
             requires: Vec::new(),
             resources: Vec::new(),
+            export: Vec::new(),
             excluded: Vec::new(),
             parent: None,
             definition_rev: String::new(),
@@ -304,6 +312,7 @@ impl TrackerDefinition {
             link: None,
             requires: Vec::new(),
             resources: Vec::new(),
+            export: Vec::new(),
             excluded: Vec::new(),
             parent: None,
             definition_rev: String::new(),
@@ -355,6 +364,16 @@ impl TrackerDefinition {
             .as_deref()
             .map_or_else(|| Utf8PathBuf::from("."), normalize_path);
         let (paths, exclusions) = place_claims(&mount, &file.paths);
+        let export = match &file.export {
+            None => Vec::new(),
+            Some(value) => {
+                parse_export(value).map_err(|reason| NewgitError::InvalidDefinition {
+                    kind: "tracker",
+                    name: name.to_owned(),
+                    reason,
+                })?
+            }
+        };
         let definition = Self {
             name: name.to_owned(),
             audience: file.audience,
@@ -374,6 +393,7 @@ impl TrackerDefinition {
             link: file.link,
             requires: file.requires,
             resources: file.resources,
+            export,
             excluded: Vec::new(),
             parent: None,
             definition_rev: format!("sha256:{hex}"),
@@ -383,6 +403,13 @@ impl TrackerDefinition {
     }
 
     fn validate(&self) -> Result<()> {
+        if !self.export.is_empty() && !self.git {
+            return Err(self.invalid(
+                "`export` ships it through Git, and a tracker outside Git never leaves this \
+                 machine through Git: drop `export`, or make it `git = true`"
+                    .to_owned(),
+            ));
+        }
         if let Some(link) = &self.link {
             let parts: Vec<&str> = link.split('/').collect();
             if !self.git || parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
@@ -493,6 +520,15 @@ impl TrackerDefinition {
         Ok(())
     }
 
+    /// This definition with `export` set to `entries`.
+    pub fn with_export(&self, entries: Vec<ExportEntry>) -> Result<Self> {
+        let mut updated = self.clone();
+        updated.export = entries;
+        updated.validate()?;
+        updated.definition_rev = updated.compute_definition_rev()?;
+        Ok(updated)
+    }
+
     pub fn with_added_paths(&self, paths: &[Utf8PathBuf]) -> Result<Self> {
         let mut updated = self.clone();
         for path in paths {
@@ -526,6 +562,7 @@ impl TrackerDefinition {
             link: self.link.clone(),
             requires: self.requires.clone(),
             resources: self.resources.clone(),
+            export: export_value(&self.export),
         }
     }
 
@@ -552,6 +589,7 @@ impl TrackerDefinition {
             link: None,
             requires: Vec::new(),
             resources: Vec::new(),
+            export: Vec::new(),
             excluded: Vec::new(),
             parent: None,
             definition_rev: String::new(),
@@ -586,6 +624,7 @@ impl TrackerDefinition {
             link: None,
             requires: Vec::new(),
             resources: Vec::new(),
+            export: Vec::new(),
             excluded: Vec::new(),
             parent: None,
             definition_rev: String::new(),
@@ -648,6 +687,19 @@ impl TrackerDefinition {
             reason,
         }
     }
+}
+
+/// Whether `contents` at `relative` (from the project root) is a definition
+/// exactly as `newgit init` writes it by default: `root`'s or `access`'s, and
+/// nobody's edit. Joining a project may replace such a file, which a copy
+/// that could not join wrote for itself.
+pub fn is_default_definition(relative: &Utf8Path, contents: &str) -> bool {
+    [TrackerDefinition::root(), TrackerDefinition::access()]
+        .iter()
+        .any(|definition| {
+            relative == Utf8Path::new(DEFINITIONS_DIR).join(format!("{}.toml", definition.name))
+                && toml::to_string_pretty(&definition.to_file()).is_ok_and(|text| text == contents)
+        })
 }
 
 /// A tracker path by its components alone, so `./.git`, `.git/` and `.git`
@@ -1052,6 +1104,7 @@ mod tests {
             link: None,
             requires: Vec::new(),
             resources: Vec::new(),
+            export: Vec::new(),
             excluded: Vec::new(),
             parent: None,
             definition_rev: "sha256:000000000000".to_owned(),

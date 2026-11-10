@@ -123,13 +123,12 @@ fn a_branches_target_is_a_remote_for_gh_and_refuses_a_straight_push() {
         &temp,
         &["init", "-q", "--bare", "-b", "main", mirror.as_str()],
     );
-    let dir = fixture.store.join(".newgit/exports");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(
-        dir.join("github.toml"),
-        format!("url = \"{mirror}\"\ntrackers = [\"root\", \"access\"]\nbranches = true\n"),
-    )
-    .expect("write");
+    set_export(
+        &fixture.store,
+        "root",
+        Some(&export_to(&mirror, "github", "branches = true")),
+    );
+    set_export(&fixture.store, "access", Some("\"inherit\""));
     git(&fixture.store, &["add", "-A"]);
     git(&fixture.store, &["commit", "-q", "-m", "target"]);
     fixture.ok(&fixture.store, &["merge", "main"]);
@@ -184,13 +183,8 @@ fn git_pull_brings_in_a_change_that_landed_on_the_mirror() {
         &temp,
         &["init", "-q", "--bare", "-b", "main", mirror.as_str()],
     );
-    let dir = store.join(".newgit/exports");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(
-        dir.join("github.toml"),
-        format!("url = \"{mirror}\"\ntrackers = [\"root\", \"access\"]\n"),
-    )
-    .expect("write");
+    set_export(store, "root", Some(&export_to(&mirror, "github", "")));
+    set_export(store, "access", Some("\"inherit\""));
     git(store, &["add", "-A"]);
     git(store, &["commit", "-q", "-m", "target"]);
     fixture.ok(store, &["merge", "main"]);

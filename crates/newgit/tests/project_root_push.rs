@@ -49,18 +49,13 @@ fn project(temp: &Utf8Path) -> Project {
             upstream.as_str(),
         ],
     );
-    let dir = store.join(".newgit/exports");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(
-        dir.join("github.toml"),
-        format!("url = \"{mirror}\"\ntrackers = [\"root\", \"access\"]\n"),
-    )
-    .expect("write");
-    std::fs::write(
-        dir.join("t3code.toml"),
-        format!("url = \"{t3code}\"\nbranch = \"newgit\"\nroot = \"t3code\"\n"),
-    )
-    .expect("write");
+    set_export(&store, "root", Some(&export_to(&mirror, "github", "")));
+    set_export(&store, "access", Some("\"inherit\""));
+    set_export(
+        &store,
+        "t3code",
+        Some(&export_to(&t3code, "t3code", "branch = \"newgit\"")),
+    );
     git(&store, &["add", "-A"]);
     git(&store, &["commit", "-q", "-m", "targets"]);
     fixture.ok(&store, &["merge", "main"]);

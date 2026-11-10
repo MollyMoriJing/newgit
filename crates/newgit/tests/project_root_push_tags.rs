@@ -1,6 +1,7 @@
 //! Tags from a linked project root: `git push origin <tag>` names a point of
-//! `main` on the remote, then on each export target, composed as that target
-//! sees it. A tag never moves, and it names only what `main` has.
+//! `main` on the remote, then on each export target carrying root's history,
+//! composed as that target sees it. A tag never moves, and it names only what
+//! `main` has.
 //!
 //! New tests live in their own file per AGENTS.md's "Working in parallel".
 
@@ -48,18 +49,13 @@ fn project(temp: &Utf8Path) -> Project {
             upstream.as_str(),
         ],
     );
-    let dir = store.join(".newgit/exports");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(
-        dir.join("github.toml"),
-        format!("url = \"{mirror}\"\ntrackers = [\"root\", \"access\"]\n"),
-    )
-    .expect("write");
-    std::fs::write(
-        dir.join("t3code.toml"),
-        format!("url = \"{t3code}\"\nbranch = \"newgit\"\nroot = \"t3code\"\n"),
-    )
-    .expect("write");
+    set_export(&store, "root", Some(&export_to(&mirror, "github", "")));
+    set_export(&store, "access", Some("\"inherit\""));
+    set_export(
+        &store,
+        "t3code",
+        Some(&export_to(&t3code, "t3code", "branch = \"newgit\"")),
+    );
     git(&store, &["add", "-A"]);
     git(&store, &["commit", "-q", "-m", "targets"]);
     fixture.ok(&store, &["merge", "main"]);
@@ -138,7 +134,7 @@ impl Project {
 }
 
 #[test]
-fn a_tag_pushed_with_main_reaches_the_remote_and_every_target() {
+fn a_tag_pushed_with_main_reaches_the_remote_and_roots_target() {
     let (_guard, temp) = tempdir();
     let project = project(&temp);
     let store = project.fixture.store.clone();
@@ -154,7 +150,8 @@ fn a_tag_pushed_with_main_reaches_the_remote_and_every_target() {
     let said = project.pushed(&store, &["origin", "main", "v1.0.0"]);
     assert!(said.contains("tagged `v1.0.0` on the remote"), "{said}");
     assert!(said.contains("tagged `v1.0.0` on `github`"), "{said}");
-    assert!(said.contains("tagged `v1.0.0` on `t3code`"), "{said}");
+    // `t3code`'s target is rooted at it: its own history, its own versions.
+    assert!(!said.contains("on `t3code`"), "{said}");
 
     let tag = project
         .remote_tag("v1.0.0")
@@ -166,15 +163,12 @@ fn a_tag_pushed_with_main_reaches_the_remote_and_every_target() {
     assert!(tag["list"]["t3code"].is_string(), "{tag}");
     assert!(tag["annotation"].is_null(), "{tag}");
 
-    // Each target has it at its own view of that commit: its branch's tip.
+    // The mirror has it at its own view of that commit: its branch's tip.
     assert_eq!(
         git(&project.mirror, &["rev-parse", "refs/tags/v1.0.0"]),
         git(&project.mirror, &["rev-parse", "main"])
     );
-    assert_eq!(
-        git(&project.t3code, &["rev-parse", "refs/tags/v1.0.0"]),
-        git(&project.t3code, &["rev-parse", "newgit"])
-    );
+    assert_eq!(git(&project.t3code, &["tag", "--list"]), "");
 
     // Pushed again, it is there already: nothing moves, and nothing fails.
     let again = project.pushed(&store, &["origin", "v1.0.0"]);

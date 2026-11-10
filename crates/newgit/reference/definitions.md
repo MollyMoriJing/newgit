@@ -13,8 +13,8 @@ The design narrative — why trackers and resources are the only two
 primitives, what each one is for — lives in `docs/design/spec.md` at
 <https://github.com/Spheroman/newgit>. This page is the lookup table.
 
-Definitions are TOML. The name of a tracker, resource, or export target
-comes from its filename, never from a key inside the file.
+Definitions are TOML. The name of a tracker or resource comes from its
+filename, never from a key inside the file.
 
 Every key below is the complete list for its table: a key newgit does not
 recognize is an error naming the file, the key, and what was expected, never
@@ -27,7 +27,6 @@ whether a lane travels with a merge — both by defaulting, silently.
   config.toml            project settings          committed
   trackers/<name>.toml   tracker definitions       committed; the `access` tracker
   resources/<name>.toml  resource definitions      committed
-  exports/<name>.toml    export targets            committed
   scripts/<name>         scripts hooks call        committed
   pins/<name>            a mounted tracker's commit; in root's history only, never in a workspace
   branches/ checkpoints/ logs/ state/ local/   local, gitignored
@@ -340,7 +339,7 @@ resources = ["staging-tunnel"]
 
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
-| `audience` | string | yes | — | who may read it. `public`, `project-devs`, `user` (each user gets their own copy), or `user:<login>`. Only `public` ships in an `export --to` without an explicit `--include`, or to an export target that does not name it. |
+| `audience` | string | yes | — | who may read it. `public`, `project-devs`, `user` (each user gets their own copy), or `user:<login>`. Only `public` ships in an `export --to` without an explicit `--include`. Where a tracker in Git ships to a remote is `export`'s to say, never its audience's. |
 | `storage` | string | yes | — | `local` or `remote` — where synced state lives. `remote` needs a `[remote]` in `config.toml`; checkpoint sync then pushes the tracker there. |
 | `merge_with_source` | bool | no | `false` | meant to say whether a source merge carries this tracker's state with it. Accepted and stored, but nothing reads it yet: `newgit merge` merges every tracker the instance changed. |
 | `mount` | string | no | `.` | where the tracker's own root sits inside the parent that defines it (`apps/electron`). `.` is an overlay beside the parent's files. A tracker in Git may be mounted at `.newgit/trackers`, beside `access`, to govern the definitions it claims (see `maintainers`); no other mount may reach into `.git` or `.newgit`. A tracker outside Git may have a mount too; it is never pinned. |
@@ -354,6 +353,7 @@ resources = ["staging-tunnel"]
 | `link` | string | no | — | where it lives when it lives in another project on the remote: `"<owner>/<project>"` for that project's root, `"<owner>/<project>/<path>"` for a tracker there. Its history, heads, repo, and policy (audience, maintainers, judged by membership there) are its home's; each root that links it pins its own commit, and a change merged from any of them reaches all of them. Only with `git = true`. Written by `newgit tracker link <name> <home> --mount <path>`. |
 | `requires` | array of strings | no | `[]` | trackers or roles it cannot do without: binding it binds them, and they cannot be dropped while it is bound. |
 | `resources` | array of strings | no | `[]` | resources it brings: they bind only while it is bound. `newgit tracker use` binds and prepares them and starts their `autostart` action; `drop` stops them and releases their binding. |
+| `export` | string, table, or array of those | no | — | where a tracker in Git ships through `newgit export --remote`: a URL it declares (`"github.com/acme/widget"`, or `{ url = …, branch = …, branches = … }`), the target rooted at it; `"inherit"`, wherever its parent ships; or a list of those. Left out, it never ships. `tracker create --git --path` writes `"inherit"`. A tracker outside Git may not have one. See *Export*. |
 | `maintainers` | string | no | its `audience` | who may merge changes to it on a remote: `owner` (the project's owner), `project-devs`, or `user:<login>`. Changing a tracker's definition is changing the tracker that owns its file in `.newgit/trackers/` — `access` unless a tracker in Git mounted beside it at `.newgit/trackers` claims the file — so governance layers: an `admin` tracker with `mount = ".newgit/trackers"` and `paths = ["web.toml"]` decides who changes `web`'s paths, audience, and maintainers. Governance only delegates downward: a claim on `<T>.toml` counts only when the claiming tracker's own definition is held by whoever holds `<T>.toml`, and no tracker may claim `access.toml` or its own definition (refused here; ignored by the remote). |
 
 The paths of a tracker outside Git stay out of Git: `newgit tracker track` adds them to
@@ -1602,39 +1602,64 @@ service and your tool insists on `PORT` — the generated file says so.
 
 ---
 
-## Export — `.newgit/exports/<name>.toml`
+## Export — `export` in a tracker's definition
 
 Somewhere `newgit export --remote <name>` pushes: an ordinary Git
 repository, usually a GitHub mirror, that receives the trackers' `main`s
 composed into one history. Real authors, dates, and messages, so the result
 is an ordinary repository that `git clone`, `gh`, and GitHub's UI read like
-any other. Write one by hand; one file per target, so a public mirror and a
-private one can each show a different view of the same project. A target
-may not be named `origin`, since its name is also a remote's in each
-workspace.
+any other. Where a tracker ships is its own definition's to say, with
+`export`; definitions live in `access`, so widening where something ships
+takes an owner's merge.
 
 ```toml
-# .newgit/exports/github.toml
-url = "acme/widget"
-trackers = ["root"]
+# .newgit/trackers/root.toml — the project's mirror
+export = { url = "github.com/acme/widget", branches = true }
+
+# .newgit/trackers/web.toml — carved out of root, so it ships inside root's
+# mirror (`newgit tracker create web --git --path apps/web` writes this)
+export = "inherit"
+
+# .newgit/trackers/lib.toml — inside the mirror, and on its own
+export = ["inherit", "github.com/acme/lib"]
+
+# .newgit/trackers/runtime-env.toml — no `export`: it never ships
 ```
+
+An entry is one of:
+
+- **`"inherit"`**: wherever the parent ships — one place, several, or none.
+  The parent is the tracker that defines this one: root, for what
+  `.newgit/trackers/` holds; `t3code`, for what `t3code`'s own
+  `.newgit/trackers/` holds. Root has no parent, so it cannot inherit.
+- **A URL**, or **a table** with `url` and these keys, declaring a target
+  rooted at this tracker:
 
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
-| `url` | string | yes | — | where to push. `owner/repo` means `https://github.com/owner/repo.git`; anything else (an `https://` or `git@` URL, a path) is used as written. Pushed with plain `git push`, so your own Git credentials apply (`gh auth setup-git` sets them up for GitHub). |
+| `url` | string | yes | — | where to push. `<host>/<path>` (`github.com/acme/widget`) means `https://<host>/<path>.git`; anything else (an `https://` or `git@` URL, a path) is used as written. A bare `acme/widget` is refused, since it could be a directory. Pushed with plain `git push`, so your own Git credentials apply (`gh auth setup-git` sets them up for GitHub). |
 | `branch` | string | no | `main` | the branch the export is pushed to. |
-| `trackers` | array of strings | no | `[]` | exactly the trackers in Git to ship, of any audience; left out, the `public` ones ship. A tracker outside Git here is an error: what it owns (a `.env`, say) never leaves through Git. |
 | `branches` | bool | no | `false` | also export each instance's branch, every time its workspace pushes, so a pull request can be opened against the target (see below). |
-| `root` | string | no | — | export the view rooted at this tracker in Git instead of the project's: its own files at the top, and its own history, ids and signatures intact. For a fork that keeps its files at the repository root (see *Rooted at a tracker*). Cannot be set with `trackers`. |
+| `name` | string | no | the repository's name | the target's name: `--remote` takes it, and it is the target's remote in each workspace, so it may not be `origin`. `github.com/acme/widget` is `widget`. |
 
-What ships fails closed. A target naming no `trackers` ships only those whose
-audience is `public`, and `root` and `access` are `project-devs`. A target
-naming them ships exactly those: a `public` tracker it leaves out stays out.
-So `trackers = ["root"]` mirrors the project's code and its `.newgit/`
-(config, resources, scripts, export targets) without `.newgit/trackers/`,
-and adding `"access"` mirrors the definitions too. A path owned by a tracker
-that does not ship stays out of every exported commit, with its pin and its
-history, and a commit that only moved its pin is not exported at all. A
+What ships fails closed. A target ships the tracker declaring it and every
+tracker below it that inherits its export, all the way up; nothing else. A
+target root declares is the project's own view, so `export` on root alone
+mirrors the project's code and its `.newgit/` (config, resources, scripts)
+without `.newgit/trackers/`, and `export = "inherit"` on `access` mirrors the
+definitions too. A target declared by any other tracker is rooted at it (see
+*Rooted at a tracker*). Its options (`branch`, `branches`, `name`) live
+where its URL is declared: a tracker that inherits shares that one target,
+so it has none of its own, and two targets declared by one tracker show the
+same trackers. One repository is one target, so declaring a URL twice is
+refused; ship inside it with `"inherit"`.
+
+A path owned by a tracker that does not ship stays out of every exported
+commit, with its pin and its history, and a commit that only moved its pin
+is not exported at all. A tracker that inherits a target whose declaring
+tracker's audience is wider than its own (and it is not `public`) refuses
+the export, naming it, rather than send it past its audience; `tracker
+create --git --path` writes no `export` for such a tracker, and says so. A
 history that ever adds a path a tracker outside Git owns, such as a `.env`
 committed before it was tracked, refuses the whole export before anything
 is pushed.
@@ -1677,21 +1702,26 @@ the next time newgit syncs the project root.
 its branch does what `newgit merge main` and then `newgit export --remote
 <target>` do by hand, for each target whose view of `main` moved since the
 last export, each getting only its own trackers. So one push with changes in
-root and under a mount updates a mirror and a `root` target together. A
+root and under a mount updates a mirror and a rooted target together. A
 refused merge fails the push, with its own message, and nothing is exported.
 A merge that landed stays: if an export then fails, the push fails, saying
 which `newgit export --remote <target>` to rerun, and `git push` again retries
 it. A push does not pull, so a target that is ahead fails with the `newgit
 pull --remote` to run. Any other branch is refused: spawn an instance.
 
-### Rooted at a tracker: `root`
+A tag pushed with it (`git push origin main v1.0`) is made on the remote,
+then on the target root declares, at its view of the commit. A target
+declared by any other tracker gets no tags: it is that tracker's own
+history, with versions of its own, and a tag never moves.
+
+### Rooted at a tracker
 
 ```toml
-# .newgit/exports/t3code.toml
-url = "Spheroman/t3code"
-branch = "newgit"
-root = "t3code"
-branches = true
+# .newgit/trackers/t3code.toml
+export = { url = "github.com/Spheroman/t3code", branch = "newgit", branches = true }
+
+# t3code's own .newgit/trackers/repos.toml: ships inside t3code's
+export = "inherit"
 ```
 
 The export is the tracker's own `main`, composed rooted at it, so its files
@@ -1699,8 +1729,10 @@ sit at the top. While it mounts no tracker in Git, that is its history as it
 is: a tracker imported with `newgit tracker create t3code --git --mount
 apps/t3code --from <url>` exports as a no-op fast-forward of where it came
 from, and commits made here go out as the tracker commits they were split
-into. Once it mounts a tracker in Git its view is no longer its own history,
-and the export is refused, naming the child. With `branches = true` each
+into. A tracker it mounts ships with it when that tracker inherits its
+export; one that does not is left out. A tracker mounted inside it but
+defined elsewhere could never inherit its export, so the export is refused,
+naming it, rather than lose its files. With `branches = true` each
 instance's branch of the tracker is pushed, and `gh` resolves to the target
 when the instance's work touched that tracker.
 
@@ -1734,7 +1766,7 @@ that gap:
   none of them.** Only the targets that ship a tracker the work touched get
   the branch. When more than one does, the push names the command to run for
   each: `gh pr create -R <repo> --head <branch>`, `<repo>` being the
-  target's `url`. Before any work, and when no target ships a tracker the
+  target's `url` (`gh` takes `github.com/<owner>/<repo>` as it is). Before any work, and when no target ships a tracker the
   work touched, every `branches = true` target takes the branch, and `gh`
   resolves the target only if it is the sole one.
 - **Pushing to the target's remote directly is refused**, naming `git push

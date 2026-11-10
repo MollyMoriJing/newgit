@@ -6,13 +6,18 @@ reported; `--include <path>` overrides. It writes one commit, not history,
 because exporting the branch's commits would carry any file they contain —
 including withheld ones. This is a path-level filter, not concealment.
 
-**GitHub stays where it is.** `newgit export --remote github` pushes a
-composed history to an ordinary repository defined in
-`.newgit/exports/github.toml` (`url = "acme/widget"`, `trackers =
-["root"]`). A target ships exactly the trackers it names, or the `public`
-ones if it names none, so a
-public mirror and a private one can show different views, and a history that
-ever committed the file of a tracker outside Git is refused. Exporting again
+**GitHub stays where it is.** `newgit export --remote widget` pushes a
+composed history to an ordinary repository that a tracker's own definition
+declares: `export = "github.com/acme/widget"` in
+`.newgit/trackers/root.toml`. A tracker with `export = "inherit"` ships
+wherever its parent ships, and one with no `export` never ships, so what
+leaves fails closed. `newgit tracker create --git --path <dir>` writes
+`"inherit"` for you, so carving a directory out never drops it from a
+mirror. A target declared by a tracker other than root is rooted at it (its
+files at the top), so a library can ship inside the project's mirror and on
+its own (`export = ["inherit", "github.com/acme/lib"]`). Definitions live in
+`access`, so widening where anything ships takes an owner's merge. A history
+that ever committed the file of a tracker outside Git is refused. Exporting again
 fast-forwards, after bringing in whatever was merged on the target since,
 and the push uses your own Git credentials, so `gh`, GitHub
 Actions, and anyone cloning from GitHub keep working. With `branches =
@@ -22,9 +27,13 @@ an agent's `git push` then `gh pr create` opens a real pull request.
 
 **Tags are the project's.** On a newgit remote, `git tag v1.0 && git push
 origin main v1.0` (or `git push --follow-tags`) in the project root names
-that point of `main` on the remote, then on each export target, each at its
-own view of the commit; a GitHub release made on a mirror comes back as the
-same tag. `git fetch` brings tags from the remote like any other. A tag
+that point of `main` on the remote, then on each export target carrying
+root's history (the one root declares), at its view of the commit; a GitHub
+release made on a mirror comes back as the same tag. A target declared by a
+child tracker (t3code's fork) gets none: it has versions of its own, and a
+tag never moves, so the project's `v0.9.0` there would take that name from
+it for good. Tags coming in from such a target are refused for the same
+reason. `git fetch` brings tags from the remote like any other. A tag
 never moves, and names only what `main` has: tag from the project root once
 the work is merged, not from a workspace.
 

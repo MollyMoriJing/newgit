@@ -954,8 +954,8 @@ pub struct PullPlan {
     pub list: BTreeMap<String, String>,
     /// The trackers this event may change: what whoever merged it maintains.
     pub writable: Vec<String>,
-    /// The export target: `.newgit/exports/<target>.toml` at `list`'s root
-    /// commit says which trackers the mirror ships.
+    /// The export target, by name: the definitions at `list` declare it, and
+    /// say which trackers the mirror ships.
     pub target: String,
     pub mirror: Mirror,
     /// Instances whose work in a tracker the mirror withholds may be behind
@@ -1084,7 +1084,7 @@ fn land(plan: &PullPlan, store: &Utf8Path) -> Result<PullAnswer> {
         tree
     };
     let all = compose::view_definitions(store, ROOT_TRACKER, &main_tree)?;
-    let target = read_target(store, base, &plan.target)?;
+    let target = read_target(&all, &plan.target)?;
     if let Some(root) = &target.root {
         return Err(NewgitError::Unsupported(format!(
             "`{}` is rooted at `{root}`: its commits are that tracker's own, and `newgit pull \
@@ -1097,14 +1097,8 @@ fn land(plan: &PullPlan, store: &Utf8Path) -> Result<PullAnswer> {
         tracked
             .iter()
             .find(|definition| definition.name == name)
-            .is_some_and(|definition| target.lists(&definition.name, &definition.audience))
+            .is_some_and(|definition| target.ships(&definition.name))
     };
-    if !ships(ROOT_TRACKER) {
-        return Err(NewgitError::Unsupported(format!(
-            "`{}` does not ship `{ROOT_TRACKER}`, so its commits are not this project's",
-            target.name
-        )));
-    }
 
     // `main` as the target sees it: composing is deterministic, so a commit
     // that came from here is in this history under the very id it has there.
@@ -1381,7 +1375,7 @@ fn find_tag(plan: &PullPlan, store: &Utf8Path, name: &str) -> Result<PullAnswer>
         tree
     };
     let all = compose::view_definitions(store, ROOT_TRACKER, &main_tree)?;
-    let target = read_target(store, base, &plan.target)?;
+    let target = read_target(&all, &plan.target)?;
     if let Some(root) = &target.root {
         return Err(NewgitError::Unsupported(format!(
             "`{}` is rooted at `{root}`: its tags name that tracker's commits, not the project's",
@@ -1391,7 +1385,7 @@ fn find_tag(plan: &PullPlan, store: &Utf8Path, name: &str) -> Result<PullAnswer>
     let ships = |tracker: &str| {
         all.iter()
             .find(|definition| definition.git && definition.name == tracker)
-            .is_some_and(|definition| target.lists(&definition.name, &definition.audience))
+            .is_some_and(|definition| target.ships(&definition.name))
     };
     let histories = tracker_histories(store, plan.repos.keys());
     let admit = |tracker: &str, commit: &str| {
@@ -1468,17 +1462,14 @@ pub fn parse_annotation(text: &str, name: &str) -> Result<TagAnnotation> {
     })
 }
 
-/// Export target `name` as root commit `root` defines it.
-fn read_target(store: &Utf8Path, root: &str, name: &str) -> Result<ExportTarget> {
-    let path = format!(".newgit/exports/{name}.toml");
-    let text = run_git_env(
-        &[
-            &format!("--git-dir={store}"),
-            "show",
-            &format!("{root}:{path}"),
-        ],
-        &[],
-    )
-    .map_err(|_| NewgitError::Unsupported(format!("root's `main` has no `{path}`")))?;
-    ExportTarget::from_text(name, Utf8Path::new(&path), &text)
+/// Export target `name` as `main`'s definitions declare it.
+fn read_target(all: &[TrackerDefinition], name: &str) -> Result<ExportTarget> {
+    crate::export_target::resolve_targets(all)?
+        .into_iter()
+        .find(|target| target.name == name)
+        .ok_or_else(|| {
+            NewgitError::Unsupported(format!(
+                "no tracker on `main` declares export target `{name}`"
+            ))
+        })
 }

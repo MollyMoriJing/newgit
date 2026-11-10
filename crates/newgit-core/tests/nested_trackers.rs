@@ -36,10 +36,10 @@ fn imported(temp: &camino::Utf8Path) -> (MetadataStore, Utf8PathBuf, Utf8PathBuf
     let github = github_copy(temp, &upstream, TARGET);
     import(&store, &upstream);
     manager(&store).merge("main", "main").expect("publish");
-    define_target(
+    set_export(
         &store,
-        TARGET,
-        &format!("url = \"{github}\"\nbranch = \"newgit\"\nroot = \"t3code\"\n"),
+        "t3code",
+        Some(&export_to(&github, TARGET, "branch = \"newgit\"")),
     );
     (store, upstream, github)
 }
@@ -123,7 +123,7 @@ fn an_export_rooted_at_the_parent_still_holds_the_child() {
         .iter()
         .find(|tracker| tracker.name == "t3code__repos")
         .expect("the report names the child");
-    assert_eq!(child.reason, ExportReason::Mounted);
+    assert_eq!(child.reason, ExportReason::Inherited);
     assert_eq!(
         child.commit.as_deref(),
         Some(tracker_main(&store, "t3code__repos").as_str()),
@@ -373,11 +373,8 @@ fn a_target_that_does_not_ship_the_parent_leaves_the_child_out_too() {
     carve(&store);
     let mirror = temp.join("mirror.git");
     git(&temp, &["init", "-q", "--bare", mirror.as_str()]);
-    define_target(
-        &store,
-        "mirror",
-        &format!("url = \"{mirror}\"\nbranch = \"main\"\ntrackers = [\"root\", \"access\"]\n"),
-    );
+    set_export(&store, "root", Some(&export_to(&mirror, "mirror", "")));
+    set_export(&store, "access", Some("\"inherit\""));
     manager(&store)
         .export_to_remote("mirror", RemoteExportOptions::default())
         .expect("export");
@@ -1062,24 +1059,6 @@ fn a_nested_requires_names_a_sibling_as_a_path() {
         .find(|definition| definition.name == "t3code__needs")
         .expect("needs");
     assert_eq!(needs.requires, ["t3code__vendor", "../site"]);
-}
-
-/// An export file says `t3code/repos`, not an id.
-#[test]
-fn an_export_target_names_trackers_as_paths() {
-    let (_guard, temp) = tempdir();
-    let (store, _, _) = imported(&temp);
-    define_target(
-        &store,
-        "paths",
-        "url = \"/nowhere\"\nbranch = \"main\"\ntrackers = [\"root\", \"t3code/repos\"]\n",
-    );
-    let targets = store.load_export_targets().expect("targets");
-    let target = targets
-        .iter()
-        .find(|target| target.name == "paths")
-        .expect("target");
-    assert_eq!(target.trackers, ["root", "t3code__repos"]);
 }
 
 /// Found by the fuzz test: carved the other way round, the inner tracker stays

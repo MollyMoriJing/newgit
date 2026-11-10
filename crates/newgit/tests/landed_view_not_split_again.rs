@@ -27,13 +27,12 @@ fn mirrored(fixture: &Fixture) -> Utf8PathBuf {
         &fixture.temp,
         &["init", "-q", "--bare", "-b", "main", github.as_str()],
     );
-    let dir = fixture.store.join(".newgit/exports");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(
-        dir.join("github.toml"),
-        format!("url = \"{github}\"\nbranches = true\ntrackers = [\"root\", \"access\"]\n"),
-    )
-    .expect("write");
+    set_export(
+        &fixture.store,
+        "root",
+        Some(&export_to(&github, "github", "branches = true")),
+    );
+    set_export(&fixture.store, "access", Some("\"inherit\""));
     git(&fixture.store, &["add", "-A"]);
     git(&fixture.store, &["commit", "-q", "-m", "export target"]);
     fixture.ok(&fixture.store, &["merge", "main"]);

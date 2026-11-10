@@ -4,9 +4,9 @@
 //! resolves neither, and the push names the `gh pr create -R <repo> --head
 //! <branch>` to run for each. A direct push to a target stays refused.
 //!
-//! The project has two trackers in Git: `root` (the project's code, shipped by
-//! `code`) and `b` (`apps/b`, which `apps-b` exports as its own root, #141:
-//! `b`'s files at the top). A bare repository stands in for each GitHub repo.
+//! The project has two trackers in Git: `root` (the project's code, which
+//! declares `code`) and `b` (`apps/b`, which declares `apps-b`, rooted at it,
+//! #141: `b`'s files at the top). A bare repository stands in for each GitHub repo.
 //!
 //! New tests live in their own file per AGENTS.md's "Working in parallel".
 
@@ -23,31 +23,24 @@ fn bare(fixture: &Fixture, name: &str) -> Utf8PathBuf {
     repo
 }
 
-fn define(fixture: &Fixture, name: &str, repo: &Utf8Path, trackers: &[&str]) {
-    let trackers: Vec<String> = trackers.iter().map(|t| format!("\"{t}\"")).collect();
-    write_target(
-        fixture,
-        name,
-        &format!(
-            "url = \"{repo}\"\nbranches = true\ntrackers = [{}]\n",
-            trackers.join(", ")
-        ),
+/// Root's target `name`, with `branches = true`, which `access` inherits.
+fn define(fixture: &Fixture, name: &str, repo: &Utf8Path) {
+    set_export(
+        &fixture.store,
+        "root",
+        Some(&export_to(repo, name, "branches = true")),
     );
+    set_export(&fixture.store, "access", Some("\"inherit\""));
 }
 
-/// A target that exports tracker `root` as its own root.
+/// A target rooted at `root`, its own files at the top. Carving wrote
+/// `export = "inherit"`; this replaces it, so `code` does not ship it.
 fn define_rooted(fixture: &Fixture, name: &str, repo: &Utf8Path, root: &str) {
-    write_target(
-        fixture,
-        name,
-        &format!("url = \"{repo}\"\nbranches = true\nroot = \"{root}\"\n"),
+    set_export(
+        &fixture.store,
+        root,
+        Some(&export_to(repo, name, "branches = true")),
     );
-}
-
-fn write_target(fixture: &Fixture, name: &str, text: &str) {
-    let dir = fixture.store.join(".newgit/exports");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(dir.join(format!("{name}.toml")), text).expect("write");
 }
 
 /// A tracker in Git `b` owning `apps/b`: carving it is a commit of its own.
@@ -67,7 +60,7 @@ fn two_targets(fixture: &Fixture) -> (Utf8PathBuf, Utf8PathBuf, Utf8PathBuf) {
     with_tracker_b(fixture);
     let code = bare(fixture, "code");
     let apps = bare(fixture, "apps-b");
-    define(fixture, "code", &code, &["root", "access"]);
+    define(fixture, "code", &code);
     define_rooted(fixture, "apps-b", &apps, "b");
     git(&fixture.store, &["add", "-A"]);
     git(&fixture.store, &["commit", "-q", "-m", "export targets"]);
@@ -116,7 +109,7 @@ fn one_target_is_the_one_gh_resolves() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
     let github = bare(&fixture, "github");
-    define(&fixture, "github", &github, &["root", "access"]);
+    define(&fixture, "github", &github);
     fixture.ok(&fixture.store, &["spawn", "feature-a"]);
     let workspace = workspace_of(&fixture, "feature-a");
     assert_eq!(resolved(&workspace, "github").as_deref(), Some("base"));

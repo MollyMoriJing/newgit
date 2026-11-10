@@ -77,7 +77,6 @@ describe("what gets in", () => {
 	it("ignores a rooted target: its commits are its tracker's", async () => {
 		const answer = await deliver({
 			payload: push({ repository: { full_name: "Spheroman/t3code" } }),
-			query: `project=jack/${name}&target=t3code`,
 		});
 		expect(answer.status).toBe(200);
 		expect(answer.body.ignored).toContain("rooted");
@@ -91,10 +90,22 @@ describe("what gets in", () => {
 	});
 
 	it("says what is wrong with the URL", async () => {
-		expect((await deliver({ query: "target=github" })).status).toBe(400);
-		expect((await deliver({ query: `project=jack/${name}` })).status).toBe(400);
-		expect((await deliver({ query: `project=jack/${name}&target=nope` })).status).toBe(404);
-		expect((await deliver({ query: "project=jack/nobody&target=github" })).status).toBe(404);
+		expect((await deliver({ query: "" })).status).toBe(400);
+		expect((await deliver({ query: "project=jack/nobody" })).status).toBe(404);
+	});
+
+	it("finds the target by the repo, whatever the URL's old `target` says", async () => {
+		setAnswers([{ outcome: "nothing" }]);
+		const answer = await deliver({ query: `project=jack/${name}&target=nope` });
+		expect(answer.status).toBe(202);
+		expect(plans[0].target).toBe("github");
+	});
+
+	it("ignores a repo no tracker exports to once its export is gone", async () => {
+		repos.write(`jack.${name}.t.access`, "root.toml", 'audience = "project-devs"\ngit = true\n');
+		const answer = await deliver();
+		expect(answer.status).toBe(403);
+		expect(await stub().pulls()).toEqual([]);
 	});
 
 	it("refuses a private mirror, which the endpoint cannot read", async () => {
@@ -262,7 +273,7 @@ describe("the signature and the repo", () => {
 
 	it("reads a target's URL the way an export does", () => {
 		for (const url of [
-			"Spheroman/newgit",
+			"github.com/Spheroman/newgit",
 			"https://github.com/Spheroman/newgit",
 			"https://github.com/Spheroman/newgit.git",
 			"git@github.com:Spheroman/newgit.git",
@@ -270,5 +281,7 @@ describe("the signature and the repo", () => {
 			expect(githubRepo(url)).toBe("spheroman/newgit");
 		expect(githubRepo("https://gitlab.com/Spheroman/newgit.git")).toBeNull();
 		expect(githubRepo("../mirror.git")).toBeNull();
+		// `owner/repo` alone could be a path: the client refuses it.
+		expect(githubRepo("Spheroman/newgit")).toBeNull();
 	});
 });

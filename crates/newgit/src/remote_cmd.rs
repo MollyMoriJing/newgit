@@ -741,7 +741,11 @@ fn join_from(
         } else if std::fs::symlink_metadata(root.join(at)).is_ok() {
             let blob = meta.split_whitespace().nth(2).unwrap_or_default();
             let hashed = in_root(&["hash-object", "--", path])?;
-            if String::from_utf8_lossy(&hashed.stdout).trim() != blob {
+            // A definition this copy's own `init` wrote, untouched, is
+            // newgit's, not someone's work: the project's replaces it.
+            let default = std::fs::read_to_string(root.join(at))
+                .is_ok_and(|text| newgit_core::tracker::is_default_definition(at, &text));
+            if String::from_utf8_lossy(&hashed.stdout).trim() != blob && !default {
                 in_the_way.push(path.to_owned());
             }
         }

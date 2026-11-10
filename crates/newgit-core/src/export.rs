@@ -227,6 +227,7 @@ mod tests {
             link: None,
             requires: Vec::new(),
             resources: Vec::new(),
+            export: Vec::new(),
             excluded: Vec::new(),
             parent: None,
         }

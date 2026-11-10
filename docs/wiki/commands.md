@@ -28,9 +28,9 @@ inside a workspace):
   `--only` restores one resource and leaves everything else alone
 - `newgit export [instance] --to <dir> [--include <path>] [--exclude <path>]`
 - `newgit export --remote <name> [--dry-run] [--force]` — push the trackers'
-  `main`s, history and all, to the target in `.newgit/exports/<name>.toml`
-  (a GitHub mirror, say); exactly the trackers it names, or the `public`
-  ones if it names none
+  `main`s, history and all, to target `<name>` (a GitHub mirror, say), which
+  a tracker's `export` declares: that tracker and every tracker inheriting
+  its export ship, nothing else
 - `newgit cleanup [--dry-run] [--purge-archived]`
 - `newgit ports [--check]` — claimed ports, or detect a listening one nothing
   claims

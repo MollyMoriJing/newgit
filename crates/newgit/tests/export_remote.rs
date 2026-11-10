@@ -1,7 +1,7 @@
 //! `newgit export --remote <name>` (docs/design/trackers.md, step 6): the
 //! trackers' `main`s, composed with their history, pushed to an ordinary Git
-//! repository defined in `.newgit/exports/<name>.toml`. A bare repository
-//! stands in for GitHub.
+//! repository a tracker's definition declares with `export`. A bare
+//! repository stands in for GitHub.
 
 use std::process::{Command, Output};
 
@@ -89,10 +89,32 @@ fn setup(temp: &Utf8Path, files: &[(&str, &str)]) -> Fixture {
     }
 }
 
-fn define(fixture: &Fixture, name: &str, contents: &str) {
-    let dir = fixture.store.join(".newgit/exports");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(dir.join(format!("{name}.toml")), contents).expect("write");
+/// Set tracker `tracker`'s `export` to `export` as written, or take it out
+/// (uncommitted: definitions are read from the working tree).
+fn set_export(fixture: &Fixture, tracker: &str, export: Option<&str>) {
+    let path = fixture
+        .store
+        .join(format!(".newgit/trackers/{tracker}.toml"));
+    let text = std::fs::read_to_string(&path).expect("definition");
+    let mut kept: String = text
+        .lines()
+        .filter(|line| !line.starts_with("export "))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    if let Some(export) = export {
+        kept.push_str(&format!("export = {export}\n"));
+    }
+    std::fs::write(&path, kept).expect("write");
+}
+
+/// Root declares target `name` at `url`; `access` inherits it when `access`.
+fn define(fixture: &Fixture, name: &str, url: &Utf8Path, access: bool) {
+    set_export(
+        fixture,
+        "root",
+        Some(&format!("{{ url = \"{url}\", name = \"{name}\" }}")),
+    );
+    set_export(fixture, "access", access.then_some("\"inherit\""));
 }
 
 fn newgit(dir: &Utf8Path, args: &[&str]) -> Output {
@@ -132,17 +154,16 @@ fn files_at(repo: &Utf8Path, rev: &str) -> Vec<String> {
 }
 
 #[test]
-fn nothing_public_exports_nothing_and_says_how_to_choose() {
+fn no_export_exports_nothing_and_says_how_to_declare_one() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp, &[]);
-    define(
-        &fixture,
-        "github",
-        &format!("url = \"{}\"\n", fixture.mirror),
-    );
 
     let stderr = fails(&fixture.store, &["export", "--remote", "github"]);
-    assert!(stderr.contains("trackers = [\"root\"]"), "{stderr}");
+    assert!(stderr.contains("no tracker declares one"), "{stderr}");
+    assert!(
+        stderr.contains("export = \"github.com/<owner>/github\""),
+        "{stderr}"
+    );
     assert_eq!(
         git(&fixture.mirror, &["for-each-ref"]),
         "",
@@ -154,11 +175,7 @@ fn nothing_public_exports_nothing_and_says_how_to_choose() {
 fn named_trackers_ship_with_their_history_and_others_stay_out() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp, &[]);
-    define(
-        &fixture,
-        "github",
-        &format!("url = \"{}\"\ntrackers = [\"root\"]\n", fixture.mirror),
-    );
+    define(&fixture, "github", &fixture.mirror, false);
 
     let stdout = succeeds(&fixture.store, &["export", "--remote", "github"]);
     assert!(stdout.contains("withheld: access"), "{stdout}");
@@ -184,11 +201,7 @@ fn named_trackers_ship_with_their_history_and_others_stay_out() {
 fn exporting_again_fast_forwards_and_project_root_work_waits_for_merge() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp, &[]);
-    define(
-        &fixture,
-        "github",
-        &format!("url = \"{}\"\ntrackers = [\"root\"]\n", fixture.mirror),
-    );
+    define(&fixture, "github", &fixture.mirror, false);
     succeeds(&fixture.store, &["export", "--remote", "github"]);
     let first = git(&fixture.mirror, &["rev-parse", "main"]);
 
@@ -224,14 +237,7 @@ fn a_tracker_set_that_rewrites_history_needs_force() {
     std::fs::write(fixture.store.join("README.md"), "after\n").expect("write");
     git(&fixture.store, &["commit", "-q", "-am", "after newgit"]);
     succeeds(&fixture.store, &["merge", "main"]);
-    define(
-        &fixture,
-        "github",
-        &format!(
-            "url = \"{}\"\ntrackers = [\"root\", \"access\"]\n",
-            fixture.mirror
-        ),
-    );
+    define(&fixture, "github", &fixture.mirror, true);
     succeeds(&fixture.store, &["export", "--remote", "github"]);
     let before = git(&fixture.mirror, &["rev-parse", "main"]);
     let files = files_at(&fixture.mirror, "main");
@@ -242,12 +248,8 @@ fn a_tracker_set_that_rewrites_history_needs_force() {
         "{files:?}"
     );
 
-    // Without `project` and `access`, the commit after theirs is rebuilt.
-    define(
-        &fixture,
-        "github",
-        &format!("url = \"{}\"\ntrackers = [\"root\"]\n", fixture.mirror),
-    );
+    // Without `access`, the commit after its own is rebuilt.
+    define(&fixture, "github", &fixture.mirror, false);
     let dry = succeeds(
         &fixture.store,
         &["export", "--remote", "github", "--dry-run"],
@@ -281,18 +283,20 @@ fn per_target_views_differ() {
     git(&fixture.store, &["add", ".newgit"]);
     git(&fixture.store, &["commit", "-q", "-m", "add newgit"]);
     succeeds(&fixture.store, &["merge", "main"]);
-    define(
+    // Root's mirror, on `trunk`, without the definitions; and `access`'s own,
+    // rooted at it.
+    set_export(
         &fixture,
-        "public",
-        &format!(
-            "url = \"{}\"\nbranch = \"trunk\"\ntrackers = [\"root\"]\n",
+        "root",
+        Some(&format!(
+            "{{ url = \"{}\", name = \"public\", branch = \"trunk\" }}",
             fixture.mirror
-        ),
+        )),
     );
-    define(
+    set_export(
         &fixture,
-        "private",
-        &format!("url = \"{private}\"\ntrackers = [\"root\", \"access\"]\n"),
+        "access",
+        Some(&format!("{{ url = \"{private}\", name = \"private\" }}")),
     );
     succeeds(&fixture.store, &["export", "--remote", "public"]);
     succeeds(&fixture.store, &["export", "--remote", "private"]);
@@ -302,12 +306,12 @@ fn per_target_views_differ() {
     assert!(
         public
             .iter()
-            .all(|path| !path.starts_with(".newgit/trackers"))
+            .all(|path| !path.starts_with(".newgit/trackers")),
+        "{public:?}"
     );
     assert!(
-        private
-            .iter()
-            .any(|path| path.starts_with(".newgit/trackers"))
+        private.contains(&"root.toml".to_owned()) && !private.contains(&"README.md".to_owned()),
+        "rooted at `access`, its own files at the top: {private:?}"
     );
 }
 
@@ -317,11 +321,7 @@ fn a_secret_in_the_history_refuses_the_export() {
     let fixture = setup(&temp, &[(".env", "TOKEN=hunter2\n")]);
     succeeds(&fixture.store, &["tracker", "create", "runtime-env"]);
     succeeds(&fixture.store, &["tracker", "track", "runtime-env", ".env"]);
-    define(
-        &fixture,
-        "github",
-        &format!("url = \"{}\"\ntrackers = [\"root\"]\n", fixture.mirror),
-    );
+    define(&fixture, "github", &fixture.mirror, false);
 
     let stderr = fails(&fixture.store, &["export", "--remote", "github"]);
     assert!(stderr.contains("runtime-env"), "{stderr}");
@@ -333,37 +333,33 @@ fn a_secret_in_the_history_refuses_the_export() {
 }
 
 #[test]
-fn a_tracker_outside_git_cannot_be_named() {
+fn a_tracker_outside_git_cannot_export_and_root_cannot_inherit() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp, &[]);
     succeeds(&fixture.store, &["tracker", "create", "runtime-env"]);
-    define(
-        &fixture,
-        "github",
-        &format!(
-            "url = \"{}\"\ntrackers = [\"root\", \"runtime-env\"]\n",
-            fixture.mirror
-        ),
-    );
+    define(&fixture, "github", &fixture.mirror, false);
+    set_export(&fixture, "runtime-env", Some("\"inherit\""));
     let stderr = fails(&fixture.store, &["export", "--remote", "github"]);
-    assert!(stderr.contains("is not in Git"), "{stderr}");
+    assert!(stderr.contains("outside Git"), "{stderr}");
 
-    define(
-        &fixture,
-        "github",
-        &format!("url = \"{}\"\ntrackers = [\"nope\"]\n", fixture.mirror),
-    );
+    set_export(&fixture, "runtime-env", None);
+    set_export(&fixture, "root", Some("\"inherit\""));
     let stderr = fails(&fixture.store, &["export", "--remote", "github"]);
-    assert!(stderr.contains("not a tracker"), "{stderr}");
+    assert!(stderr.contains("root has no parent"), "{stderr}");
+    assert_eq!(
+        git(&fixture.mirror, &["for-each-ref"]),
+        "",
+        "nothing pushed"
+    );
 }
 
 #[test]
-fn an_unknown_target_names_the_defined_ones() {
+fn an_unknown_target_names_the_declared_ones() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp, &[]);
-    define(&fixture, "github", "url = \"acme/widget\"\n");
+    set_export(&fixture, "root", Some("\"github.com/acme/widget\""));
     let stderr = fails(&fixture.store, &["export", "--remote", "gitlab"]);
-    assert!(stderr.contains("defined: github"), "{stderr}");
+    assert!(stderr.contains("declared: widget"), "{stderr}");
 }
 
 /// A pull request merged on the target: a branch, merged with a merge
@@ -401,11 +397,7 @@ fn merge_on_target(temp: &Utf8Path, fixture: &Fixture) -> String {
 fn commits_merged_on_the_target_come_into_main_before_the_push() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp, &[]);
-    define(
-        &fixture,
-        "github",
-        &format!("url = \"{}\"\ntrackers = [\"root\"]\n", fixture.mirror),
-    );
+    define(&fixture, "github", &fixture.mirror, false);
     succeeds(&fixture.store, &["export", "--remote", "github"]);
     let theirs = merge_on_target(&temp, &fixture);
 
@@ -446,11 +438,7 @@ fn commits_merged_on_the_target_come_into_main_before_the_push() {
 fn project_root_work_of_its_own_leaves_the_target_commits_to_bring_in_by_hand() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp, &[]);
-    define(
-        &fixture,
-        "github",
-        &format!("url = \"{}\"\ntrackers = [\"root\"]\n", fixture.mirror),
-    );
+    define(&fixture, "github", &fixture.mirror, false);
     succeeds(&fixture.store, &["export", "--remote", "github"]);
     let theirs = merge_on_target(&temp, &fixture);
     std::fs::write(fixture.store.join("src/lib.rs"), "fn main() { }\n").expect("write");
@@ -468,11 +456,7 @@ fn project_root_work_of_its_own_leaves_the_target_commits_to_bring_in_by_hand() 
 fn force_replaces_the_target_instead_of_pulling() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp, &[]);
-    define(
-        &fixture,
-        "github",
-        &format!("url = \"{}\"\ntrackers = [\"root\"]\n", fixture.mirror),
-    );
+    define(&fixture, "github", &fixture.mirror, false);
     succeeds(&fixture.store, &["export", "--remote", "github"]);
     let ours = git(&fixture.mirror, &["rev-parse", "main"]);
     merge_on_target(&temp, &fixture);
@@ -490,15 +474,8 @@ fn a_target_shipping_every_tracker_pulls_with_newgit_committed() {
     git(&fixture.store, &["add", ".newgit"]);
     git(&fixture.store, &["commit", "-q", "-m", "add newgit"]);
     succeeds(&fixture.store, &["merge", "main"]);
-    define(
-        &fixture,
-        "github",
-        &format!(
-            "url = \"{}\"\ntrackers = [\"root\", \"access\"]\n",
-            fixture.mirror
-        ),
-    );
-    git(&fixture.store, &["add", ".newgit/exports"]);
+    define(&fixture, "github", &fixture.mirror, true);
+    git(&fixture.store, &["add", ".newgit/trackers"]);
     git(&fixture.store, &["commit", "-q", "-m", "add export target"]);
     succeeds(&fixture.store, &["merge", "main"]);
     succeeds(&fixture.store, &["export", "--remote", "github"]);
@@ -517,11 +494,7 @@ fn a_target_withholding_a_tracker_cannot_be_pulled_from() {
     git(&fixture.store, &["add", ".newgit"]);
     git(&fixture.store, &["commit", "-q", "-m", "add newgit"]);
     succeeds(&fixture.store, &["merge", "main"]);
-    define(
-        &fixture,
-        "github",
-        &format!("url = \"{}\"\ntrackers = [\"root\"]\n", fixture.mirror),
-    );
+    define(&fixture, "github", &fixture.mirror, false);
     succeeds(&fixture.store, &["export", "--remote", "github"]);
     let theirs = merge_on_target(&temp, &fixture);
     let ours = git(&fixture.store, &["rev-parse", "HEAD"]);

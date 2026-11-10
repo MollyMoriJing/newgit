@@ -187,11 +187,8 @@ pub fn remote(temp: &Utf8Path) -> Remote {
         &["init", "-q", "--bare", "-b", "main", mirror.as_str()],
     );
     import(&store, &upstream);
-    define_target(
-        &store,
-        "github",
-        &format!("url = \"{mirror}\"\ntrackers = [\"root\", \"access\"]\n"),
-    );
+    set_export(&store, "root", Some(&export_to(&mirror, "github", "")));
+    set_export(&store, "access", Some("\"inherit\""));
     let repo = store.paths().project_root.clone();
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "export target"]);

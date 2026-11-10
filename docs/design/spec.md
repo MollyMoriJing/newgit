@@ -152,7 +152,6 @@ not to delete the rule.
   config.toml            [project], and [remote] once linked   committed
   trackers/              tracker definitions                    committed
   resources/             resource definitions                   committed
-  exports/               export targets                         committed
   scripts/               scripts resource commands call         committed
   branches/              binding records, one per instance      local
   checkpoints/           checkpoint records                     local
@@ -491,7 +490,8 @@ global `core.hooksPath` cannot switch it off. The route is per-clone
 config, and every checkpoint reinstalls it.
 
 On a newgit remote, `origin` is the newgit endpoint, which `gh` cannot read.
-An export target with `branches = true` adds itself as a remote in each
+An export target with `branches = true` (an `export` in a tracker's
+definition) adds itself as a remote in each
 workspace, and `gh` resolves the one the instance's work belongs to, so `git
 push` then `gh pr create` opens a real pull request there (see *Export*).
 
@@ -1351,10 +1351,28 @@ not concealment) on every run, because this is the command whose output
 leaves the machine.
 
 `newgit export --remote <name>` pushes the project's trackers, history and
-all, to an ordinary repository defined in `.newgit/exports/<name>.toml`,
-typically a GitHub mirror. It ships exactly the trackers the target names,
-or the `public` ones if it names none, so a public mirror and a private one can show different views,
-and a history that ever committed a file a tracker outside Git owns is refused. It
+all, to an ordinary repository a tracker's definition declares with
+`export`, typically a GitHub mirror. Where something ships is said by the
+tracker itself:
+
+```toml
+# root.toml: the project's mirror
+export = { url = "github.com/acme/widget", branches = true }
+# a carved child: wherever its parent ships (`tracker create --git --path`
+# writes this)
+export = "inherit"
+# a library inside the mirror and on its own, rooted at itself
+export = ["inherit", "github.com/acme/lib"]
+# no `export`: it never ships
+```
+
+A target ships the tracker declaring it and every tracker below that
+inherits its export, so what leaves fails closed. A target declared by a
+tracker other than root is rooted at it, its files at the top. Definitions
+live in `access`, so widening where something ships takes an owner's merge.
+An inheriting tracker whose audience is narrower than the declaring one's
+is refused rather than sent past it, and a history that ever committed a
+file a tracker outside Git owns is refused. It
 pushes with your own Git credentials, so GitHub Actions and `gh` keep
 working. When the target's branch has moved ahead (a pull request merged on
 GitHub), export brings that in first. With `branches = true`, every push
