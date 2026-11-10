@@ -2,7 +2,7 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CHECKING } from "../src/endpoint";
-import { PULLS_ASKED, PULL_ATTEMPTS, PULL_INDEX_ASK_MS, PULL_INDEX_WAIT_MS, PULL_POLL_MS } from "../src/webhook";
+import { PULL_ATTEMPTS, PULL_INDEX_ASK_MS, PULL_INDEX_WAIT_MS, PULL_POLL_MS, PULL_RETRY_MAX_MS } from "../src/webhook";
 import {
 	THEIRS,
 	advance,
@@ -86,8 +86,17 @@ describe("ProjectDO.alarm()", () => {
 		await deliver({ hold: true });
 		expect(await runDurableObjectAlarm(stub())).toBe(true);
 		expect((await stub().pulls())[0].attempts).toBe(1);
-		for (let attempt = 2; attempt < PULL_ATTEMPTS; attempt++) expect(await runDurableObjectAlarm(stub())).toBe(true);
-		expect(await runDurableObjectAlarm(stub())).toBe(true);
+		vi.useFakeTimers({ toFake: ["Date"] });
+		try {
+			expect(await runDurableObjectAlarm(stub()), "it waits out the failure").toBe(true);
+			expect((await stub().pulls())[0].attempts).toBe(1);
+			for (let attempt = 2; attempt <= PULL_ATTEMPTS; attempt++) {
+				vi.setSystemTime(Date.now() + PULL_RETRY_MAX_MS);
+				expect(await runDurableObjectAlarm(stub())).toBe(true);
+			}
+		} finally {
+			vi.useRealTimers();
+		}
 		expect(await stub().pulls()).toEqual([]);
 		expect(await runDurableObjectAlarm(stub()), "nothing left to wake for").toBe(false);
 		logged.mockRestore();
@@ -297,50 +306,6 @@ describe("GitHub listing no pull request", () => {
 		await deliver({ payload: push({ commits: [{ id: sha("c") }, { id: THEIRS }] }) });
 		expect(plans).toEqual([]);
 		for (let step = 0; step < 10 && plans.length === 0; step++) await later(PULL_INDEX_ASK_MS);
-		expect(plans[0].instances).toEqual([holding("feature")]);
-	});
-});
-
-describe("when GitHub cannot say", () => {
-	const failing: [string, () => Response][] = [
-		["a rate limit", () => new Response("rate limited", { status: 403 })],
-		["a 5xx", () => new Response("down", { status: 503 })],
-		["a private repo", () => new Response("not found", { status: 404 })],
-		[
-			"no connection",
-			() => {
-				throw new Error("the network went away");
-			},
-		],
-	];
-
-	it.each(failing)("counts every instance on %s, says why, and a redelivery can land it", async (_case, answer) => {
-		await instanceWith("feature");
-		await instanceWith("other");
-		setGitHub(answer);
-		setAnswers([{ outcome: "refused", why: "may hold `feature`'s work: redeliver this event" }]);
-		const logged = vi.spyOn(console, "error").mockImplementation(() => {});
-		await deliver();
-		expect(plans[0].instances).toEqual([holding("feature"), holding("other")]);
-		expect(logged.mock.calls.flat().join("\n")).toContain("GitHub could not say");
-		logged.mockRestore();
-		expect(await index()).toEqual(main);
-		expect(await stub().pulls(), "finished, so a redelivery starts over").toEqual([]);
-
-		setGitHub(() => Response.json([pullRequest("nobody")]));
-		setAnswers([landed]);
-		await deliver();
-		expect(plans[1].instances).toEqual([]);
-		expect((await index()).root).toBe(sha("f"));
-	});
-
-	it("does not ask about more commits than it may", async () => {
-		await instanceWith("feature");
-		const logged = vi.spyOn(console, "error").mockImplementation(() => {});
-		const commits = Array.from({ length: PULLS_ASKED + 1 }, (_, n) => ({ id: n.toString(16).padStart(40, "0") }));
-		await deliver({ payload: push({ commits }) });
-		logged.mockRestore();
-		expect(asked).toEqual([]);
 		expect(plans[0].instances).toEqual([holding("feature")]);
 	});
 });

@@ -46,8 +46,21 @@ export const PULL_START_MS = 1_000;
 /** Past this, a pull still not landed gives up; a redelivery starts it again. */
 export const PULL_LIMIT_MS = 2 * 60 * 60_000;
 
-/** How many times a failure is retried before a redelivery has to. */
-export const PULL_ATTEMPTS = 5;
+/**
+ * How many failed attempts a pull makes before it gives up. With the wait
+ * between them doubling from `PULL_POLL_MS` to `PULL_RETRY_MAX_MS`, that is
+ * about three quarters of an hour: an outage of GitHub's, or the container
+ * dropping under a deploy, is over long before.
+ */
+export const PULL_ATTEMPTS = 10;
+
+/** The longest wait between two attempts, or two failed lookups. */
+export const PULL_RETRY_MAX_MS = 10 * 60_000;
+
+/** How long after its `attempts`th failure a pull is tried again. */
+export function retryDelay(attempts: number, first = PULL_POLL_MS): number {
+	return Math.min(first * 2 ** Math.max(attempts - 1, 0), PULL_RETRY_MAX_MS);
+}
 
 /** The passwords a pull's container fetches and pushes with: past `CHECK_LIMIT_MS`. */
 const PULL_CREDENTIAL_SECONDS = 50 * 60;
@@ -68,14 +81,20 @@ export interface MirrorPull {
 	subject?: string;
 	/** The trackers the mirror withholds. */
 	withheld: string[];
-	/** Instances whose withheld work this may hold, known once GitHub has said. */
+	/** Instances GitHub says this came from that hold withheld work, known once it has said. */
 	instances?: MirrorInstance[];
-	/** When GitHub first listed no pull request for this, and was last asked. */
-	lookup?: { since: number; last: number };
+	/**
+	 * Asking GitHub which pull request this came from: when it was last asked,
+	 * since when it has listed none, and why it could not answer, how many
+	 * times in a row. Until it answers, the pull waits.
+	 */
+	lookup?: { since?: number; last: number; failed?: string; failures?: number };
 	queuedAt: number;
 	attempts: number;
 	/** Why the last attempt failed, for `newgit status` to say. */
 	lastError?: string;
+	/** After a failure, not tried again before this. */
+	retryAt?: number;
 	/** A look found something to land. */
 	peeked?: boolean;
 	/** Read passwords handed out for looks, to cancel when the pull ends. */
@@ -193,7 +212,6 @@ async function pullRequestBranches(
 	repo: string,
 	commits: string[],
 ): Promise<{ branches: string[]; unlisted: boolean }> {
-	if (commits.length > PULLS_ASKED) throw new Error(`${commits.length} commits is too many to ask about`);
 	const asked = await Promise.all(
 		commits.map(async (commit) => {
 			const response = await fetcher(`https://api.github.com/repos/${repo}/commits/${commit}/pulls`, {
@@ -213,38 +231,54 @@ async function pullRequestBranches(
 	};
 }
 
+/** What GitHub said of whose work a pull's commits are. */
+export type Implicated =
+	| { instances: MirrorInstance[]; unlisted: boolean }
+	/** GitHub could not say. `retry` is false when asking again cannot help. */
+	| { unknown: string; retry: boolean };
+
 /**
- * The instances among `work` whose withheld work this pull's commits may
- * hold. A mirror's branch is named for its instance, and a push to `main`
- * does not say which branch it merged, so GitHub's merge subject says, or
- * else GitHub. `unlisted` says GitHub listed nothing for some commit, which
- * may be a direct push, or may be GitHub not having caught up: the caller
- * decides how long to wait. Only when GitHub cannot answer does every instance
- * count, and the refusal that follows can be redelivered.
+ * The instances among `work` whose withheld work this pull's commits hold.
+ * A mirror's branch is named for its instance, and a push to `main` does not
+ * say which branch it merged, so GitHub's merge subject says, or else GitHub.
+ * Only an instance GitHub names counts: one whose branch is not on GitHub
+ * yet, or that merely has a fork, is no part of this. `unlisted` says GitHub
+ * listed nothing for some commit, which may be a direct push, or may be
+ * GitHub not having caught up: the caller decides how long to wait. When
+ * GitHub cannot answer, nobody is named and the caller waits for it.
  */
 export async function implicated(
 	deps: Deps,
 	pull: Pick<MirrorPull, "repo" | "commit" | "commits" | "subject">,
 	work: MirrorInstance[],
-): Promise<{ instances: MirrorInstance[]; unlisted: boolean }> {
+): Promise<Implicated> {
 	if (work.length === 0) return { instances: [], unlisted: false };
 	let branches: string[];
 	let unlisted = false;
 	const named = mergedBranch(pull.subject);
 	if (named !== undefined) branches = [named];
 	else {
+		const commits = [...new Set([...pull.commits, pull.commit])];
+		if (commits.length > PULLS_ASKED)
+			return {
+				unknown: `the event landed ${commits.length} commits, and GitHub is asked about at most ${PULLS_ASKED}`,
+				retry: false,
+			};
 		try {
-			({ branches, unlisted } = await pullRequestBranches(deps.fetcher, pull.repo, [
-				...new Set([...pull.commits, pull.commit]),
-			]));
+			({ branches, unlisted } = await pullRequestBranches(deps.fetcher, pull.repo, commits));
 		} catch (error) {
 			const why = error instanceof Error ? error.message : String(error);
 			console.error(JSON.stringify({ webhook: "GitHub could not say which pull request this is", repo: pull.repo, commit: pull.commit, why }));
-			return { instances: work, unlisted: false };
+			return { unknown: why, retry: true };
 		}
 	}
 	const slugs = new Set(branches.map(instanceSlug));
 	return { instances: work.filter((instance) => slugs.has(instance.name)), unlisted };
+}
+
+/** What to do about a pull that ended without landing, for its `why`. */
+function bringItIn(target: string): string {
+	return `redeliver the event from GitHub's *Recent Deliveries*, or run \`newgit pull --remote ${target}\` from the project root`;
 }
 
 const refused = (status: number, reason: string, context: Record<string, unknown>): never => {
@@ -359,16 +393,21 @@ function parseProject(key: string | null) {
 
 /**
  * Move the oldest pull on. True when there is more to do. Only `ProjectDO`'s
- * alarm calls this, so two steps never run at once. Never throws: a failure
- * is logged and retried, and past `PULL_ATTEMPTS` it is dropped, for a
- * redelivery to start again.
+ * alarm calls this, so two steps never run at once. A failure is logged and
+ * retried, each time a little later; past `PULL_ATTEMPTS`, or `PULL_LIMIT_MS`,
+ * it gives up. Every pull that ends says how where `newgit status` reads it,
+ * a give-up with what to do, so none ends without a word.
  */
 export async function advancePulls(env: Env, deps: Deps, id: ProjectId): Promise<boolean> {
 	const project = projectStub(env, id);
 	const [pull] = await project.pulls();
 	if (pull === undefined) return false;
 	const log = { project: projectKey(id), target: pull.target, commit: pull.commit };
+	const now = Date.now();
+	// Waiting out its last failure: the queue waits with it, in order.
+	if (pull.retryAt !== undefined && now < pull.retryAt && now - pull.queuedAt <= PULL_LIMIT_MS) return true;
 	let done = false;
+	let gaveUp: string | undefined;
 	try {
 		done = await advance(env, deps, id, pull);
 	} catch (error) {
@@ -379,28 +418,34 @@ export async function advancePulls(env: Env, deps: Deps, id: ProjectId): Promise
 			console.log(JSON.stringify({ webhook: "starting again from `main`", ...log, why }));
 			await project.restartPull(pull);
 		} else {
-			const attempts = await project.pullFailed(pull, why);
+			const attempts = await project.pullFailed(pull, why, Date.now() + retryDelay(pull.attempts + 1));
 			done = attempts >= PULL_ATTEMPTS;
+			if (done) gaveUp = `it failed ${attempts} times; the last: ${why}`;
 			console.error(JSON.stringify({ webhook: "pull failed", ...log, why, attempts, givingUp: done }));
 		}
 	}
 	if (!done && Date.now() - pull.queuedAt > PULL_LIMIT_MS) {
-		console.error(JSON.stringify({ webhook: "pull gave up; redeliver the event", ...log }));
+		const last = (await project.pulls()).find((known) => known.target === pull.target && known.commit === pull.commit);
+		gaveUp = `it waited ${PULL_LIMIT_MS / 3_600_000} hours, ${
+			last?.lookup?.failed !== undefined && last.instances === undefined
+				? `and GitHub still could not say which pull request it came from (${last.lookup.failed})`
+				: last?.lastError !== undefined
+					? `failing ${last.attempts} times; the last: ${last.lastError}`
+					: "without finishing"
+		}`;
 		done = true;
 	}
-	if (done) {
-		// Said where `newgit status` reads it, not only in the logs.
-		const last = (await project.pulls()).find((known) => known.target === pull.target && known.commit === pull.commit);
-		if (last?.attempts !== undefined && last.attempts > 0)
-			await project.notePullEnded({
-				target: pull.target,
-				commit: pull.commit,
-				outcome: "gave up",
-				why: last.lastError ?? "it ran too long",
-				at: new Date().toISOString(),
-			});
-		await revokeRepoTokens(deps, await project.dropPull(pull));
+	if (gaveUp !== undefined) {
+		console.error(JSON.stringify({ webhook: "pull gave up", ...log, why: gaveUp }));
+		await project.notePullEnded({
+			target: pull.target,
+			commit: pull.commit,
+			outcome: "gave up",
+			why: `${gaveUp}. Nothing moved: ${bringItIn(pull.target)}`,
+			at: new Date().toISOString(),
+		});
 	}
+	if (done) await revokeRepoTokens(deps, await project.dropPull(pull));
 	return (await project.pulls()).length > 0;
 }
 
@@ -436,18 +481,21 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 		}
 		return { handed, minted };
 	};
-	const ended = async (answer: { outcome: "nothing" } | { outcome: "refused"; why: string }) => {
-		if (answer.outcome === "refused") {
-			console.error(JSON.stringify({ webhook: "refused", ...log, why: answer.why }));
-			// A refusal is the pusher's to fix: said where `newgit status` reads it.
-			await project.notePullEnded({
-				target: pull.target,
-				commit: pull.commit,
-				outcome: "refused",
-				why: answer.why,
-				at: new Date().toISOString(),
-			});
-		} else console.log(JSON.stringify({ webhook: "nothing to bring in", ...log }));
+	const ended = async (
+		answer: { outcome: "nothing" } | { outcome: "refused"; why: string } | { outcome: "gave up"; why: string },
+	) => {
+		if (answer.outcome === "nothing") console.log(JSON.stringify({ webhook: "nothing to bring in", ...log }));
+		else console.error(JSON.stringify({ webhook: answer.outcome, ...log, why: answer.why }));
+		// Said where `newgit status` reads it: a refusal is the pusher's to
+		// fix, and "nothing" says the mirror's commit is on `main`, which
+		// ends whatever trouble an earlier pull from there had.
+		await project.notePullEnded({
+			target: pull.target,
+			commit: pull.commit,
+			outcome: answer.outcome,
+			...(answer.outcome === "nothing" ? {} : { why: answer.why }),
+			at: new Date().toISOString(),
+		});
 		return true;
 	};
 	if (!deps.pull) throw new HttpError(501, "this remote has no Git endpoint to pull with");
@@ -500,9 +548,30 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 	// Asked only now: our own exports end above, and cost GitHub no call.
 	if (instances === undefined) {
 		const now = Date.now();
-		if (pull.lookup !== undefined && now - pull.lookup.last < PULL_INDEX_ASK_MS) return false;
+		const lookup = pull.lookup;
+		if (lookup !== undefined) {
+			const wait = lookup.failed !== undefined ? retryDelay(lookup.failures ?? 1, PULL_INDEX_ASK_MS) : PULL_INDEX_ASK_MS;
+			if (now - lookup.last < wait) return false;
+		}
 		const found = await implicated(deps, pull, await project.withheldWork(pull.withheld));
-		const since = pull.lookup?.since ?? now;
+		if ("unknown" in found) {
+			// Not knowing is not a refusal: nobody is named, and the pull
+			// waits for GitHub, asking again later each time, until
+			// `PULL_LIMIT_MS` gives up saying so.
+			if (!found.retry)
+				return await ended({
+					outcome: "gave up",
+					why: `whose work commit ${pull.commit} holds cannot be known: ${found.unknown}. Nothing moved: run \`newgit pull --remote ${pull.target}\` from the project root`,
+				});
+			await project.noteLookup(pull, {
+				...(lookup?.since === undefined ? {} : { since: lookup.since }),
+				last: now,
+				failed: found.unknown,
+				failures: (lookup?.failures ?? 0) + 1,
+			});
+			return false;
+		}
+		const since = lookup?.since ?? now;
 		if (found.unlisted && now - since < PULL_INDEX_WAIT_MS) {
 			await project.noteLookup(pull, { since, last: now });
 			return false;

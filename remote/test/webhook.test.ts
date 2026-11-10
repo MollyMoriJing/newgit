@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { CHECKING, pullKey } from "../src/endpoint";
 import { type Deps, handle, issue } from "../src/index";
-import { PULL_ATTEMPTS, PULL_LIMIT_MS, githubRepo, verifySignature } from "../src/webhook";
+import { PULL_ATTEMPTS, PULL_LIMIT_MS, PULL_RETRY_MAX_MS, githubRepo, verifySignature } from "../src/webhook";
 import {
 	SECRET,
 	THEIRS,
@@ -248,8 +248,17 @@ describe("when it goes wrong", () => {
 		const logged = vi.spyOn(console, "error").mockImplementation(() => {});
 		setAnswers(Array.from({ length: PULL_ATTEMPTS }, () => new Error("GitHub said 500")));
 		await deliver();
-		for (let attempt = 1; attempt < PULL_ATTEMPTS - 1; attempt++) expect(await advance()).toBe(true);
-		expect(await advance()).toBe(false);
+		vi.useFakeTimers({ toFake: ["Date"] });
+		try {
+			for (let attempt = 1; attempt < PULL_ATTEMPTS - 1; attempt++) {
+				vi.setSystemTime(Date.now() + PULL_RETRY_MAX_MS);
+				expect(await advance()).toBe(true);
+			}
+			vi.setSystemTime(Date.now() + PULL_RETRY_MAX_MS);
+			expect(await advance()).toBe(false);
+		} finally {
+			vi.useRealTimers();
+		}
 		expect(await stub().pulls()).toEqual([]);
 		expect(logged.mock.calls.flat().join("\n")).toContain("GitHub said 500");
 		logged.mockRestore();

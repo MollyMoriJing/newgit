@@ -1756,8 +1756,9 @@ function nextHolders(facts: Map<string, TrackerFacts>, holder: Map<string, strin
 }
 
 /**
- * Every named tracker's committed definition on the project's default
- * branch. A definition is the view's `.newgit/trackers/<name>.toml`: `access`'s
+ * Every named tracker's committed definition on its holder's `main`, never
+ * a branch's own copy, so a branch cannot widen its own audience or
+ * maintainers. A definition is the view's `.newgit/trackers/<name>.toml`: `access`'s
  * `<name>.toml`, unless a tracker in Git owns that path by the ownership rules
  * and may hold it ([`nextHolders`]) — which is how governance layers:
  * changing a tracker's definition is changing the tracker that owns its file,

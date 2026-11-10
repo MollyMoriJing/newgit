@@ -718,6 +718,50 @@ impl Composer<'_> {
     }
 }
 
+/// Which side of a merge moved a tracker since the two sides forked.
+#[derive(PartialEq, Eq)]
+enum Side {
+    Ahead,
+    Other,
+}
+
+/// For two diverged commits whose subtrees at `mount` differ (`there` in
+/// `ahead`, `other_there` in `other`): the side that alone changed that
+/// subtree since their merge base, or `None` when both did, or when they
+/// share no base.
+fn one_side_changed(
+    repo: &Utf8Path,
+    objects: &mut Objects,
+    ahead: &str,
+    other: &str,
+    mount: &str,
+    there: &Option<String>,
+    other_there: &Option<String>,
+) -> Result<Option<Side>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo.as_str())
+        .args(["merge-base", ahead, other])
+        .output()
+        .map_err(|source| NewgitError::io(repo, source))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let base = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if base.is_empty() {
+        return Ok(None);
+    }
+    let base_tree = objects.commit(&base)?.tree;
+    let base_there = objects.subtree(&base_tree, mount)?;
+    Ok(if &base_there == other_there {
+        Some(Side::Ahead)
+    } else if &base_there == there {
+        Some(Side::Other)
+    } else {
+        None
+    })
+}
+
 /// Whether commit `ancestor` is behind commit `descendant`.
 fn is_ancestor(repo: &Utf8Path, ancestor: &str, descendant: &str) -> Result<bool> {
     Ok(Command::new("git")
@@ -949,7 +993,26 @@ pub fn bring_in(
                 if is_ancestor(repo, &ahead, other)? {
                     ahead = other.clone();
                     there = other_there;
-                } else if !is_ancestor(repo, other, &ahead)? {
+                } else if is_ancestor(repo, other, &ahead)? {
+                    // `other` is behind: `ahead` already has its content.
+                } else if let Some(side) = one_side_changed(
+                    repo,
+                    &mut objects,
+                    &ahead,
+                    other,
+                    mount,
+                    &there,
+                    &other_there,
+                )? {
+                    // The two lines diverged, but only one of them moved
+                    // this tracker since they forked (a pull request
+                    // branched before `main` moved it): that side's content
+                    // is the merge, as Git's own three-way merge would say.
+                    if side == Side::Other {
+                        ahead = other.clone();
+                        there = other_there;
+                    }
+                } else {
                     return Err(NewgitError::SplitRefused(format!(
                         "commit {} on `{target}` merges two lines of `{}`, which that target \
                          does not ship, so nothing was pulled: `newgit merge` the work there",

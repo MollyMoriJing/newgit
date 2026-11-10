@@ -42,11 +42,23 @@ fn tempdir() -> (tempfile::TempDir, Utf8PathBuf) {
 
 const ENV: &str = "API_URL=http://127.0.0.1:54321\n";
 
+/// A port nothing holds, from the OS, for `db` to start probing at. A fixed
+/// one collided with whatever else was listening on the runner (or with the
+/// other test in this file), so `db` was given the next port and the
+/// assertion on the rendered file failed (#354).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind an ephemeral port")
+        .local_addr()
+        .expect("local_addr")
+        .port()
+}
+
 /// `branch-db` brings `db`, which renders into `apps/admin/.env.local`.
 /// Three processes autostart regardless: `admin` declares it reads
 /// `apps/admin`, `quiet` declares it reads something else, and `worker`
 /// declares nothing.
-fn setup(temp: &Utf8Path) -> BranchManager {
+fn setup(temp: &Utf8Path, db_port: u16) -> BranchManager {
     let repo = temp.join("store");
     std::fs::create_dir_all(repo.join("apps/admin")).expect("mkdir");
     std::fs::create_dir_all(repo.join("apps/db")).expect("mkdir");
@@ -78,15 +90,17 @@ fn setup(temp: &Utf8Path) -> BranchManager {
     let resources = &store.paths().resources;
     std::fs::write(
         resources.join("db.toml"),
-        r#"ownership = "branch"
+        format!(
+            r#"ownership = "branch"
 
 [ports.api]
-start = 47311
+start = {db_port}
 
 [[render]]
 path = "apps/admin/.env.local"
-replace = [{ find = "API_URL=http://127.0.0.1:54321", with = "API_URL=http://127.0.0.1:{{ports.api}}" }]
-"#,
+replace = [{{ find = "API_URL=http://127.0.0.1:54321", with = "API_URL=http://127.0.0.1:{{{{ports.api}}}}" }}]
+"#
+        ),
     )
     .expect("db");
     for (name, reads, stop) in [
@@ -141,7 +155,8 @@ impl Drop for Stop<'_> {
 #[test]
 fn a_use_that_rewrites_a_rendered_file_restarts_readers_and_names_the_rest() {
     let (_guard, temp) = tempdir();
-    let manager = setup(&temp);
+    let db_port = free_port();
+    let manager = setup(&temp, db_port);
     let spawned = manager
         .spawn_binding("x", None, &without_db())
         .expect("spawn x");
@@ -162,7 +177,7 @@ fn a_use_that_rewrites_a_rendered_file_restarts_readers_and_names_the_rest() {
 
     assert_eq!(
         std::fs::read_to_string(workspace.join("apps/admin/.env.local")).expect("env"),
-        "API_URL=http://127.0.0.1:47311\n",
+        format!("API_URL=http://127.0.0.1:{db_port}\n"),
         "precondition: binding `db` rendered its port"
     );
     assert_eq!(
@@ -216,7 +231,8 @@ fn a_use_that_rewrites_a_rendered_file_restarts_readers_and_names_the_rest() {
 #[test]
 fn a_drop_that_takes_a_rendered_value_out_restarts_its_readers() {
     let (_guard, temp) = tempdir();
-    let manager = setup(&temp);
+    let db_port = free_port();
+    let manager = setup(&temp, db_port);
     let spawned = manager.spawn("x", None).expect("spawn x");
     let _stop = Stop(&manager);
     let workspace = spawned.branch.workspace_path;
