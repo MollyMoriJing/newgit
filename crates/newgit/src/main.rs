@@ -325,6 +325,9 @@ enum Command {
     /// inside its container: brings the commit in and lands it on `main`
     #[command(hide = true)]
     EndpointPull,
+    /// Run a newgit remote: Git repositories on this machine's disk, project
+    /// state in SQLite, the same API newgit.dev answers
+    Serve(ServeArgs),
     /// Link this project to a newgit remote
     Remote {
         #[command(subcommand)]
@@ -749,6 +752,7 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::Serve(args) => serve(args),
         Command::EndpointPull => {
             let plan: newgit_core::endpoint::PullPlan =
                 serde_json::from_reader(std::io::stdin())
@@ -4614,4 +4618,55 @@ mod tests {
             "the last section does not reach the end of the document"
         );
     }
+}
+
+#[derive(Debug, Args)]
+struct ServeArgs {
+    /// Where the remote keeps everything (its database, repositories, key)
+    #[arg(long, value_name = "DIR")]
+    data: Utf8PathBuf,
+    /// The address to listen on (port 0 picks one, and says which)
+    #[arg(long, default_value = "127.0.0.1:8484")]
+    listen: std::net::SocketAddr,
+    /// The URL clients reach this remote at, when not the one they ask by
+    /// (behind a proxy that terminates TLS, say)
+    #[arg(long)]
+    url: Option<String>,
+    /// Who may log in: GitHub logins, comma-separated, or `*` for anyone
+    #[arg(long, default_value = "")]
+    allow: String,
+    /// GitHub logins shut out, whatever `--allow` says
+    #[arg(long, default_value = "")]
+    block: String,
+    /// GitHub logins who may delete any project and own any number
+    #[arg(long, default_value = "")]
+    admin: String,
+    /// How many projects one login may own
+    #[arg(long, default_value_t = 5)]
+    projects_per_login: usize,
+    /// The GitHub OAuth app's client id, for `newgit login` (device flow)
+    #[arg(long, env = "NEWGIT_SERVE_GITHUB_CLIENT_ID")]
+    github_client_id: Option<String>,
+    /// Let a caller holding this secret log in as anyone invited, without
+    /// GitHub (`POST /v1/dev/login`): for tests and trying changes locally
+    #[arg(long, env = "NEWGIT_SERVE_DEV_LOGIN_SECRET", hide_env_values = true)]
+    dev_login_secret: Option<String>,
+    /// How many Git processes may run at once
+    #[arg(long, default_value_t = 16)]
+    git_slots: usize,
+}
+
+fn serve(args: ServeArgs) -> Result<()> {
+    newgit_serve::serve(newgit_serve::Config {
+        data: args.data,
+        listen: args.listen,
+        url: args.url,
+        allowed_logins: args.allow,
+        blocked_logins: args.block,
+        admin_logins: args.admin,
+        projects_per_login: args.projects_per_login,
+        github_client_id: args.github_client_id,
+        dev_login_secret: args.dev_login_secret,
+        git_slots: args.git_slots,
+    })
 }

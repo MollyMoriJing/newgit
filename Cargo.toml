@@ -2,6 +2,7 @@
 members = [
     "crates/newgit",
     "crates/newgit-core",
+    "crates/newgit-serve",
 ]
 resolver = "2"
 
