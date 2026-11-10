@@ -5,11 +5,10 @@
 // above it only learn of it here, when something needs them to. Rolling up
 // never merges files: below the anchor it moves only pins, and a pin's new
 // value is that child's head. So a roll-up is the parent's tree with entries
-// under `.newgit/pins/` replaced, one commit per change (`history =
-// commits`, the default), made in the Worker from Artifacts' reads and
-// pushed as a pack (`objects.ts`), then one compare-and-swap of the
-// parent's head. Deepest first: a child with its own children rolls up
-// before it is pinned.
+// under `.newgit/pins/` replaced, one commit per change, made in the Worker
+// from Artifacts' reads and pushed as a pack (`objects.ts`), then one
+// compare-and-swap of the parent's head. Deepest first: a child with its own
+// children rolls up before it is pinned.
 //
 // Each commit is built from what was logged at landing: its child, its
 // new pin, when it moved, and the commit the change made in the parent if
@@ -30,11 +29,8 @@ export interface RollupStore {
 	rolledUp(branch: string, parent: string, old: string, next: string, through: number): Promise<boolean>;
 	/** Whether `commit` has ever been `tracker`'s head on `branch`. */
 	wasHead(branch: string, tracker: string, commit: string): Promise<boolean>;
-	/**
-	 * How `tracker`'s parent records it (its definition's `history`):
-	 * `commits` unless it says `pins`.
-	 */
-	historyOf?(tracker: string): Promise<"commits" | "pins" | "pinned">;
+	/** Whether `tracker`'s parent holds it where it is (its definition's `pinned`): never rolled up. */
+	isPinned?(tracker: string): Promise<boolean>;
 }
 
 /** Who a roll-up commit is by. */
@@ -86,28 +82,16 @@ export async function rollUp(
 		const head = await store.head(branch, parent);
 		const moves = await store.pending(branch, parent);
 		if (head === null || moves.length === 0) return { head, written };
-		const history = new Map<string, "commits" | "pins" | "pinned">();
+		const pinned = new Map<string, boolean>();
 		for (const tracker of new Set(moves.map((move) => move.tracker)))
-			history.set(tracker, (await store.historyOf?.(tracker)) ?? "commits");
+			pinned.set(tracker, (await store.isPinned?.(tracker)) ?? false);
 		const made = await commitsFor(
 			repos,
 			repoOf(parent),
 			head,
-			moves.filter((move) => history.get(move.tracker) === "commits"),
+			moves.filter((move) => !pinned.get(move.tracker)),
 			(commit) => store.wasHead(branch, parent, commit),
 		);
-		const snapshot = await pinsSnapshot(
-			repos,
-			repoOf(parent),
-			made,
-			moves.filter((move) => history.get(move.tracker) === "pins"),
-		);
-		if (snapshot !== null) {
-			made.head = snapshot.hash;
-			made.tree = snapshot.tree;
-			made.objects.push(...snapshot.objects);
-			made.written++;
-		}
 		const through = moves.at(-1)!.seq;
 		if (made.head === head) {
 			// Every pin already says it: nothing to write, only to record.
@@ -219,45 +203,6 @@ async function keptCommit(
 	if (base === null) return null;
 	const expected = await replacePin(repos, name, base, leaf, move.new!).catch(() => null);
 	return expected?.tree === via.tree ? via : null;
-}
-
-/**
- * Where each `pins` child is now, written in one commit on top of `made`:
- * its earlier heads, and its messages, are not the parent's to keep. So a
- * week unread is one snapshot, however much is queued. Null when every pin
- * says it already.
- */
-async function pinsSnapshot(
-	repos: Repos,
-	name: string,
-	made: { head: string; tree: string },
-	moves: HeadMove[],
-): Promise<{ hash: string; tree: string; objects: GitObject[] } | null> {
-	if (moves.length === 0) return null;
-	const latest = new Map<string, HeadMove>();
-	for (const move of moves) latest.set(move.tracker, move);
-	const objects: GitObject[] = [];
-	const start = made.tree;
-	let tree = start;
-	const pinned: string[] = [];
-	for (const [tracker, move] of latest) {
-		const next = await replacePin(repos, name, tree, leafOf(tracker), move.new!);
-		if (next.tree === tree) continue;
-		objects.push(...next.objects);
-		tree = next.tree;
-		pinned.push(pathOf(tracker));
-	}
-	if (tree === start) return null;
-	const at = Math.max(...[...latest.values()].map((move) => Math.floor(Date.parse(move.movedAt) / 1000)));
-	const commit = await commitObject({
-		tree,
-		parents: [made.head],
-		author: { ...ROLLUP_SIGNATURE, at },
-		committer: { ...ROLLUP_SIGNATURE, at },
-		message: `Roll up ${pinned.map((path) => `\`${path}\``).join(", ")}`,
-	});
-	objects.push(commit);
-	return { hash: commit.hash, tree, objects };
 }
 
 function dedupe(objects: GitObject[]): GitObject[] {
