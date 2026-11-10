@@ -96,6 +96,10 @@ Remote:
   project root
 - `newgit pull <tracker> [instance]` — one commit moving a mounted tracker's
   pin to its `follow` ref; spawn says when a tracker is behind
+- `newgit pull` — every tracker in Git root mounts, in one commit on the
+  branch it runs on (`Update trackers: t3code (14 commits), ui-kit (2
+  commits)`); no commit when none is behind. A pin holding commits its ref
+  lacks stays put; trackers outside Git are left alone (`newgit tracker pull`)
 - `newgit members add|remove <github-login>` / `members list [--json]`
 - `newgit spawn <name> --from-checkpoint <instance>/<checkpoint>`
 

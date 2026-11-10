@@ -273,13 +273,20 @@ enum Command {
     /// the new pin; its history stays in its own repo. Nothing else moves a
     /// pin on anyone's behalf
     ///
+    /// With no tracker, every tracker in Git root mounts moves to its
+    /// `follow` ref, in one commit: `Update trackers: t3code (14 commits),
+    /// ui-kit (2 commits)`, on this instance's branch (the project root's
+    /// own branch outside one). A pin holding commits its ref does not stays
+    /// where it is. Trackers outside Git have no pins and are left alone
+    /// (`newgit tracker pull`)
+    ///
     /// With --remote <target>, bring the commits on an export target's branch
     /// (a pull request merged there) back instead: into the tracker a rooted
     /// target is rooted at, then its pin in the project root; otherwise into
     /// the project root as work. `newgit merge main` publishes either
-    #[command(group(clap::ArgGroup::new("what").args(["tracker", "remote"]).required(true)))]
     Pull {
-        /// The mounted tracker in Git to bring up to date
+        /// The mounted tracker in Git to bring up to date (every one when
+        /// left out)
         tracker: Option<String>,
         /// Instance (inferred when run inside a workspace; the project root
         /// otherwise)
@@ -724,8 +731,11 @@ fn main() -> Result<()> {
             ..
         } => pull_remote(&target),
         Command::Pull {
-            tracker, instance, ..
-        } => pull(instance, &tracker_id(&tracker.unwrap_or_default())?),
+            tracker: Some(tracker),
+            instance,
+            ..
+        } => pull(instance, &tracker_id(&tracker)?),
+        Command::Pull { .. } => pull_all(),
         Command::EndpointCompose => {
             let plan: newgit_core::endpoint::Plan = serde_json::from_reader(std::io::stdin())
                 .context("the plan on stdin is not JSON newgit can read")?;
@@ -4530,6 +4540,70 @@ fn pull(instance: Option<String>, tracker: &str) -> Result<()> {
             outcome.follow,
             &view[..view.len().min(12)]
         ),
+    }
+    Ok(())
+}
+
+/// `newgit pull` with no tracker (#345): every mounted tracker's pin to its
+/// `follow` ref, in one commit on the branch this runs on.
+fn pull_all() -> Result<()> {
+    let context = context_here()?;
+    let instance = context.current_branch.clone();
+    let manager = BranchManager::open(context.store)?;
+    let outcome = manager.pull_all(instance.as_deref())?;
+    let place = match instance.as_deref() {
+        Some(instance) => format!("`{instance}`"),
+        None => "the project root".to_owned(),
+    };
+    match &outcome.view {
+        None => {
+            println!("Nothing to pull: no mounted tracker is behind its `follow` ref in {place}")
+        }
+        Some(view) => {
+            println!(
+                "Updated {} in {place}, one commit ({}):",
+                plural(outcome.pulled.len(), "tracker"),
+                short_rev(view)
+            );
+            for pulled in &outcome.pulled {
+                println!(
+                    "  {:<12} {} from {}",
+                    tracker_path(&pulled.tracker),
+                    plural(pulled.commits, "commit"),
+                    pulled.follow
+                );
+            }
+        }
+    }
+    for (tracker, follow) in &outcome.diverged {
+        println!(
+            "  `{}` stays: its pin has commits its `{follow}` does not (`newgit merge` them first)",
+            tracker_path(tracker)
+        );
+    }
+    for (tracker, follow) in &outcome.no_follow {
+        println!(
+            "  `{}` stays: it has no `{follow}` to pull here",
+            tracker_path(tracker)
+        );
+    }
+    for tracker in &outcome.deeper {
+        println!(
+            "  `{}` stays: it is mounted deeper; pull it in the tracker that mounts it",
+            tracker_path(tracker)
+        );
+    }
+    if !outcome.outside_git.is_empty() {
+        let names: Vec<String> = outcome
+            .outside_git
+            .iter()
+            .map(|tracker| format!("`{}`", tracker_path(tracker)))
+            .collect();
+        println!(
+            "  trackers outside Git have no pins and were left alone ({}): `newgit tracker pull \
+             <tracker>` updates one",
+            names.join(", ")
+        );
     }
     Ok(())
 }
