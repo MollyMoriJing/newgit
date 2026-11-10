@@ -114,10 +114,19 @@ export interface MirrorInstance {
 	pins: Record<string, string>;
 }
 
+/** One commit a pull would bring in beyond `main`, as a look reports it. */
+export interface WalkedCommit {
+	commit: string;
+	parents: string[];
+	/** The first line of its message: GitHub's merge commits name their branch there. */
+	subject: string;
+}
+
 /** How a pull ended. A refusal is an answer: running it again refuses again. */
 export type PullAnswer =
 	| { outcome: "nothing" }
-	| { outcome: "work" }
+	/** A look found something to land: every commit it would bring in beyond `main`, oldest first. */
+	| { outcome: "work"; commits: WalkedCommit[] }
 	| { outcome: "landed"; list: Record<string, string>; commits: number; moves?: RefMove[] }
 	| { outcome: "tagged"; root: string; annotation: { tagger: string; message: string } | null }
 	| { outcome: "refused"; why: string };

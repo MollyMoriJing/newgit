@@ -739,9 +739,9 @@ export class ProjectDO extends DurableObject<Env> {
 		return tokens;
 	}
 
-	/** A look found something to land. */
-	markPeeked(pull: MirrorPull): void {
-		this.writePulls(this.pulls().map((known) => (samePull(known, pull) ? { ...known, peeked: true } : known)));
+	/** A look found something to land: this, beyond `main`. */
+	markPeeked(pull: MirrorPull, beyond: NonNullable<MirrorPull["beyond"]>): void {
+		this.writePulls(this.pulls().map((known) => (samePull(known, pull) ? { ...known, beyond } : known)));
 	}
 
 	/** Whose work this pull may hold: settled. */
@@ -878,7 +878,7 @@ export class ProjectDO extends DurableObject<Env> {
 						? "queued"
 						: pull.tag !== undefined
 							? "tagging"
-							: !pull.peeked
+							: pull.beyond === undefined
 								? "looking"
 								: pull.instances === undefined
 									? "asking GitHub"

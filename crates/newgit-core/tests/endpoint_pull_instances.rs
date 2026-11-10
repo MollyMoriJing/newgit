@@ -11,92 +11,7 @@ use std::collections::BTreeMap;
 
 use imports::*;
 use mirror_remote::*;
-use newgit_core::compose::{self, ComposeOptions};
 use newgit_core::endpoint::{MirrorInstance, PullAnswer, pull_mirror};
-
-/// What the probe found: an agent edits `apps/t3code/x.ts` and `src/y.rs` in
-/// one commit, the branch push strips t3code, and the pull request merges on
-/// the mirror. Returns the mirror's merge commit, and the instance as the
-/// Worker describes it.
-fn merged_pr(remote: &Remote) -> (String, MirrorInstance) {
-    let workspace = manager(&remote.store)
-        .spawn("feature", None)
-        .expect("spawn")
-        .branch
-        .workspace_path;
-    git(&workspace, &["config", "commit.gpgSign", "false"]);
-    commit_as(
-        &workspace,
-        "ana",
-        2_000_000,
-        &[("apps/t3code/x.ts", "x\n"), ("src/y.rs", "y\n")],
-        "edit both",
-    );
-    manager(&remote.store)
-        .checkpoint("feature", None)
-        .expect("checkpoint");
-    let (store, reference) = manager(&remote.store)
-        .tracker_log_target("root", Some("feature"))
-        .expect("split");
-    let root_commit = git(
-        &remote.temp,
-        &[&format!("--git-dir={store}"), "rev-parse", &reference],
-    );
-    let held = compose::index(&store, "root", &root_commit).expect("index");
-
-    // The push to the mirror's branch: the instance, as the target sees it.
-    let project = remote.store.paths().project_root.clone();
-    let ships = |tracker: &str| tracker != "t3code";
-    let view = compose::compose(
-        &project,
-        "root",
-        &[("refs/newgit/test/branch".to_owned(), root_commit)],
-        &ComposeOptions {
-            readable: &ships,
-            admit: None,
-        },
-    )
-    .expect("compose")
-    .remove(0)
-    .tip
-    .expect("a view");
-    git(
-        &project,
-        &[
-            "push",
-            "-q",
-            remote.mirror.as_str(),
-            &format!("{view}:refs/heads/feature"),
-        ],
-    );
-
-    let clone = remote.temp.join("pr");
-    git(
-        &remote.temp,
-        &["clone", "-q", remote.mirror.as_str(), clone.as_str()],
-    );
-    git(&clone, &["config", "commit.gpgSign", "false"]);
-    git(
-        &clone,
-        &[
-            "merge",
-            "-q",
-            "--no-ff",
-            "-m",
-            "Merge pull request #7 from acme/feature",
-            "origin/feature",
-        ],
-    );
-    git(&clone, &["push", "-q", "origin", "main"]);
-    let theirs = git(&clone, &["rev-parse", "HEAD"]);
-    (
-        theirs,
-        MirrorInstance {
-            name: "feature".to_owned(),
-            pins: BTreeMap::from([("t3code".to_owned(), held["t3code"].clone())]),
-        },
-    )
-}
 
 fn answer(
     remote: &Remote,
@@ -275,10 +190,10 @@ fn a_look_says_what_a_landing_would_and_moves_nothing() {
         &[("pr.txt", "pr\n")],
         "from GitHub",
     );
-    assert_eq!(
+    assert!(matches!(
         answer(&remote, &base, &theirs, Vec::new(), true),
-        PullAnswer::Work
-    );
+        PullAnswer::Work { commits } if commits.last().is_some_and(|last| last.commit == theirs)
+    ));
     assert_eq!(remote.main("root"), root);
 }
 
