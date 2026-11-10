@@ -68,7 +68,7 @@ not (
     | binary(=tracker_log)
     | binary(=tracker_ownership)
     | binary(=tracker_link)
-    | binary(=tracker_history)
+    | binary(=tracker_no_history)
     | binary(=tracker_pinned)
 )
 '''

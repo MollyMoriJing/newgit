@@ -5,17 +5,14 @@ import { LOGIN_TTL_SECONDS } from "../src/auth";
 import { handle, issue } from "../src/index";
 import { commitObject, treeObject } from "../src/objects";
 import { landingRef } from "../src/refs";
-import { nativeIndex } from "../src/walk";
 import { FakeRepos, noEndpoint } from "./fake-repos";
 import { sweep } from "../src/sweep";
 import { runInDurableObject } from "cloudflare:test";
 import type { ProjectDO } from "../src/project";
 
-// Anchoring build step 5 (docs/design/anchoring.md): a parent records each
-// child as `history` says, every change (`commits`) or where it is now
-// (`pins`), and the sweep rolls up what nobody read and clears the landing
-// refs merges leave. New tests live in their own file per AGENTS.md's
-// "Working in parallel".
+// The sweep (docs/design/anchoring.md): it rolls up what nobody read and
+// clears the landing refs merges leave. New tests live in their own file per
+// AGENTS.md's "Working in parallel".
 
 const blob = "45b983be36b73c0788dc9cbcb76cbb80fc7bb057";
 const other = "8baef1b4abc478178b004d62031cf7fe6db6f903";
@@ -99,42 +96,6 @@ async function moveBelowRoot(tracker: string, file: string) {
 }
 
 const rootHead = async () => (await project().branch("main"))!.list.root;
-
-describe("a child recorded as `pins`", () => {
-	it("rolls up as one snapshot of where it is now, however many times it moved", async () => {
-		repos.write(repo("access"), "site.toml", 'audience = "project-devs"\ngit = true\nmount = "site"\nhistory = "pins"\n');
-		const before = await rootHead();
-		await moveBelowRoot("site", other);
-		const last = await moveBelowRoot("site", blob.replace("4", "7"));
-		expect(await sweep(env, deps(), id())).toBe(false);
-		const head = await repos.readCommit(repo("root"), await rootHead());
-		expect(head?.parents, "one commit, on the head").toEqual([before]);
-		const now = (await project().branch("main"))!.list;
-		expect(now.site).toBe(last);
-		expect(await nativeIndex(repos, (tracker) => repo(tracker), now)).toMatchObject({ matches: true });
-	});
-
-	it("beside a `commits` child: one commit per change for it, one snapshot for the pins", async () => {
-		repos.write(repo("access"), "site.toml", 'audience = "project-devs"\ngit = true\nmount = "site"\nhistory = "pins"\n');
-		const before = await rootHead();
-		await moveBelowRoot("t3code", other);
-		await moveBelowRoot("site", other);
-		await moveBelowRoot("t3code", blob.replace("4", "7"));
-		await moveBelowRoot("site", blob.replace("4", "7"));
-		await sweep(env, deps(), id());
-		// t3code twice, then the pins once: three commits above the head.
-		let commit = await repos.readCommit(repo("root"), await rootHead());
-		const chain = [];
-		while (commit !== null && commit.hash !== before) {
-			chain.push(commit.hash);
-			commit = await repos.readCommit(repo("root"), commit.parents[0]);
-		}
-		expect(chain).toHaveLength(3);
-		expect(await nativeIndex(repos, (tracker) => repo(tracker), (await project().branch("main"))!.list)).toMatchObject({
-			matches: true,
-		});
-	});
-});
 
 describe("the sweep", () => {
 	it("rolls up what nobody read", async () => {

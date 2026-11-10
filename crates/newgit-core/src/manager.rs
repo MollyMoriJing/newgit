@@ -11035,8 +11035,9 @@ impl BranchManager {
     /// the merge is made in the composed view.
     ///
     /// The view merge is three-way over composed history, which holds a
-    /// tracker's commits only where root kept them. A parent that rolls a
-    /// child up as `pins` keeps none, so the instance's last merge was never
+    /// tracker's commits only where root kept them. A roll-up that could not
+    /// keep the merge's own commit (another landing moved root's head first)
+    /// writes one of its own, so the instance's last merge was never
     /// `main`'s view's ancestor, and its next one met an old base and
     /// "conflicted" on files only it had changed (seen on the dev remote).
     fn merge_by_pins(&self, ours: &str, theirs: &str, message: &str) -> Result<Option<String>> {
