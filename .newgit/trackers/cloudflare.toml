@@ -4,3 +4,4 @@ merge_with_source = true
 mount = "remote"
 paths = ["."]
 git = true
+export = "inherit"

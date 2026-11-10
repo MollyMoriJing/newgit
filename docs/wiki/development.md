@@ -29,6 +29,6 @@ it locally.
 - `remote/` is the hosted remote: a Cloudflare Worker with Durable Objects
   over Artifacts repos, deployed at `https://newgit.dev`.
 - `.newgit/` is created by `newgit init`. Committed: `config.toml`,
-  `trackers/`, `resources/`, `scripts/`, `exports/`. Gitignored local state: `branches/`,
+  `trackers/`, `resources/`, `scripts/`. Gitignored local state: `branches/`,
   `checkpoints/`, `logs/`, `state/`, `installs/`, and `local/` — which holds
   `trackers.git`, every tracker's history (bare repo).

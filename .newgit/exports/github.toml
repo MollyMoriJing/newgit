@@ -1,6 +1,0 @@
-# The GitHub mirror: only newgit's own trackers ship. t3code goes to its fork,
-# through exports/t3code.toml. Each workspace push lands its branch here for
-# `gh pr create`.
-url = "Spheroman/newgit"
-trackers = ["root", "access", "serve", "cloudflare"]
-branches = true

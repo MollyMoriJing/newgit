@@ -252,10 +252,32 @@ pub fn merge_pr(
     git(&clone, &["rev-parse", "HEAD"])
 }
 
-/// Define export target `name` in the project root (uncommitted: targets are
-/// read from the working tree).
-pub fn define_target(store: &MetadataStore, name: &str, text: &str) {
-    let dir = store.paths().project_root.join(".newgit/exports");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(dir.join(format!("{name}.toml")), text).expect("write");
+/// Set the `export` of the tracker `.newgit/trackers/<tracker>.toml` defines
+/// in the project root, as written, or take it out (uncommitted: definitions
+/// are read from the working tree).
+pub fn set_export(store: &MetadataStore, tracker: &str, export: Option<&str>) {
+    let path = store
+        .paths()
+        .project_root
+        .join(format!(".newgit/trackers/{tracker}.toml"));
+    let text = std::fs::read_to_string(&path).expect("definition");
+    let mut kept: String = text
+        .lines()
+        .filter(|line| !line.starts_with("export "))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    if let Some(export) = export {
+        kept.push_str(&format!("export = {export}\n"));
+    }
+    std::fs::write(&path, kept).expect("write");
+}
+
+/// An `export` table for a target at `url` named `name`, with `extra` keys
+/// as written.
+pub fn export_to(url: &camino::Utf8Path, name: &str, extra: &str) -> String {
+    if extra.is_empty() {
+        format!("{{ url = \"{url}\", name = \"{name}\" }}")
+    } else {
+        format!("{{ url = \"{url}\", name = \"{name}\", {extra} }}")
+    }
 }

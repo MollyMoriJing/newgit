@@ -16,10 +16,10 @@ fn exported(temp: &camino::Utf8Path) -> (MetadataStore, camino::Utf8PathBuf, Str
     let store = project(temp);
     let github = github_copy(temp, &upstream, "t3code");
     let outcome = import(&store, &upstream);
-    define_target(
+    set_export(
         &store,
         "t3code",
-        &format!("url = \"{github}\"\nbranch = \"newgit\"\nroot = \"t3code\"\n"),
+        Some(&export_to(&github, "t3code", "branch = \"newgit\"")),
     );
     let repo = store.paths().project_root.clone();
     git(&repo, &["add", "-A"]);
@@ -216,8 +216,9 @@ fn a_history_adding_a_file_a_tracker_outside_git_owns_is_refused() {
     assert_eq!(git(&repo, &["rev-parse", "HEAD"]), head);
 }
 
-/// A mirror of the project itself, shipping `trackers`.
-fn mirrored(temp: &camino::Utf8Path, trackers: &str) -> (MetadataStore, camino::Utf8PathBuf) {
+/// A mirror of the project itself, root's, which `access` inherits when
+/// `access`.
+fn mirrored(temp: &camino::Utf8Path, access: bool) -> (MetadataStore, camino::Utf8PathBuf) {
     let store = project(temp);
     let repo = store.paths().project_root.clone();
     let mirror = temp.join("mirror.git");
@@ -225,11 +226,11 @@ fn mirrored(temp: &camino::Utf8Path, trackers: &str) -> (MetadataStore, camino::
         temp,
         &["init", "-q", "--bare", "-b", "main", mirror.as_str()],
     );
-    define_target(
-        &store,
-        "github",
-        &format!("url = \"{mirror}\"\ntrackers = {trackers}\n"),
-    );
+    set_export(&store, "root", Some(&export_to(&mirror, "github", "")));
+    set_export(&store, "access", access.then_some("\"inherit\""));
+    // Root's too, so the commit is the mirror's even when `access`, which
+    // holds the definitions, is withheld there.
+    std::fs::write(repo.join("MIRRORED.md"), "mirrored\n").expect("write");
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "export target"]);
     manager(&store).merge("main", "main").expect("publish");
@@ -242,7 +243,7 @@ fn mirrored(temp: &camino::Utf8Path, trackers: &str) -> (MetadataStore, camino::
 #[test]
 fn pulling_back_from_a_target_without_root_recognises_our_commits() {
     let (_guard, temp) = tempdir();
-    let (store, mirror) = mirrored(&temp, "[\"root\", \"access\"]");
+    let (store, mirror) = mirrored(&temp, true);
     let repo = store.paths().project_root.clone();
     let theirs = merge_pr(&temp, &mirror, "main", &[("pr.txt", "pr\n")], "from GitHub");
 
@@ -263,7 +264,7 @@ fn pulling_back_from_a_target_without_root_recognises_our_commits() {
 #[test]
 fn a_target_withholding_a_tracker_comes_back_with_its_files_put_back() {
     let (_guard, temp) = tempdir();
-    let (store, mirror) = mirrored(&temp, "[\"root\"]");
+    let (store, mirror) = mirrored(&temp, false);
     let repo = store.paths().project_root.clone();
     let before = git(&repo, &["rev-parse", "HEAD"]);
     let definitions = git(&repo, &["rev-parse", "HEAD:.newgit/trackers"]);

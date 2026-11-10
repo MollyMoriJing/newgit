@@ -1024,3 +1024,32 @@ fn workspace_of(fixture: &Fixture, name: &str) -> Utf8PathBuf {
     )
 }
 
+
+/// Set the `export` of the tracker `.newgit/trackers/<tracker>.toml` (under
+/// `store`) defines, as written, or take it out. Uncommitted: definitions are
+/// read from the working tree, and committing is the caller's.
+#[allow(dead_code)]
+fn set_export(store: &Utf8Path, tracker: &str, export: Option<&str>) {
+    let path = store.join(format!(".newgit/trackers/{tracker}.toml"));
+    let text = std::fs::read_to_string(&path).expect("definition");
+    let mut kept: String = text
+        .lines()
+        .filter(|line| !line.starts_with("export "))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    if let Some(export) = export {
+        kept.push_str(&format!("export = {export}\n"));
+    }
+    std::fs::write(&path, kept).expect("write");
+}
+
+/// An `export` table for a target at `url` named `name`, with `extra` keys
+/// (`branch = "newgit", branches = true`) as written.
+#[allow(dead_code)]
+fn export_to(url: &Utf8Path, name: &str, extra: &str) -> String {
+    if extra.is_empty() {
+        format!("{{ url = \"{url}\", name = \"{name}\" }}")
+    } else {
+        format!("{{ url = \"{url}\", name = \"{name}\", {extra} }}")
+    }
+}

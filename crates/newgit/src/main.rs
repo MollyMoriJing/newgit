@@ -6,6 +6,7 @@ use newgit_core::checkpoint::CheckpointReason;
 use newgit_core::cleanup::{ArchivedCheckpoints, HookDetail, HookOutcome};
 use newgit_core::deposit_diff::{DepositDiff, FileChange, escape_control};
 use newgit_core::export::{ExportFilter, Reason};
+use newgit_core::export_target::declared_in;
 use newgit_core::exports::unresolved_placeholder;
 use newgit_core::installs::InstallReport;
 use newgit_core::manager::{
@@ -284,7 +285,7 @@ enum Command {
         /// otherwise)
         #[arg(conflicts_with = "remote")]
         instance: Option<String>,
-        /// The export target (`.newgit/exports/<name>.toml`) to pull from
+        /// The export target to pull from (declared by a tracker's `export`)
         #[arg(long, value_name = "TARGET", conflicts_with = "tracker")]
         remote: Option<String>,
     },
@@ -577,8 +578,8 @@ struct ExportArgs {
     /// Destination directory; must be empty or nonexistent
     #[arg(long, value_name = "DIR")]
     to: Option<Utf8PathBuf>,
-    /// Push the trackers' `main`s, history and all, to the target defined in
-    /// .newgit/exports/<NAME>.toml (a GitHub mirror, say)
+    /// Push the trackers' `main`s, history and all, to target NAME, which a
+    /// tracker's `export` declares (a GitHub mirror, say)
     #[arg(long, value_name = "NAME", conflicts_with_all = ["instance", "includes", "excludes"])]
     remote: Option<String>,
     /// Include this path regardless of tracker audience; repeatable
@@ -2198,6 +2199,18 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                 plural(outcome.commits as usize, "commit"),
                 outcome.source
             );
+            if outcome.inherits_export {
+                println!(
+                    "  export:    inherits `{}`'s (`export = \"inherit\"`), so it ships wherever that does",
+                    tracker_path(&outcome.source)
+                );
+            } else {
+                println!(
+                    "  export:    none: its audience is narrower than `{}`'s, so it ships nowhere until \
+                     its definition says where (`newgit reference export`)",
+                    tracker_path(&outcome.source)
+                );
+            }
             println!(
                 "  commit to it with Git; newgit splits your commits into it when work leaves the machine"
             );
@@ -3590,7 +3603,10 @@ fn export_to_remote(name: &str, options: RemoteExportOptions) -> Result<()> {
         ),
         None => println!("{verb} `main` → {} (branch {})", outcome.url, target.branch),
     }
-    let width = column_width(outcome.trackers.iter().map(|t| t.name.len()), "");
+    let width = column_width(
+        outcome.trackers.iter().map(|t| tracker_path(&t.name).len()),
+        "",
+    );
     // Rooted at a tracker, the others are not withheld so much as not in
     // that view at all.
     let shown = outcome
@@ -3603,25 +3619,26 @@ fn export_to_remote(name: &str, options: RemoteExportOptions) -> Result<()> {
             .as_deref()
             .map_or("no history yet", short_rev);
         match tracker.reason {
-            ExportReason::Public => println!(
-                "  tracker:  {:<width$}  included (audience public) @ {at}",
-                tracker.name
-            ),
-            ExportReason::Listed => println!(
-                "  tracker:  {:<width$}  included (named by .newgit/exports/{}.toml, audience {}) @ {at}",
-                tracker.name, target.name, tracker.audience
-            ),
             ExportReason::Root => println!(
-                "  tracker:  {:<width$}  the root (named by .newgit/exports/{}.toml), its own files at the top @ {at}",
-                tracker.name, target.name
+                "  tracker:  {:<width$}  declares it (`export` in {}), audience {}{} @ {at}",
+                tracker_path(&tracker.name),
+                declared_in(target),
+                tracker.audience,
+                if target.root.is_some() {
+                    ", its own files at the top"
+                } else {
+                    ""
+                }
             ),
-            ExportReason::Mounted => println!(
-                "  tracker:  {:<width$}  mounted in the root @ {at}",
-                tracker_path(&tracker.name)
+            ExportReason::Inherited => println!(
+                "  tracker:  {:<width$}  inherits it (`export = \"inherit\"`), audience {} @ {at}",
+                tracker_path(&tracker.name),
+                tracker.audience
             ),
             ExportReason::Withheld => println!(
                 "  withheld: {:<width$}  (audience {})",
-                tracker.name, tracker.audience
+                tracker_path(&tracker.name),
+                tracker.audience
             ),
         }
     }
@@ -3657,10 +3674,7 @@ fn export_to_remote(name: &str, options: RemoteExportOptions) -> Result<()> {
             .iter()
             .any(|t| t.reason == ExportReason::Withheld)
     {
-        println!(
-            "  Ship a withheld tracker by naming it in .newgit/exports/{}.toml: trackers = [\"<name>\"]",
-            target.name
-        );
+        println!("  Ship a withheld tracker by giving its definition `export = \"inherit\"`");
     }
     Ok(())
 }

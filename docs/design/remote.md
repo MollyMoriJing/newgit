@@ -48,7 +48,8 @@ Objects, the Git endpoint's container, and Artifacts.
 `.github/workflows/deploy-remote.yml` deploys it after CI passes on
 `main`, or by hand from the Actions tab. newgit itself is developed on it:
 this repository is `spheroman/newgit` on newgit.dev, and GitHub's
-`Spheroman/newgit` is its export target (`.newgit/exports/github.toml`).
+`Spheroman/newgit` is its export target, declared by `export` in root's
+definition (`.newgit/trackers/root.toml`).
 
 **Built, and run live:**
 
@@ -108,9 +109,10 @@ this repository is `spheroman/newgit` on newgit.dev, and GitHub's
   (`refs/trackers/<tracker>/…`), so a tracker never merged serves nothing
   and `/` redirects to the GitHub repository. Nothing reads that `main`
   back into another machine yet: `tracker pull` there still takes its own.
-- GitHub export (0.6.0): `newgit export --remote <NAME>` pushes the chosen
-  trackers' `main`s, history and all, to the target defined in
-  `.newgit/exports/<NAME>.toml`; `--dry-run` composes and checks without
+- GitHub export (0.6.0): `newgit export --remote <NAME>` pushes the
+  trackers' `main`s, history and all, to the target a tracker's `export`
+  declares, with every tracker that inherits it (`export = "inherit"`);
+  `--dry-run` composes and checks without
   pushing, and `--force` replaces the target branch. When the target is
   ahead with the project's own commits (a pull request merged on GitHub),
   the export brings them in first instead of refusing. A target with
@@ -859,20 +861,22 @@ Undo stays as it is in v1, local only.
 ## The GitHub webhook
 
 A pull request merged on a mirror lands in `main` on newgit.dev by itself.
-GitHub pushes an event to `POST
-/v1/webhooks/github?project=<owner>/<name>&target=<target>`, and the rest is
-`newgit pull --remote <target>` for a target without `root`, run on the
-remote ([trackers.md](trackers.md), *Git and GitHub*).
+GitHub pushes an event to `POST /v1/webhooks/github?project=<owner>/<name>`,
+and the rest is `newgit pull --remote <target>` for the target root
+declares, run on the remote ([trackers.md](trackers.md), *Git and GitHub*).
 
 **What is checked, in order.** `X-Hub-Signature-256` is HMAC-SHA256 of the
 raw body under `GITHUB_WEBHOOK_SECRET`, compared in constant time; unsigned
 or mis-signed is 401, and with no secret configured everything is 503.
 `ping` is 200, and any event but `push` is 200 and ignored. The URL names
-the project and the target; root's `main` must have that
-`.newgit/exports/<target>.toml`, and its `url` must be the repo the event
-came from, or it is 403, so one repo's event cannot move a project that does
-not say it mirrors there. A rooted target, another branch, and a deleted
-branch are 200 and ignored. Whoever pushed (GitHub's `pusher.name`, which is
+the project; one of its tracker definitions on `main` must declare an
+`export` to the repo the event came from, or it is 403, so one repo's event
+cannot move a project that does not say it mirrors there. That declaration
+is the target: one repository is one target, so the URL needs no
+`&target=` (one left from before is not read). The trackers it ships are the
+declaring one and those inheriting its export, as the client decides. A
+target declared by another tracker than root (rooted at it), another branch,
+and a deleted branch are 200 and ignored. Whoever pushed (GitHub's `pusher.name`, which is
 their newgit login) must be a member who may merge root; what they do not
 maintain, and what the target withholds, gets no write password and may not
 change. A private mirror is 422: the endpoint fetches mirrors without
@@ -1017,7 +1021,7 @@ that ref: the rest of the path would have to follow first.
 **Setting one up**, in the repo's *Settings → Webhooks*:
 
 - Payload URL:
-  `https://newgit.dev/v1/webhooks/github?project=<owner>/<name>&target=<target>`
+  `https://newgit.dev/v1/webhooks/github?project=<owner>/<name>`
 - Content type: `application/json`
 - Secret: the value of `GITHUB_WEBHOOK_SECRET`, set with `wrangler secret put
   GITHUB_WEBHOOK_SECRET`

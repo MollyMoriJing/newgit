@@ -128,7 +128,7 @@ export async function deliver({ event = "push", payload = push(), signature, que
 	const signed = signature === undefined ? await sign(SECRET, body) : signature;
 	if (signed !== null) headers.set("x-hub-signature-256", signed);
 	const response = await handle(
-		new Request(`https://newgit.dev/v1/webhooks/github?${query ?? `project=jack/${name}&target=github`}`, {
+		new Request(`https://newgit.dev/v1/webhooks/github?${query ?? `project=jack/${name}`}`, {
 			method: "POST",
 			headers,
 			body,
@@ -154,18 +154,23 @@ beforeEach(async () => {
 	name = `hook-${crypto.randomUUID().slice(0, 8)}`;
 	jack = (await issue(env, { kind: "login", login: "jack", ttlSeconds: LOGIN_TTL_SECONDS })).token;
 	await call(jack, "POST", "/v1/projects", { name, trackers: ["root", "access", "t3code"] });
-	repos.write(`jack.${name}.t.access`, "root.toml", 'audience = "project-devs"\ngit = true\n');
+	// Root declares the mirror and `access` inherits it; t3code, public but not
+	// inheriting, is withheld from it and declares its own.
+	repos.write(
+		`jack.${name}.t.access`,
+		"root.toml",
+		'audience = "project-devs"\ngit = true\nexport = { url = "github.com/Spheroman/newgit", name = "github" }\n',
+	);
+	repos.write(
+		`jack.${name}.t.access`,
+		"access.toml",
+		'audience = "project-devs"\ngit = true\nmount = ".newgit/trackers"\npaths = ["."]\nmaintainers = "owner"\nexport = "inherit"\n',
+	);
 	repos.write(
 		`jack.${name}.t.access`,
 		"t3code.toml",
-		'audience = "public"\ngit = true\nmount = "apps/t3code"\npaths = ["."]\n',
+		'audience = "public"\ngit = true\nmount = "apps/t3code"\npaths = ["."]\nexport = "github.com/Spheroman/t3code"\n',
 	);
-	repos.write(
-		`jack.${name}.t.root`,
-		".newgit/exports/github.toml",
-		'url = "Spheroman/newgit"\ntrackers = ["root", "access"]\n',
-	);
-	repos.write(`jack.${name}.t.root`, ".newgit/exports/t3code.toml", 'url = "Spheroman/t3code"\nroot = "t3code"\n');
 	await call(jack, "PUT", path("/branches/main"), { list: main });
 });
 

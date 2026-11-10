@@ -11,10 +11,10 @@ use newgit_core::manager::RemoteExportOptions;
 const TARGET: &str = "t3code";
 
 fn rooted(store: &newgit_core::store::MetadataStore, bare: &camino::Utf8Path) {
-    define_target(
+    set_export(
         store,
-        TARGET,
-        &format!("url = \"{bare}\"\nbranch = \"newgit\"\nroot = \"t3code\"\n"),
+        "t3code",
+        Some(&export_to(bare, TARGET, "branch = \"newgit\"")),
     );
 }
 
@@ -70,7 +70,7 @@ fn the_first_export_of_an_import_is_a_no_op_fast_forward_of_its_upstream() {
 }
 
 #[test]
-fn a_root_that_mounts_a_tracker_in_git_ships_what_it_mounts() {
+fn a_root_that_mounts_a_tracker_in_git_ships_what_inherits_its_export() {
     let (_guard, temp) = tempdir();
     let upstream = upstream(&temp);
     let store = project(&temp);
@@ -78,7 +78,8 @@ fn a_root_that_mounts_a_tracker_in_git_ships_what_it_mounts() {
     let github = github_copy(&temp, &upstream, "t3code");
     import(&store, &upstream);
     manager(&store).merge("main", "main").expect("publish");
-    // t3code mounts `ui` of its own, defined in its own .newgit/trackers.
+    // t3code mounts `ui` of its own, defined in its own .newgit/trackers,
+    // which ships wherever t3code does.
     commit_as(
         &repo,
         "ana",
@@ -86,7 +87,7 @@ fn a_root_that_mounts_a_tracker_in_git_ships_what_it_mounts() {
         &[
             (
                 "apps/t3code/.newgit/trackers/ui.toml",
-                "audience = \"project-devs\"\nstorage = \"local\"\ngit = true\nmount = \"ui\"\npaths = [\".\"]\n",
+                "audience = \"project-devs\"\nstorage = \"local\"\ngit = true\nmount = \"ui\"\npaths = [\".\"]\nexport = \"inherit\"\n",
             ),
             ("apps/t3code/ui/button.ts", "b\n"),
         ],
@@ -100,27 +101,4 @@ fn a_root_that_mounts_a_tracker_in_git_ships_what_it_mounts() {
     let files = git(&github, &["ls-tree", "-r", "--name-only", "newgit"]);
     assert!(files.lines().any(|line| line == "ui/button.ts"), "{files}");
     assert!(!files.contains(".newgit/pins"), "{files}");
-}
-
-#[test]
-fn root_must_name_a_tracker_in_git_and_cannot_come_with_trackers() {
-    let (_guard, temp) = tempdir();
-    let store = project(&temp);
-    define_target(&store, "x", "url = \"/nowhere\"\nroot = \"nothing\"\n");
-    let error = manager(&store)
-        .export_to_remote("x", RemoteExportOptions::default())
-        .expect_err("refused");
-    assert!(
-        error.to_string().contains("`root` names `nothing`"),
-        "{error}"
-    );
-    define_target(
-        &store,
-        "x",
-        "url = \"/nowhere\"\nroot = \"root\"\ntrackers = [\"root\"]\n",
-    );
-    let error = manager(&store)
-        .export_to_remote("x", RemoteExportOptions::default())
-        .expect_err("refused");
-    assert!(error.to_string().contains("cannot"), "{error}");
 }

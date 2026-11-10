@@ -12,10 +12,9 @@
 // meanwhile sends it back to start from `main` as it is. Every step can run
 // twice: a redelivery, an evicted object, or a retry finds the work done.
 
-import { parse as parseToml } from "smol-toml";
-
 import {
 	type Deps,
+	type ExportDeclaration,
 	HttpError,
 	isChecking,
 	anchorFor,
@@ -26,6 +25,7 @@ import {
 	repoNamer,
 	revokeRepoTokens,
 	settle,
+	type TrackerFacts,
 } from "./index";
 import { pausedBy } from "./budget";
 import type { MirrorInstance, PullPlan } from "./endpoint";
@@ -122,10 +122,53 @@ export async function verifySignature(secret: string, body: ArrayBuffer, header:
 /** The `owner/name` an export target's `url` is on GitHub, lowercased; null when it is elsewhere. */
 export function githubRepo(url: string): string | null {
 	const found =
-		url.match(/^(\w[\w.-]*\/\w[\w.-]*)$/) ??
-		url.match(/^https:\/\/github\.com\/([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/) ??
+		url.match(/^(?:https:\/\/)?github\.com\/([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/) ??
 		url.match(/^git@github\.com:([\w.-]+\/[\w.-]+?)(?:\.git)?$/);
 	return found ? found[1].toLowerCase() : null;
+}
+
+/** A target's name, as the client gives it: its `name`, or its repository's. */
+export function targetName(declaration: ExportDeclaration): string {
+	if (declaration.name !== undefined) return declaration.name;
+	const last = declaration.url.replace(/\/+$/, "").split(/[/:]/).pop() ?? "";
+	return last.endsWith(".git") ? last.slice(0, -".git".length) : last;
+}
+
+/** The tracker whose export `"inherit"` takes: `t3code` for `t3code__repos`, root for the rest. */
+function exportParent(tracker: string): string | null {
+	if (tracker === "root") return null;
+	const at = tracker.lastIndexOf("__");
+	return at < 0 ? "root" : tracker.slice(0, at);
+}
+
+/**
+ * Whether `tracker` ships in the target `declaredBy` declares: it is that
+ * tracker, or it says `export = "inherit"` all the way up to it. As the
+ * client decides it (`export_target::resolve_targets`).
+ */
+export function shipsIn(tracker: string, declaredBy: string, facts: Map<string, TrackerFacts>): boolean {
+	let at: string | null = tracker;
+	while (at !== null) {
+		if (at === declaredBy) return facts.get(at)?.git === true;
+		const found = facts.get(at);
+		if (found?.git !== true || !(found.export ?? []).includes("inherit")) return false;
+		at = exportParent(at);
+	}
+	return false;
+}
+
+/** The target a GitHub repo is, among the definitions: the one declaring a URL there. */
+export function targetFor(
+	repo: string,
+	facts: Map<string, TrackerFacts>,
+): { declaredBy: string; declaration: ExportDeclaration } | null {
+	for (const [tracker, found] of facts) {
+		if (!found.git) continue;
+		for (const entry of found.export ?? []) {
+			if (entry !== "inherit" && githubRepo(entry.url) === repo.toLowerCase()) return { declaredBy: tracker, declaration: entry };
+		}
+	}
+	return null;
 }
 
 /** The slug newgit names an instance by: its branch, as `branch_slug` makes it. */
@@ -238,40 +281,17 @@ function bringItIn(target: string): string {
 	return `redeliver the event from GitHub's *Recent Deliveries*, or run \`newgit pull --remote ${target}\` from the project root`;
 }
 
-interface Target {
-	url: string;
-	branch: string;
-	root?: string;
-	trackers: string[];
-}
-
-function parseTarget(text: string): Target | null {
-	let file: { url?: unknown; branch?: unknown; root?: unknown; trackers?: unknown };
-	try {
-		file = parseToml(text) as typeof file;
-	} catch {
-		return null;
-	}
-	if (typeof file.url !== "string") return null;
-	return {
-		url: file.url,
-		branch: typeof file.branch === "string" ? file.branch : "main",
-		...(typeof file.root === "string" ? { root: file.root } : {}),
-		trackers: Array.isArray(file.trackers) ? file.trackers.filter((name) => typeof name === "string") : [],
-	};
-}
-
 const refused = (status: number, reason: string, context: Record<string, unknown>): never => {
 	console.error(JSON.stringify({ webhook: "refused", reason, ...context }));
 	throw new HttpError(status, reason);
 };
 
 /**
- * `POST /v1/webhooks/github?project=<owner>/<name>&target=<target>`. Which
- * project and target an event is for is in the URL, set when the webhook was
- * made; the project's own `.newgit/exports/<target>.toml` then has to name
- * the repo the event came from, so one repo's event cannot move a project
- * that does not say it mirrors there.
+ * `POST /v1/webhooks/github?project=<owner>/<name>`. Which project an event
+ * is for is in the URL, set when the webhook was made; one of the project's
+ * tracker definitions on `main` then has to declare an `export` to the repo
+ * the event came from, so one repo's event cannot move a project that does
+ * not say it mirrors there. That declaration is the target: a repo is one.
  */
 export async function githubWebhook(request: Request, env: Env, deps: Deps): Promise<Response> {
 	if (!env.GITHUB_WEBHOOK_SECRET) throw new HttpError(503, "this remote has no GITHUB_WEBHOOK_SECRET");
@@ -298,35 +318,29 @@ export async function githubWebhook(request: Request, env: Env, deps: Deps): Pro
 		throw new HttpError(400, "the event is not JSON");
 	}
 	const url = new URL(request.url);
-	const context = { project: url.searchParams.get("project"), target: url.searchParams.get("target"), repo: payload.repository?.full_name };
+	const repo = payload.repository?.full_name ?? "";
+	const context = { project: url.searchParams.get("project"), repo };
 	const id = parseProject(context.project);
 	if (id === null) return refused(400, "the webhook's URL needs `?project=<owner>/<name>`", context);
-	const target = context.target;
-	if (target === null || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(target))
-		return refused(400, "the webhook's URL needs `&target=<export target>`", context);
 	const project = projectStub(env, id);
 	const info = await project.info();
 	if (info === null) return refused(404, `no project \`${projectKey(id)}\``, context);
 
-	const text = await deps.repos.readFile(
-		repoName({ kind: "tracker", project: id, tracker: "root" }),
-		"main",
-		`.newgit/exports/${target}.toml`,
-	);
-	if (text === null) return refused(404, `root's \`main\` has no export target \`${target}\``, context);
-	const definition = parseTarget(text);
-	if (definition === null) return refused(400, `export target \`${target}\` cannot be read`, context);
-	const repo = payload.repository?.full_name ?? "";
-	if (githubRepo(definition.url) !== repo.toLowerCase())
-		return refused(403, `export target \`${target}\` does not mirror to ${repo}`, context);
+	const list = (await project.branch(PULL_BRANCH))?.list;
+	if (list === undefined) return refused(404, `no branch \`${PULL_BRANCH}\``, context);
+	const facts = await loadDefinitions(deps.repos, id, Object.keys(list));
+	const found = targetFor(repo, facts);
+	if (found === null) return refused(403, `no tracker on \`${PULL_BRANCH}\` exports to ${repo}`, context);
+	const target = targetName(found.declaration);
+	const branch = found.declaration.branch ?? "main";
 
-	if (definition.root !== undefined)
+	if (found.declaredBy !== "root")
 		return Response.json({ ignored: "a rooted target's commits are its tracker's: `newgit pull --remote`" });
 	const tag = payload.ref?.startsWith("refs/tags/") ? payload.ref.slice("refs/tags/".length) : undefined;
 	if (tag !== undefined && payload.deleted === true)
 		return Response.json({ ignored: "a tag is deleted on the remote, not by a mirror: tags never move" });
-	if (tag === undefined && payload.ref !== `refs/heads/${definition.branch}`)
-		return Response.json({ ignored: `not \`${definition.branch}\`` });
+	if (tag === undefined && payload.ref !== `refs/heads/${branch}`)
+		return Response.json({ ignored: `not \`${branch}\`` });
 	const commit = payload.after ?? "";
 	if (payload.deleted === true || !/^[0-9a-f]{40}$/.test(commit) || /^0+$/.test(commit))
 		return Response.json({ ignored: "the branch was deleted" });
@@ -336,15 +350,9 @@ export async function githubWebhook(request: Request, env: Env, deps: Deps): Pro
 
 	// Landing here is a merge by whoever pushed there: they must be able to
 	// merge here, and what they do not maintain stays as it is.
-	const list = (await project.branch(PULL_BRANCH))?.list;
-	if (list === undefined) return refused(404, `no branch \`${PULL_BRANCH}\``, context);
 	const pusher = (payload.pusher?.name ?? "").toLowerCase();
 	const who = { login: pusher, member: await project.isMember(pusher) };
-	const facts = await loadDefinitions(deps.repos, id, Object.keys(list));
-	const ships = (tracker: string) =>
-		definition.trackers.length > 0
-			? definition.trackers.includes(tracker)
-			: facts.get(tracker)?.audience.kind === "public";
+	const ships = (tracker: string) => shipsIn(tracker, found.declaredBy, facts);
 	const writable = Object.keys(list).filter((tracker) => {
 		const found = facts.get(tracker);
 		return (
@@ -363,7 +371,7 @@ export async function githubWebhook(request: Request, env: Env, deps: Deps): Pro
 	await project.queuePull({
 		target,
 		repo,
-		branch: definition.branch,
+		branch,
 		commit,
 		pusher,
 		writable,

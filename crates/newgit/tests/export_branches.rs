@@ -13,23 +13,20 @@
 
 include!("support/fake_remote.rs");
 
-fn mirror(fixture: &Fixture, name: &str, trackers: &[&str]) -> Utf8PathBuf {
+/// A bare repository root exports to with `branches = true`, `access`
+/// inheriting it when `access`.
+fn mirror(fixture: &Fixture, name: &str, access: bool) -> Utf8PathBuf {
     let repo = fixture.temp.join(format!("{name}.git"));
     git(
         &fixture.temp,
         &["init", "-q", "--bare", "-b", "main", repo.as_str()],
     );
-    let dir = fixture.store.join(".newgit/exports");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    let trackers: Vec<String> = trackers.iter().map(|t| format!("\"{t}\"")).collect();
-    std::fs::write(
-        dir.join(format!("{name}.toml")),
-        format!(
-            "url = \"{repo}\"\nbranches = true\ntrackers = [{}]\n",
-            trackers.join(", ")
-        ),
-    )
-    .expect("write");
+    set_export(
+        &fixture.store,
+        "root",
+        Some(&export_to(&repo, name, "branches = true")),
+    );
+    set_export(&fixture.store, "access", access.then_some("\"inherit\""));
     repo
 }
 
@@ -55,7 +52,7 @@ fn pushed(workspace: &Utf8Path) -> String {
 fn the_workspace_gets_the_target_as_the_remote_gh_resolves() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
-    let github = mirror(&fixture, "github", &["root", "access"]);
+    let github = mirror(&fixture, "github", true);
     fixture.ok(&fixture.store, &["export", "--remote", "github"]);
     fixture.ok(&fixture.store, &["spawn", "feature-a"]);
     let workspace = workspace_of(&fixture, "feature-a");
@@ -79,7 +76,7 @@ fn the_workspace_gets_the_target_as_the_remote_gh_resolves() {
 fn a_push_exports_the_branch_as_the_agents_own_commits_when_every_tracker_ships() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
-    let github = mirror(&fixture, "github", &["root", "access"]);
+    let github = mirror(&fixture, "github", true);
     fixture.ok(&fixture.store, &["spawn", "feature-a"]);
     let workspace = workspace_of(&fixture, "feature-a");
 
@@ -101,7 +98,7 @@ fn a_push_exports_the_branch_as_the_agents_own_commits_when_every_tracker_ships(
 fn a_filtered_target_gets_other_commits_and_the_push_says_head() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
-    let public = mirror(&fixture, "public", &["root"]);
+    let public = mirror(&fixture, "public", false);
     fixture.ok(&fixture.store, &["spawn", "feature-a"]);
     let workspace = workspace_of(&fixture, "feature-a");
 
@@ -126,7 +123,7 @@ fn a_filtered_target_gets_other_commits_and_the_push_says_head() {
 fn pushing_to_the_target_directly_is_refused_naming_origin() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
-    let github = mirror(&fixture, "github", &["root"]);
+    let github = mirror(&fixture, "github", false);
     fixture.ok(&fixture.store, &["spawn", "feature-a"]);
     let workspace = workspace_of(&fixture, "feature-a");
     commit_work(&workspace);
@@ -142,10 +139,12 @@ fn pushing_to_the_target_directly_is_refused_naming_origin() {
 fn a_target_without_branches_gets_no_remote_and_no_branch() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
-    let github = mirror(&fixture, "github", &["root"]);
-    let path = fixture.store.join(".newgit/exports/github.toml");
-    let text = std::fs::read_to_string(&path).expect("read");
-    std::fs::write(&path, text.replace("branches = true\n", "")).expect("write");
+    let github = mirror(&fixture, "github", false);
+    set_export(
+        &fixture.store,
+        "root",
+        Some(&export_to(&github, "github", "")),
+    );
     fixture.ok(&fixture.store, &["spawn", "feature-a"]);
     let workspace = workspace_of(&fixture, "feature-a");
     commit_work(&workspace);

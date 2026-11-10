@@ -47,7 +47,7 @@ scripts/fork/install-mac.sh
   owns them.
 - An agent in a thread pushes and opens pull requests the usual way, `git
   push` then `gh pr create`. On a newgit remote, `origin` is the newgit
-  endpoint, which `gh` cannot read, so give the project an export target
+  endpoint, which `gh` cannot read, so give root's definition an `export`
   with `branches = true` (`newgit reference export`): each push then lands
   the branch there too, and the workspace's remote for it is the one `gh`
   uses.

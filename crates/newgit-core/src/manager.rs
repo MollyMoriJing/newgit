@@ -114,6 +114,10 @@ pub struct CreateCodeTrackerOutcome {
     pub source: String,
     /// How many commits it starts with.
     pub commits: u32,
+    /// Its definition says `export = "inherit"`: it ships wherever the tracker
+    /// it was carved out of ships. False when its audience is narrower than
+    /// that tracker's, which an export would send it past.
+    pub inherits_export: bool,
 }
 
 /// What `newgit pull --remote <target>` did.
@@ -996,14 +1000,11 @@ pub struct ExportOutcome {
 /// Why a tracker in Git is in a remote export, or that it is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportReason {
-    /// Its audience is `public`.
-    Public,
-    /// The target's `trackers` names it.
-    Listed,
-    /// The target is rooted at it (`root`).
+    /// Its definition declares the target: the view is rooted at it.
     Root,
-    /// The target is rooted at a tracker that mounts it.
-    Mounted,
+    /// It says `export = "inherit"`, all the way up to the tracker declaring
+    /// the target.
+    Inherited,
     /// Neither: its history stays out.
     Withheld,
 }
@@ -1031,7 +1032,7 @@ struct ComposedExport {
 pub struct BranchExport {
     pub target: String,
     pub url: String,
-    /// The repository as the target names it (`owner/repo`, or the URL as
+    /// The repository as the target names it (`github.com/owner/repo`, or the URL as
     /// written): what `gh pr create -R` takes.
     pub repo: String,
     pub branch: String,
@@ -1644,13 +1645,28 @@ impl BranchManager {
                 parent_path.map_or_else(|| name.to_owned(), |path| format!("{path}/{name}"))
             )));
         }
+        // Carved out of a tracker, its files were going wherever that tracker
+        // ships, and carving must not quietly drop them from a mirror. Not
+        // past their audience, though.
+        let parent_audience = parent
+            .as_ref()
+            .map_or(self.root.audience.as_str(), |parent| {
+                parent.audience.as_str()
+            });
+        let inherits_export = audience == parent_audience || audience == "public";
+        let definition = if inherits_export {
+            definition.with_export(vec![crate::export_target::ExportEntry::Inherit])?
+        } else {
+            definition
+        };
         let (definition, placed) = match &parent {
             Some(parent) => {
                 let relative = definition
                     .mount
                     .strip_prefix(&parent.mount)
                     .expect("filtered to mounts under it");
-                let definition = TrackerDefinition::in_git(name, audience.to_owned(), relative)?;
+                let definition = TrackerDefinition::in_git(name, audience.to_owned(), relative)?
+                    .with_export(definition.export.clone())?;
                 let mut placed = definition.clone();
                 placed.nest_under(&parent.name, &parent.mount);
                 (definition, placed)
@@ -1773,6 +1789,7 @@ impl BranchManager {
             path,
             source: parent.map_or_else(|| self.root.name.clone(), |parent| parent.name),
             commits: u32::from(pinned.is_some()),
+            inherits_export,
         })
     }
 
@@ -2948,6 +2965,18 @@ impl BranchManager {
             && targets
                 .iter()
                 .all(|target| has(&format!("remote.{}.url", target.name), &target.push_url()))
+            && set.lines().all(|line| {
+                let Some((key, command)) = line.split_once(' ') else {
+                    return true;
+                };
+                let remote = key
+                    .strip_prefix("remote.")
+                    .and_then(|rest| rest.strip_suffix(".receivepack"));
+                remote.is_none_or(|remote| {
+                    !command.contains(" --export-target ")
+                        || targets.iter().any(|target| target.name == remote)
+                })
+            })
         {
             return Ok(());
         }
@@ -2984,9 +3013,6 @@ impl BranchManager {
                 &format!("refs/heads/{branch}"),
             )?;
         }
-        if targets.is_empty() {
-            return Ok(());
-        }
         let owned: Vec<ExportTarget> = targets.into_iter().cloned().collect();
         self.route_export_remotes(
             &root,
@@ -2995,6 +3021,9 @@ impl BranchManager {
             &outbox,
             &BTreeSet::new(),
         )?;
+        if owned.is_empty() {
+            return Ok(());
+        }
         let definitions = self.carved_definitions();
         let resolved = route_to_targets(
             &owned,
@@ -3004,7 +3033,7 @@ impl BranchManager {
                     .iter()
                     .find(|definition| definition.name == tracker)
                     .is_some_and(|definition| {
-                        export_reason(target, definition, &definitions) != ExportReason::Withheld
+                        export_reason(target, definition) != ExportReason::Withheld
                     })
             },
         )
@@ -4201,6 +4230,37 @@ impl BranchManager {
         let config = |key: &str, value: &str| {
             crate::source::run_git_env(&["-C", workspace, "config", key, value], &[]).map(|_| ())
         };
+        // A remote this made for a target no definition declares any more
+        // (renamed, or taken out of `export`): pushing to it could only fail.
+        let made = crate::source::run_git_env(
+            &[
+                "-C",
+                workspace,
+                "config",
+                "--get-regexp",
+                "^remote\\..*\\.receivepack$",
+            ],
+            &[],
+        )
+        .unwrap_or_default();
+        for line in made.lines() {
+            let Some((key, command)) = line.split_once(' ') else {
+                continue;
+            };
+            let Some(remote) = key
+                .strip_prefix("remote.")
+                .and_then(|rest| rest.strip_suffix(".receivepack"))
+            else {
+                continue;
+            };
+            if command.contains(" --export-target ")
+                && !targets
+                    .iter()
+                    .any(|target| target.branches && target.name == remote)
+            {
+                crate::source::run_git_env(&["-C", workspace, "remote", "remove", remote], &[])?;
+            }
+        }
         for target in targets.iter().filter(|target| target.branches) {
             let remote = &target.name;
             config(&format!("remote.{remote}.url"), &target.push_url())?;
@@ -4326,7 +4386,7 @@ impl BranchManager {
                     .iter()
                     .find(|definition| definition.name == tracker)
                     .is_some_and(|definition| {
-                        export_reason(target, definition, &definitions) != ExportReason::Withheld
+                        export_reason(target, definition) != ExportReason::Withheld
                     })
             },
         )
@@ -8239,10 +8299,10 @@ impl BranchManager {
     }
 
     /// Push a composed projection of the trackers' `main`s to export target
-    /// `name` (`.newgit/exports/<name>.toml`), history and all.
+    /// `name` (declared by a tracker's `export`), history and all.
     ///
-    /// Fails closed: only the trackers in Git the target names ship (the
-    /// `public` ones when it names none), a tracker outside Git cannot be named, and a composed history
+    /// Fails closed: only the tracker declaring the target and those that
+    /// inherit its export ship, a tracker outside Git has no `export`, and a composed history
     /// that ever adds a path a tracker outside Git owns is refused before anything
     /// is pushed. Composing is deterministic, so exporting again
     /// fast-forwards the target; a different tracker set is a different
@@ -8521,13 +8581,14 @@ impl BranchManager {
                 let known: Vec<&str> = targets.iter().map(|target| target.name.as_str()).collect();
                 NewgitError::Unsupported(if known.is_empty() {
                     format!(
-                        "no export target `{name}`: define one in .newgit/exports/{name}.toml \
-                         (`newgit reference export`)"
+                        "no export target `{name}`: no tracker declares one. Give the tracker to \
+                         ship an `export` in its definition, `export = \"github.com/<owner>/{name}\"` \
+                         in .newgit/trackers/root.toml for the project (`newgit reference export`)"
                     )
                 } else {
                     format!(
-                        "no export target `{name}` (defined: {}); targets live in \
-                         .newgit/exports/<name>.toml",
+                        "no export target `{name}` (declared: {}); a target is declared by a \
+                         tracker's `export`",
                         known.join(", ")
                     )
                 })
@@ -8789,11 +8850,10 @@ impl BranchManager {
         .map(ToOwned::to_owned)
         .collect();
         let mut recognise = Recognise::new(&project, &self.root.name)?;
-        let code = self.carved_definitions();
         let withheld: Vec<TrackerDefinition> = self
             .carved
             .iter()
-            .filter(|definition| export_reason(target, definition, &code) == ExportReason::Withheld)
+            .filter(|definition| export_reason(target, definition) == ExportReason::Withheld)
             .cloned()
             .collect();
         let mapped =
@@ -8897,73 +8957,46 @@ impl BranchManager {
         }
     }
 
-    /// Every export target, each checked against this project's trackers:
-    /// a target naming a tracker outside Git, or none at all, is an error.
+    /// Every export target, as the trackers' definitions declare them.
     fn export_targets(&self) -> Result<Vec<ExportTarget>> {
-        let targets = self.store.load_export_targets()?;
-        let code = self.carved_definitions();
-        for target in &targets {
-            if let Some(root) = &target.root
-                && !code.iter().any(|definition| &definition.name == root)
-            {
-                let reason = if self
-                    .trackers
-                    .iter()
-                    .any(|definition| &definition.name == root)
-                {
-                    "is not in Git, and a tracker outside Git never leaves this machine through Git"
-                } else {
-                    "is not a tracker in this project"
-                };
-                return Err(NewgitError::InvalidDefinition {
-                    kind: "export",
-                    name: target.name.clone(),
-                    reason: format!("`root` names `{root}`, which {reason}"),
-                });
-            }
-            for listed in &target.trackers {
-                if code.iter().any(|definition| &definition.name == listed) {
-                    continue;
-                }
-                let reason = if self
-                    .trackers
-                    .iter()
-                    .any(|definition| &definition.name == listed)
-                {
-                    "is not in Git, and a tracker outside Git never leaves this machine through Git"
-                } else {
-                    "is not a tracker in this project"
-                };
-                return Err(NewgitError::InvalidDefinition {
-                    kind: "export",
-                    name: target.name.clone(),
-                    reason: format!("`trackers` names `{listed}`, which {reason}"),
-                });
-            }
+        if self
+            .root
+            .export
+            .contains(&crate::export_target::ExportEntry::Inherit)
+        {
+            return Err(NewgitError::InvalidDefinition {
+                kind: "tracker",
+                name: self.root.name.clone(),
+                reason: "`export = \"inherit\"` takes the parent's export, and root has no \
+                         parent: give it a URL, or leave `export` out"
+                    .to_owned(),
+            });
         }
-        Ok(targets)
+        crate::export_target::resolve_targets(&self.all_definitions())
     }
 
-    /// A target's `root` names the tracker, not what it mounts, so nobody
-    /// chose to send a child whose audience is narrower than the root's.
-    /// Left out, the target's repository would lose those files; sent, they
-    /// reach people the child's audience does not include. So: refused.
+    /// `"inherit"` follows the parent wherever it ships, whoever reads it
+    /// there, so it reaches no further than the parent's audience: a child
+    /// whose audience is narrower than the tracker declaring the target would
+    /// be sent past it. So: refused, naming the child. And a view rooted at a
+    /// tracker lacks the files of a tracker mounted inside it that another
+    /// tracker defines, which could never inherit its export: refused too,
+    /// rather than losing them without a word.
     fn refuse_narrower_children(
         &self,
         target: &ExportTarget,
-        root: &str,
         trackers: &[ExportedTracker],
     ) -> Result<()> {
-        // Mounted inside the root but not by it: a view rooted there lacks
-        // its files, and the target would lose them without a word.
-        let at = self
-            .carved
-            .iter()
-            .find(|definition| definition.name == root)
-            .map(|definition| definition.mount.clone());
-        if let Some(at) = at
+        let root = target.declared_by();
+        if target.root.is_some()
+            && let Some(at) = self
+                .carved
+                .iter()
+                .find(|definition| definition.name == root)
+                .map(|definition| definition.mount.clone())
             && let Some(inside) = trackers.iter().find(|tracker| {
                 tracker.reason == ExportReason::Withheld
+                    && !descends_from(&tracker.name, root)
                     && self.carved.iter().any(|definition| {
                         definition.name == tracker.name
                             && definition.mount != at
@@ -8978,28 +9011,30 @@ impl BranchManager {
                 crate::tracker::tracker_path(&inside.name)
             )));
         }
-        let audience = |name: &str| {
-            trackers
-                .iter()
-                .find(|tracker| tracker.name == name)
-                .map(|tracker| tracker.audience.as_str())
-        };
-        let Some(root_audience) = audience(root) else {
+        let Some(root_audience) = trackers
+            .iter()
+            .find(|tracker| tracker.name == root)
+            .map(|tracker| tracker.audience.as_str())
+        else {
             return Ok(());
         };
         for child in trackers
             .iter()
-            .filter(|tracker| tracker.reason == ExportReason::Mounted)
+            .filter(|tracker| tracker.reason == ExportReason::Inherited)
         {
             if child.audience != root_audience && child.audience != "public" {
+                let child = crate::tracker::tracker_path(&child.name);
                 return Err(NewgitError::Unsupported(format!(
-                    "`{}` is rooted at `{root}` (audience {root_audience}), which mounts `{}` \
-                     (audience {}), so exporting would send it past its audience. Nothing was \
-                     exported. Give `{}` the audience `{root_audience}`, or stop exporting `{root}`",
+                    "`{}` is declared by `{}` (audience {root_audience}), and `{child}` (audience \
+                     {}) inherits it, so exporting would send `{child}` past its audience. Nothing \
+                     was exported. Give `{child}` the audience `{root_audience}`, or drop its \
+                     `export = \"inherit\"`",
                     target.name,
-                    crate::tracker::tracker_path(&child.name),
-                    child.audience,
-                    crate::tracker::tracker_path(&child.name)
+                    crate::tracker::tracker_path(root),
+                    trackers
+                        .iter()
+                        .find(|tracker| crate::tracker::tracker_path(&tracker.name) == child)
+                        .map_or("", |tracker| tracker.audience.as_str()),
                 )));
             }
         }
@@ -9022,7 +9057,7 @@ impl BranchManager {
             .map(|definition| ExportedTracker {
                 name: definition.name.clone(),
                 audience: definition.audience.clone(),
-                reason: export_reason(target, definition, &code),
+                reason: export_reason(target, definition),
                 commit: list.get(&definition.name).cloned(),
                 unmerged: false,
             })
@@ -9032,30 +9067,19 @@ impl BranchManager {
             .filter(|tracker| tracker.reason != ExportReason::Withheld)
             .map(|tracker| tracker.name.clone())
             .collect();
-        let root_name = target
-            .root
-            .clone()
-            .unwrap_or_else(|| self.root.name.clone());
-        let root_commit = list
-            .get(&root_name)
-            .filter(|_| shipped.contains(&root_name));
-        if target.root.is_some() {
-            if root_commit.is_none() {
-                return Err(NewgitError::Unsupported(format!(
-                    "nothing to export to `{}`: `{root_name}` has no history on `{branch}` yet",
-                    target.name
-                )));
-            }
-            // Rooted there, its history is the view's shape.
-            self.need_history(&root_name)?;
-            self.refuse_narrower_children(target, &root_name, &trackers)?;
-        }
-        let Some(root_commit) = root_commit else {
+        let root_name = target.declared_by().to_owned();
+        let Some(root_commit) = list.get(&root_name) else {
             return Err(NewgitError::Unsupported(format!(
-                "nothing to export to `{}`: `{}` holds the project's history on `{branch}`, and it                  is not public and the target does not name it. Name the trackers to ship in                  .newgit/exports/{}.toml — `trackers = [\"root\"]` mirrors the project's own                  code",
-                target.name, self.root.name, target.name
+                "nothing to export to `{}`: `{}` has no history on `{branch}` yet",
+                target.name,
+                crate::tracker::tracker_path(&root_name)
             )));
         };
+        if target.root.is_some() {
+            // Rooted there, its history is the view's shape.
+            self.need_history(&root_name)?;
+        }
+        self.refuse_narrower_children(target, &trackers)?;
 
         self.bring_pins(&root_name, root_commit, &BTreeMap::new())?;
         let root = self.store.paths().project_root.clone();
@@ -9560,7 +9584,13 @@ impl BranchManager {
         }
     }
 
-    /// Make each of `tags` on the remote, then on each export target.
+    /// Make each of `tags` on the remote, then on each export target that
+    /// carries root's history: one root declares, which every tracker
+    /// inheriting it ships inside. A target rooted at another tracker is
+    /// that tracker's own history, with versions of its own (t3code's
+    /// `v0.1.x`), and a tag never moves, so the project's `v0.9.0` there
+    /// would take that name from it for good. Tags from such a target are
+    /// refused coming in for the same reason.
     fn push_tags(
         &self,
         targets: &[ExportTarget],
@@ -9569,6 +9599,10 @@ impl BranchManager {
         if tags.is_empty() {
             return Ok(Vec::new());
         }
+        let targets: Vec<&ExportTarget> = targets
+            .iter()
+            .filter(|target| target.root.is_none())
+            .collect();
         let link = self.remote.as_ref().ok_or_else(|| {
             NewgitError::Unsupported("this project has no newgit remote".to_owned())
         })?;
@@ -14090,37 +14124,28 @@ struct ImportedCode {
 }
 
 /// Whether `target` ships a tracker in Git, and why: the one place that is
-/// decided, for composing an export and for routing `gh` alike. A target
-/// rooted at a tracker ships that tracker alone (one that mounts another in
-/// Git is refused when composed).
-fn export_reason(
-    target: &ExportTarget,
-    definition: &TrackerDefinition,
-    all: &[TrackerDefinition],
-) -> ExportReason {
-    if let Some(root) = &target.root {
-        if root == &definition.name {
-            return ExportReason::Root;
-        }
-        let mut above = definition.parent.as_ref();
-        while let Some(parent) = above {
-            if parent == root {
-                return ExportReason::Mounted;
-            }
-            above = all
-                .iter()
-                .find(|definition| &definition.name == parent)
-                .and_then(|definition| definition.parent.as_ref());
-        }
-        return ExportReason::Withheld;
-    }
-    if !target.lists(&definition.name, &definition.audience) {
-        ExportReason::Withheld
-    } else if definition.audience == "public" {
-        ExportReason::Public
+/// decided, for composing an export and for routing `gh` alike.
+fn export_reason(target: &ExportTarget, definition: &TrackerDefinition) -> ExportReason {
+    if definition.name == target.declared_by() {
+        ExportReason::Root
+    } else if target.ships(&definition.name) {
+        ExportReason::Inherited
     } else {
-        ExportReason::Listed
+        ExportReason::Withheld
     }
+}
+
+/// Whether tracker `name` is `ancestor`'s, or below it, by the trackers that
+/// define each other.
+fn descends_from(name: &str, ancestor: &str) -> bool {
+    let mut at = Some(name);
+    while let Some(here) = at {
+        if here == ancestor {
+            return true;
+        }
+        at = crate::export_target::export_parent(here);
+    }
+    false
 }
 
 /// Which `branches = true` targets an instance's work belongs to, and which

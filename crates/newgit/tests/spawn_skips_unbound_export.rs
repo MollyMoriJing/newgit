@@ -26,13 +26,11 @@ fn rooted_target(fixture: &Fixture) {
         &fixture.temp,
         &["init", "-q", "--bare", "-b", "main", github.as_str()],
     );
-    let dir = fixture.store.join(".newgit/exports");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(
-        dir.join("app.toml"),
-        format!("url = \"{github}\"\nroot = \"app\"\nbranches = true\n"),
-    )
-    .expect("write");
+    set_export(
+        &fixture.store,
+        "app",
+        Some(&export_to(&github, "app", "branches = true")),
+    );
     git(&fixture.store, &["add", "-A"]);
     git(&fixture.store, &["commit", "-q", "-m", "export app"]);
     fixture.ok(&fixture.store, &["merge", "main"]);

@@ -9,7 +9,7 @@ newgit init
 (a plain `git clone` of a newgit project, or one set up by an older newgit)
 and it adopts what is there: it writes any missing built-in tracker
 definitions and gives `root` the project's history. The split matters:
-`.newgit/config.toml`, `trackers/`, `resources/`, `scripts/`, and `exports/`
+`.newgit/config.toml`, `trackers/`, `resources/`, and `scripts/`
 are the control plane and belong in Git, so teammates and CI see the same orchestration. Everything else under
 `.newgit/` — branch bindings, captured content, checkpoints, logs, runtime
 state — is local and is gitignored for you.

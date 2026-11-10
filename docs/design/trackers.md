@@ -809,8 +809,8 @@ composes the view rooted there. Resources come from the trackers in that
 view. A tracker that mounts nothing in Git composes to its own history
 unchanged. One that does composes like any root (its pin-only commits
 rebuilt with their children's metadata), so its view is no longer its raw
-history. That is the view an export target's `root` ships, children and all
-(*GitHub is an export*).
+history. That is the view a target declared by that tracker ships, with the
+children that inherit its export (*GitHub is an export*).
 
 **A root that `requires` its parent** (rooting at `electron`, which needs the
 workspace `package.json`) is an error naming the parent to root at instead
@@ -1015,23 +1015,62 @@ it onward. Two layers keep that from mattering:
 Spheroman/newgit holds newgit's, Spheroman/t3code holds t3code's.
 
 **GitHub is an export (decided).** `newgit export --remote <name>` pushes a
-composed projection of the trackers' `main`s, with composed history, to the
-target defined in `.newgit/exports/<name>.toml` — an ordinary GitHub
-repository, say. A target with `trackers` ships exactly those, of any
-audience; one without ships the `public` ones. A tracker left out leaves no
-path, no pin, and no history there, and a commit that only moved its pin is
-not shown, so the target's ids differ from the view's from the first commit
-that touched it. With `root = "<tracker>"` the target
-gets the view rooted at that tracker instead: the tracker's own `main`, its
-files at the top, which for a tracker that mounts nothing in Git is its
-history unchanged (#141). What it mounts ships with it, since the repository
-holds those files as its own, so carving a directory out of a tracker changes
-nothing in its export but the one definition file. `root` names only the
-tracker, so a child whose audience is narrower than the root's (and is not
-`public`) refuses the export, naming it: leaving it out would lose files, and
-sending it would pass its audience. GitHub never holds a tracker the export
-did not include, so `.env` files can live in the project and never reach a
-public mirror.
+composed projection of the trackers' `main`s, with composed history, to an
+ordinary repository — GitHub's, say — that a tracker's own definition
+declares **(decided 2026-11-08, replacing `.newgit/exports/<name>.toml`)**:
+
+```toml
+# t3code.toml
+export = { url = "github.com/Spheroman/t3code", branch = "newgit", branches = true }
+# t3code's repos.toml
+export = "inherit"       # ships inside t3code's export, wherever that goes
+# a secrets tracker: no export key, so it never leaves newgit
+```
+
+- **The declaring tracker is the target's root.** Declared by `root`, it is
+  the project's own view; declared by another, it is the view rooted at it,
+  its files at the top, which for a tracker that mounts nothing in Git is its
+  history unchanged (#141).
+- **No key means no export,** which fails closed. **`"inherit"`** takes the
+  parent's export, whatever it is: one place, several, or none. The parent
+  is the tracker defining this one (`t3code` for `t3code/repos`, root for
+  what `access` defines). **A list** covers a tracker inside the monorepo's
+  mirror and on its own: `export = ["inherit", "github.com/x/lib"]`.
+- **Carving writes `"inherit"`.** `newgit tracker create --git --path lib`
+  does, so carving never silently drops a directory from a mirror. The
+  key's default stays nothing; the command writes the obvious line, unless
+  the new tracker's audience is narrower than its parent's (and not
+  `public`), when it writes none and says so.
+- **A target's options live where its URL is declared.** `branch`,
+  `branches`, and `name` belong to the declaration; a tracker that inherits
+  shares that one target, as it shares its one composed history and one
+  branch, so it has no options of its own. A target is named after its
+  repository (`t3code`), or its `name`; that is its remote's name in a
+  workspace and what `--remote` takes. One repository is one target: two
+  declarations of it are refused.
+- **Inheriting never passes an audience.** A tracker that inherits a target
+  but whose audience is narrower than the declaring tracker's (and not
+  `public`) refuses the export, naming it. A view rooted at a tracker that
+  lacks a tracker mounted inside it but defined elsewhere is refused too,
+  rather than losing its files without a word.
+- **Exports are owner-governed.** Definitions live in `access`, so widening
+  where something ships takes an owner's merge, where `exports/` was
+  ordinary root content.
+- **Tags go only where root's history goes.** A project's tag is pushed to
+  the target root declares, which every inheriting tracker ships inside,
+  never to one declared by a child: that is the child's own history, with
+  versions of its own (t3code's `v0.1.x`), and a tag never moves, so the
+  project's `v0.9.0` would take that name from it for good. Tags coming in
+  from such a target are refused for the same reason.
+- **What this gives up:** a child inherits all of its parent's targets, so
+  two targets declared by one tracker show the same trackers. A view that
+  differs is declared by a different tracker.
+
+A tracker left out leaves no path, no pin, and no history there, and a
+commit that only moved its pin is not shown, so the target's ids differ from
+the view's from the first commit that touched it. GitHub never holds a
+tracker the export did not include, so `.env` files can live in the project
+and never reach a public mirror.
 
 **Coming back (decided 2026-11-05).** Ids differ on a mirror, so what is
 merged there comes back through newgit, never by fetching GitHub. A linked
@@ -1049,8 +1088,8 @@ composed as the target sees it, under the very id it has there, so the
 remote knows which root commit it names and makes the project's tag there
 (*A tag is a frozen list*).
  Since `.newgit/` is root's, exporting root ships the config,
-resources, scripts, and export targets; only `.newgit/trackers/` follows
-`access`'s audience.
+resources, and scripts; only `.newgit/trackers/`, where every `export` is
+declared, follows `access`'s audience.
 
 **Adopting an existing repository (decided).** `newgit init` in a Git
 repository imports its history as `root`'s history, up to the first commit
@@ -1120,8 +1159,9 @@ named and skipped.
   root adding the definition (in `access`), the mount, and the pin (a
   commit on one parent). Refused, leaving nothing behind, when the mount has
   files or the history adds a file a tracker outside Git owns there.
-- **#141 (export a tracker as its own root):** *done.* `root = "t3code"` on
-  an export target pushes t3code's own `main`, composed rooted at it. While
+- **#141 (export a tracker as its own root):** *done.* A target declared in
+  `t3code`'s own definition pushes t3code's own `main`, composed rooted at
+  it. While
   t3code mounts nothing in Git, that is its own history, so the first export
   is a no-op fast-forward of Spheroman/t3code, ids and signatures intact.
   Once it mounts one, commits from then on are the view's, with the child's
@@ -1158,7 +1198,8 @@ trackers in Git, wiring into spawn, push, and checkpoint sync, the remote
 with one Artifacts repo per tracker and the Git endpoint); roles, priority,
 `requires`, resources, `use`/`drop`; `newgit merge [instance] [--into
 <branch>]` moving every tracker together; the GitHub export
-(`.newgit/exports/<name>.toml`, `branches = true`). The engine of that
+(`branches = true`; its targets are now declared by `export` in the
+definitions). The engine of that
 period — interleaving by committer date, `Newgit-Split-Parent`, carving with
 history, the `project` tracker, `tracker repair` for commits split before
 headers were recorded — is replaced by the steps below and deleted.
@@ -1224,7 +1265,8 @@ something:
 ### Settled while building (2026-11-05)
 
 - **`trackers` on a target is exact.** It used to add to the `public`
-  trackers, so a public tracker (t3code) could not be left out.
+  trackers, so a public tracker (t3code) could not be left out. (Since
+  replaced by `export` in the definitions, where no key ships nothing.)
 - **A root commit brought in from a mirror names the mirror's commit,** not
   the view commit rebuilt from it, so its id survives the round trip.
 - **The project root learns what `git pull` brought.** The view commit of

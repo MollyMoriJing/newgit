@@ -15,10 +15,10 @@ fn a_pull_into_a_dirty_tree_moves_nothing_and_runs_again_once_clean() {
     let store = project(&temp);
     let github = github_copy(&temp, &upstream, "t3code");
     let outcome = import(&store, &upstream);
-    define_target(
+    set_export(
         &store,
         "t3code",
-        &format!("url = \"{github}\"\nbranch = \"newgit\"\nroot = \"t3code\"\n"),
+        Some(&export_to(&github, "t3code", "branch = \"newgit\"")),
     );
     let repo = store.paths().project_root.clone();
     git(&repo, &["add", "-A"]);

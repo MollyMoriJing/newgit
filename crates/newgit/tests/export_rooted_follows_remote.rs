@@ -27,13 +27,7 @@ fn a_rooted_export_takes_the_trackers_head_from_the_remote() {
         &fixture.temp,
         &["init", "-q", "--bare", "-b", "main", mirror.as_str()],
     );
-    let dir = fixture.store.join(".newgit/exports");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(
-        dir.join("apps-b.toml"),
-        format!("url = \"{mirror}\"\nroot = \"b\"\n"),
-    )
-    .expect("write");
+    set_export(&fixture.store, "b", Some(&export_to(&mirror, "apps-b", "")));
     git(&fixture.store, &["add", "-A"]);
     git(&fixture.store, &["commit", "-q", "-m", "export apps-b"]);
     fixture.ok(&fixture.store, &["merge", "main"]);

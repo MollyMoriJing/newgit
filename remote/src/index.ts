@@ -1530,6 +1530,42 @@ export interface TrackerFacts {
 	 * its heads, and its policy are its home's.
 	 */
 	link?: string;
+	/**
+	 * Where it ships (`export`): targets it declares, rooted at it, and
+	 * `"inherit"`, its parent's. Absent, it never ships. Read only for a
+	 * tracker in Git: the client refuses one on any other.
+	 */
+	export?: ExportEntry[];
+}
+
+/** One entry of a definition's `export`. */
+export type ExportEntry = "inherit" | ExportDeclaration;
+
+/** A target as its declaring definition writes it. */
+export interface ExportDeclaration {
+	url: string;
+	branch?: string;
+	branches?: boolean;
+	name?: string;
+}
+
+/** `export` as the file writes it: a string, a table, or an array of those. */
+function parseExport(value: unknown): ExportEntry[] {
+	const entry = (item: unknown): ExportEntry | null => {
+		if (item === "inherit") return "inherit";
+		if (typeof item === "string") return { url: item };
+		if (item === null || typeof item !== "object") return null;
+		const table = item as Record<string, unknown>;
+		if (typeof table.url !== "string") return null;
+		return {
+			url: table.url,
+			...(typeof table.branch === "string" ? { branch: table.branch } : {}),
+			...(table.branches === true ? { branches: true } : {}),
+			...(typeof table.name === "string" ? { name: table.name } : {}),
+		};
+	};
+	const items = value === undefined ? [] : Array.isArray(value) ? value : [value];
+	return items.flatMap((item) => entry(item) ?? []);
 }
 
 /** Where `access` is mounted: every definition is `<name>.toml` at its root. */
@@ -1571,6 +1607,7 @@ function parseFacts(text: string, source: string): TrackerFacts | undefined {
 		history?: unknown;
 		pinned?: unknown;
 		link?: unknown;
+		export?: unknown;
 	};
 	try {
 		definition = parseToml(text) as typeof definition;
@@ -1600,6 +1637,7 @@ function parseFacts(text: string, source: string): TrackerFacts | undefined {
 		history,
 		pinned: definition.pinned === true,
 		...(typeof definition.link === "string" ? { link: definition.link } : {}),
+		...(definition.git === true && definition.export !== undefined ? { export: parseExport(definition.export) } : {}),
 	};
 }
 

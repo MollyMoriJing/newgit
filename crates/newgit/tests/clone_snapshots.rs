@@ -39,13 +39,11 @@ fn published(fixture: &Fixture) -> Utf8PathBuf {
             upstream.as_str(),
         ],
     );
-    let dir = fixture.store.join(".newgit/exports");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(
-        dir.join("t3code.toml"),
-        format!("url = \"{github}\"\nbranch = \"newgit\"\nroot = \"t3code\"\n"),
-    )
-    .expect("write");
+    set_export(
+        &fixture.store,
+        "t3code",
+        Some(&export_to(&github, "t3code", "branch = \"newgit\"")),
+    );
     git(&fixture.store, &["add", "-A"]);
     git(&fixture.store, &["commit", "-q", "-m", "export target"]);
     fixture.ok(&fixture.store, &["merge", "main"]);
