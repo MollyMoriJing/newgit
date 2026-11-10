@@ -80,6 +80,9 @@ Definition management (noun subcommands):
 Remote:
 
 - `newgit login` / `logout` / `whoami`
+- `newgit serve --data <dir> [--listen <addr>] [--url <url>] [--allow <logins>]
+  [--github-client-id <id>]` — run a remote on this machine ([your own
+  remote](serve.md)); `newgit serve --help` lists the rest
 - `newgit remote add [--url <url>] [--project <name> | <owner>/<name>]
   [--json]` / `remote show [--json]` — a bare name creates the project under
   your account; `owner/name` joins one that exists

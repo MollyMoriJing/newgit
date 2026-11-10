@@ -147,3 +147,15 @@ jobs:
         run: npx tsc --noEmit && npx tsc --noEmit -p test
       - name: Test
         run: npx vitest run
+      - name: Wrangler config
+        # What `wrangler deploy` does with remote/wrangler.jsonc, minus the
+        # upload and the container image: it parses and validates the config
+        # and bundles the Worker, once for the top level and once for `dev`
+        # (an environment is only checked when it is named).
+        # `--containers-rollout none` is what skips building the image.
+        # #347 put a field in it that deploy refused and nothing else read.
+        env:
+          WRANGLER_SEND_METRICS: "false"
+        run: |
+          npx wrangler deploy --dry-run --containers-rollout none --outdir "$RUNNER_TEMP/wrangler-prod"
+          npx wrangler deploy --dry-run --containers-rollout none --env dev --outdir "$RUNNER_TEMP/wrangler-dev"
