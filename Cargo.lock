@@ -917,7 +917,7 @@ dependencies = [
 
 [[package]]
 name = "newgit"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "newgit-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "camino",
  "chrono",
@@ -949,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "newgit-serve"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "axum",
