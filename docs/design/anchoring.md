@@ -1,10 +1,10 @@
 # Anchoring
 
-**Status: draft, for review.** Nothing here is built. It implements the
-anchoring paragraph of #201's vision, and replaces "the root is the spine"
-(`trackers.md`). There are no projects in this design, only a tree of trackers.
-Where today's code has them (`ProjectDO`, `<owner>.<project>.t.<tracker>`), that
-is storage to replace, called out under *Build order*.
+**Status: superseded by [landing.md](landing.md).** This describes how the
+Worker on newgit.dev lands merges as built (steps 1–8 below), and goes away
+when newgit.dev moves to `newgit serve`. Its user-visible parts (`pending`,
+`behind`, deferred roll-ups) are the Worker's alone; `newgit serve` never had
+them, and `landing.md` explains why the design drops them.
 
 ## The problem
 

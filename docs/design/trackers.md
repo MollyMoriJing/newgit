@@ -174,7 +174,10 @@ for is never taken by a nested definition, even if that file does not parse,
 and names are unique within a parent. Only a tracker in Git is defined
 inside another, and it needs a `mount` of its own.
 
-**Landing is moving to anchors:** see [anchoring.md](anchoring.md), a draft.
+**Landing:** newgit.dev's Worker lands at anchors and rolls parents up
+([anchoring.md](anchoring.md), as built). `newgit serve` replaces that with
+one-transaction landings and one object store per audience
+([landing.md](landing.md), decided, not built).
 
 **A tracker is named by its path (decided 2026-11-06).** A name is local to its
 parent, as a file's is to its directory: `repos.toml` and `.newgit/pins/repos`

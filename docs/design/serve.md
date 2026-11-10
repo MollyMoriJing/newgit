@@ -82,6 +82,14 @@ Resolved loudly; each is reversible.
    **A private instance's forks are repos of their own:** objects sharing a
    store answer "do you have this?" for everyone in it, and an embargo's
    shape is the secret.
+   **`hideRefs` only tidies the listing; it is not access control.** Under
+   protocol v2 a reader can fetch any object in a repo by id ("wants can be
+   anything", `gitprotocol-v2(5)`), a `have` line is an existence oracle,
+   and a crafted push can point a ref at any object in the store, which a
+   reachability check then allows. So a repo is safe only when everyone who
+   can reach it may read all of it: **one audience per repo, always.** The
+   namespaces here are safe because a fork's readers are exactly its
+   tracker's. Reproduced in `docs/research/nixpkgs-bench.md`, *Review*.
 2. **The Git password is the caller's own newgit token.** No repo passwords
    are minted, stored, or revoked. Each Git request is checked against the
    rules when it arrives, so a revocation or a removed member bites on the
