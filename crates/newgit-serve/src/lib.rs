@@ -1,0 +1,292 @@
+//! `newgit serve`: the newgit remote as one binary.
+//!
+//! Git repositories on local disk, served by real Git; project state in one
+//! SQLite database; the checks and composition the Worker sent to a container
+//! run in-process. It answers the same API the Worker on Cloudflare does
+//! (`remote/`), so the CLI talks to either (docs/design/serve.md).
+
+pub mod api;
+pub mod db;
+pub mod error;
+pub mod git_http;
+pub mod merge;
+pub mod names;
+pub mod policy;
+pub mod repos;
+pub mod tokens;
+
+use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+
+use anyhow::Context as _;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{HeaderValue, Request, Response, StatusCode, header};
+use camino::{Utf8Path, Utf8PathBuf};
+
+/// The most a JSON request body may be: a checkpoint's record is the largest.
+const API_BODY_LIMIT: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Where everything lives: `server.sqlite`, `homes/`, `endpoint/`.
+    pub data: Utf8PathBuf,
+    pub listen: SocketAddr,
+    /// The URL clients reach this remote at, for the URLs answers name; by
+    /// default each request's own `Host`.
+    pub url: Option<String>,
+    /// Who may log in: GitHub logins, or `*` for anyone. Empty admits no one.
+    pub allowed_logins: String,
+    pub blocked_logins: String,
+    /// Logins who may delete any project and own any number.
+    pub admin_logins: String,
+    pub projects_per_login: usize,
+    pub github_client_id: Option<String>,
+    /// Lets a caller holding it log in as anyone invited (`POST /v1/dev/login`).
+    pub dev_login_secret: Option<String>,
+    /// How many Git children may run at once.
+    pub git_slots: usize,
+}
+
+pub struct App {
+    pub config: Config,
+    pub db: db::Db,
+    pub token_key: Vec<u8>,
+    pub git_slots: Arc<tokio::sync::Semaphore>,
+    compose_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Definitions read before, by project and names, with the generation
+    /// they were read at (see [`App::trackers_moved`]).
+    definitions: Mutex<HashMap<DefinitionsKey, (u64, Definitions)>>,
+    generation: std::sync::atomic::AtomicU64,
+    /// Merges begun and not landed.
+    pub merges: merge::Merges,
+}
+
+pub type Definitions = BTreeMap<String, policy::Facts>;
+/// A project's key and the tracker names asked for.
+type DefinitionsKey = (String, Vec<String>);
+
+/// How many definition reads are kept before the cache starts over.
+const DEFINITIONS_KEPT: usize = 1024;
+
+impl App {
+    pub fn open(config: Config) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(&config.data)
+            .with_context(|| format!("creating {}", config.data))?;
+        let db = db::Db::open(&config.data.join("server.sqlite"))?;
+        let token_key = token_key(&config.data)?;
+        let hooks = config.data.join("hooks");
+        std::fs::create_dir_all(&hooks)?;
+        let hook = hooks.join("pre-receive");
+        std::fs::write(&hook, git_http::PRE_RECEIVE)?;
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(Self {
+            git_slots: Arc::new(tokio::sync::Semaphore::new(config.git_slots.max(1))),
+            config,
+            db,
+            token_key,
+            compose_locks: Mutex::default(),
+            definitions: Mutex::default(),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            merges: merge::Merges::default(),
+        })
+    }
+
+    pub fn hooks_dir(&self) -> Utf8PathBuf {
+        self.config.data.join("hooks")
+    }
+
+    /// Something moved a tracker repo's own refs (a push to it, a branch made,
+    /// a project made or deleted): every definition read before may be stale.
+    /// Definitions are read from trackers' `main`, which moves only through
+    /// this server, so this is exact rather than a time to live. Pushes into
+    /// a fork's namespace move no `main` and do not count.
+    pub fn trackers_moved(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// `project`'s definitions of `names`, read once per generation.
+    pub fn definitions(&self, project: &names::ProjectId, mut names: Vec<String>) -> Definitions {
+        names.sort();
+        names.dedup();
+        let key = (project.key(), names);
+        let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
+        {
+            let cache = self
+                .definitions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((at, facts)) = cache.get(&key)
+                && *at == generation
+            {
+                return facts.clone();
+            }
+        }
+        let facts =
+            policy::load_definitions(&self.config.data, project, key.1.iter().map(String::as_str));
+        let mut cache = self
+            .definitions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= DEFINITIONS_KEPT {
+            cache.clear();
+        }
+        cache.insert(key, (generation, facts.clone()));
+        facts
+    }
+
+    fn compose_lock(&self, project: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .compose_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.entry(project.to_owned()).or_default().clone()
+    }
+
+    fn origin<B>(&self, request: &Request<B>) -> String {
+        if let Some(url) = &self.config.url {
+            return url.trim_end_matches('/').to_owned();
+        }
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .map_or_else(|| self.config.listen.to_string(), str::to_owned);
+        format!("http://{host}")
+    }
+}
+
+/// The key tokens are signed with: made once, kept in the data directory.
+fn token_key(data: &Utf8Path) -> anyhow::Result<Vec<u8>> {
+    let path = data.join("token.key");
+    if let Ok(key) = std::fs::read_to_string(&path) {
+        return Ok(key.trim().as_bytes().to_vec());
+    }
+    let key = tokens::random_hex(32);
+    std::fs::write(&path, &key).with_context(|| format!("writing {path}"))?;
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(key.into_bytes())
+}
+
+/// Run the remote until interrupted. Says where it listens on stdout, once
+/// it does.
+pub fn serve(config: Config) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(config.listen).await?;
+        let address = listener.local_addr()?;
+        let app = Arc::new(App::open(Config {
+            listen: address,
+            ..config
+        })?);
+        println!("newgit serve: listening on http://{address}");
+        use std::io::Write as _;
+        std::io::stdout().flush()?;
+        let router = axum::Router::new().fallback(dispatch).with_state(app);
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await?;
+        Ok(())
+    })
+}
+
+async fn dispatch(State(app): State<Arc<App>>, request: Request<Body>) -> Response<Body> {
+    let path = request.uri().path().to_owned();
+    if path.starts_with("/_git/") {
+        return git_http::repo(app, request).await;
+    }
+    if path.contains(".git/") {
+        return git_http::endpoint(app, request).await;
+    }
+    if path == "/" {
+        return Response::new(Body::from("newgit serve\n"));
+    }
+    let (parts, body) = request.into_parts();
+    let api_request = match api_request(&app, parts, body).await {
+        Ok(api_request) => api_request,
+        Err(response) => return *response,
+    };
+    let answered = tokio::task::spawn_blocking(move || api::handle(&app, &api_request)).await;
+    match answered {
+        Ok(Ok(answer)) => json_response(answer.status, &answer.body),
+        Ok(Err(error)) => {
+            json_response(error.status, &serde_json::json!({ "error": error.message }))
+        }
+        Err(error) => {
+            let error = error::HttpError::internal(error);
+            json_response(error.status, &serde_json::json!({ "error": error.message }))
+        }
+    }
+}
+
+/// What the API needs of a request: read synchronously from its head,
+/// then its body, so nothing borrowed from the head waits on the body.
+async fn api_request(
+    app: &App,
+    parts: axum::http::request::Parts,
+    body: Body,
+) -> Result<api::ApiRequest, Box<Response<Body>>> {
+    let head = Request::from_parts(parts, ());
+    let header = |name: &str| -> Option<String> {
+        head.headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    let mut request = api::ApiRequest {
+        method: head.method().as_str().to_owned(),
+        path: head.uri().path().to_owned(),
+        query: head
+            .uri()
+            .query()
+            .unwrap_or_default()
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect::<BTreeMap<String, String>>(),
+        bearer: header("authorization")
+            .and_then(|value| value.strip_prefix("Bearer ").map(str::to_owned)),
+        dev_login: header("x-dev-login"),
+        origin: app.origin(&head),
+        body: Vec::new(),
+    };
+    // A merge's commits, sent ahead as a pack, are the one large body.
+    let limit = if request.path.contains("/objects/") {
+        merge::OBJECTS_MAX_BYTES + 1
+    } else {
+        API_BODY_LIMIT
+    };
+    request.body = match axum::body::to_bytes(body, limit).await {
+        Ok(body) => body.to_vec(),
+        Err(_) => {
+            return Err(Box::new(json_response(
+                413,
+                &serde_json::json!({ "error": "that request is too large" }),
+            )));
+        }
+    };
+    Ok(request)
+}
+
+fn json_response(status: u16, body: &serde_json::Value) -> Response<Body> {
+    let mut response = Response::new(Body::from(body.to_string()));
+    *response.status_mut() =
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}

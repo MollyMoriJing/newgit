@@ -39,6 +39,10 @@ anything.
 
 ## Status (2026-10-28)
 
+> **2026-11-09:** [`newgit serve`](serve.md) answers this same API as one
+> binary, with repos on local disk and state in SQLite, and is several times
+> faster. What follows is the Worker, which still runs newgit.dev.
+
 Deployed at `newgit.dev`: the Worker (`remote/`, TypeScript), its Durable
 Objects, the Git endpoint's container, and Artifacts.
 `.github/workflows/deploy-remote.yml` deploys it after CI passes on
