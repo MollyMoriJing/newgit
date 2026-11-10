@@ -417,7 +417,9 @@ fn view_plan(
 
 // ── Running Git ───────────────────────────────────────────────────────────
 
-async fn request_body(request: Request<Body>) -> Result<Body, Response<Body>> {
+/// The request's body, inflated if Git gzipped it; or the response refusing it
+/// (boxed: a `Response` is too large to return by value as an error).
+async fn request_body(request: Request<Body>) -> Result<Body, Box<Response<Body>>> {
     let gzipped = request
         .headers()
         .get(header::CONTENT_ENCODING)
@@ -429,7 +431,7 @@ async fn request_body(request: Request<Body>) -> Result<Body, Response<Body>> {
     }
     let bytes = axum::body::to_bytes(body, GZIP_LIMIT)
         .await
-        .map_err(|_| text(413, "that request is too large"))?;
+        .map_err(|_| Box::new(text(413, "that request is too large")))?;
     let decoded = tokio::task::spawn_blocking(move || {
         use std::io::Read as _;
         let mut out = Vec::new();
@@ -441,8 +443,8 @@ async fn request_body(request: Request<Body>) -> Result<Body, Response<Body>> {
     .await;
     match decoded {
         Ok(Ok(out)) if out.len() <= GZIP_LIMIT => Ok(Body::from(out)),
-        Ok(Ok(_)) => Err(text(413, "that request is too large")),
-        _ => Err(text(400, "that request body is not gzip")),
+        Ok(Ok(_)) => Err(Box::new(text(413, "that request is too large"))),
+        _ => Err(Box::new(text(400, "that request body is not gzip"))),
     }
 }
 
@@ -455,7 +457,7 @@ async fn run_git(app: Arc<App>, run: Run, ask: Ask, request: Request<Body>) -> R
         .to_owned();
     let body = match request_body(request).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     // Each Git child holds a slot while it runs: a clone of a large history
     // takes hundreds of MiB, so they are bounded.

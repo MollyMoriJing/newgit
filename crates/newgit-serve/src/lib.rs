@@ -216,7 +216,7 @@ async fn dispatch(State(app): State<Arc<App>>, request: Request<Body>) -> Respon
     let (parts, body) = request.into_parts();
     let api_request = match api_request(&app, parts, body).await {
         Ok(api_request) => api_request,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let answered = tokio::task::spawn_blocking(move || api::handle(&app, &api_request)).await;
     match answered {
@@ -237,7 +237,7 @@ async fn api_request(
     app: &App,
     parts: axum::http::request::Parts,
     body: Body,
-) -> Result<api::ApiRequest, Response<Body>> {
+) -> Result<api::ApiRequest, Box<Response<Body>>> {
     let head = Request::from_parts(parts, ());
     let header = |name: &str| -> Option<String> {
         head.headers()
@@ -271,10 +271,10 @@ async fn api_request(
     request.body = match axum::body::to_bytes(body, limit).await {
         Ok(body) => body.to_vec(),
         Err(_) => {
-            return Err(json_response(
+            return Err(Box::new(json_response(
                 413,
                 &serde_json::json!({ "error": "that request is too large" }),
-            ));
+            )));
         }
     };
     Ok(request)
