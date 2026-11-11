@@ -28,3 +28,9 @@ Trackers sharing a `role` are alternatives (`dev-db`, `staging-db`); a spawn
 picks one by `--use`, then your own default in `~/.newgit/config.toml`, then
 `priority`. A tracker can bring resources (they run only while it is bound) and
 `require` others.
+
+`pinned = true` holds a tracker where its parent has it: a change to it never
+rolls up into the parent by itself, and moving the pin is a change to the
+parent, for its maintainers to approve. A tracker can also live in another
+project on the remote and be mounted here too (`newgit tracker link`), with
+one history and its home's policy. `newgit reference tracker` has every key.
