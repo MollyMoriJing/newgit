@@ -788,16 +788,22 @@ when a mounted tracker is behind its `follow` ref.
 `newgit pull` with no tracker (#345) is the same for every tracker in Git
 root mounts, in one commit: `Update trackers: t3code (14 commits), ui-kit
 (2 commits)`. A pin is part of a commit, so it lands on the branch it ran
-on, as `flake.lock` does: an instance's branch in an instance, the project
-root's own branch there, and `main` takes it when that merges. It writes
-nothing when no pin is behind. Three kinds of tracker stay put, and it says
-which: a pin holding commits its `follow` ref lacks (the instance's own
-work on it; moving the pin would drop them, so merge first), a tracker
-mounted deeper than root (pulled in the tracker that mounts it), and a
-tracker outside Git, which has no pin (`newgit tracker pull` updates its
-files, and can overwrite an instance's). It moves pins to the tracker's
-`follow` ref here, not to what is newest on an export target:
-`newgit pull --remote <target>` stays a separate step.
+on, as `flake.lock` does: an instance's branch in an instance, and in the
+project root the project root's own instance branch, which `newgit merge
+main` publishes; `main` takes it only when that merges. It writes nothing
+when no pin is behind. Four kinds of tracker stay put, and it says which: a
+pin holding commits its `follow` ref lacks (the instance's own work on it;
+moving the pin would drop them, so merge first), a tracker mounted deeper
+than root (pulled in the tracker that mounts it), a tracker the remote will
+not let the caller read (a 403 on its repo; `newgit pull <tracker>` on it
+fails instead), and a tracker outside Git, which has no pin (`newgit tracker
+pull` updates its files, and can overwrite an instance's). With a remote, it
+resolves each `follow` ref there, one fetch per tracker. It moves pins to
+the tracker's `follow` ref, not to what is newest on an export target:
+`newgit pull --remote <target>` stays a separate step. Updating from rooted
+export targets as part of it, pulling child trackers mounted deeper, and
+selecting several trackers (`newgit pull t3code ui-kit`) are tracked in
+[#426](https://github.com/Spheroman/newgit/issues/426).
 
 Parallel instances merge the way a monorepo does: two instances that each
 made a commit produce a merge commit in `main`'s view, even if they touched
