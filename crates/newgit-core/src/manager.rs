@@ -11597,8 +11597,9 @@ impl BranchManager {
     ///
     /// Only a pin its `follow` ref fast-forwards moves. One with commits
     /// that ref lacks (the instance's own work on that tracker, say) stays
-    /// where it is, and is listed: moving it would drop them. Trackers
-    /// outside Git have no pins and are left alone, as are trackers
+    /// where it is, and is listed: moving it would drop them. One the
+    /// remote will not let the caller read (403) is listed and passed
+    /// over. Trackers outside Git have no pins and are left alone, as are trackers
     /// mounted deeper than root (pulled in the tracker that mounts them).
     pub fn pull_all(&self, instance: Option<&str>) -> Result<PullAllOutcome> {
         self.require_migrated()?;
@@ -11622,11 +11623,25 @@ impl BranchManager {
             else {
                 continue;
             };
-            let Some(new) = self.follow_commit(definition)? else {
-                outcome
-                    .no_follow
-                    .push((tracker.clone(), definition.follow.clone()));
-                continue;
+            // A tracker the remote will not let this caller read is passed
+            // over, like a missing ref, so it does not stop the rest;
+            // `newgit pull <tracker>` still fails on it.
+            let new = match self.follow_commit(definition) {
+                Ok(Some(new)) => new,
+                Ok(None) => {
+                    outcome
+                        .no_follow
+                        .push((tracker.clone(), definition.follow.clone()));
+                    continue;
+                }
+                Err(NewgitError::Remote {
+                    status: 403,
+                    message,
+                }) => {
+                    outcome.unreadable.push((tracker.clone(), message));
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
             match self.pin_move(tracker, old, &new)? {
                 PinMove::UpToDate => outcome.up_to_date.push(tracker.clone()),
@@ -14235,6 +14250,9 @@ pub struct PullAllOutcome {
     pub diverged: Vec<(String, String)>,
     /// Mounted trackers with no `follow` ref (the second item) to pull.
     pub no_follow: Vec<(String, String)>,
+    /// Mounted trackers the remote refused to let this caller read (403),
+    /// with its reason: passed over, not pulled.
+    pub unreadable: Vec<(String, String)>,
     /// Trackers in Git mounted deeper than root, pulled in the tracker that
     /// mounts them.
     pub deeper: Vec<String>,

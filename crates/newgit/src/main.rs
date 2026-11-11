@@ -288,8 +288,10 @@ enum Command {
     /// With no tracker, every tracker in Git root mounts moves to its
     /// `follow` ref, in one commit: `Update trackers: t3code (14 commits),
     /// ui-kit (2 commits)`, on this instance's branch (the project root's
-    /// own branch outside one). A pin holding commits its ref does not stays
-    /// where it is. Trackers outside Git have no pins and are left alone
+    /// own instance branch outside one, which `newgit merge main`
+    /// publishes). A pin holding commits its ref does not stays where it
+    /// is, and a tracker the remote won't let you read is skipped. Trackers
+    /// outside Git have no pins and are left alone
     /// (`newgit tracker pull`)
     ///
     /// With --remote <target>, bring the commits on an export target's branch
@@ -4618,6 +4620,12 @@ fn pull_all() -> Result<()> {
     for (tracker, follow) in &outcome.no_follow {
         println!(
             "  `{}` stays: it has no `{follow}` to pull here",
+            tracker_path(tracker)
+        );
+    }
+    for (tracker, reason) in &outcome.unreadable {
+        println!(
+            "  `{}` skipped: you can't read it on the remote ({reason})",
             tracker_path(tracker)
         );
     }
