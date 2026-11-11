@@ -164,12 +164,10 @@ pub struct ListeningPort {
 }
 
 /// Runs `lsof -nP -iTCP -sTCP:LISTEN` and parses its output. Chosen over
-/// probing `bindable` a second time because it sees what `bindable` cannot:
-/// `bindable` only tries binding `127.0.0.1`, so a container Docker Desktop
-/// has published on `0.0.0.0` looks free to it (that gap is #93). `lsof`
-/// reports the real socket table the kernel holds, regardless of which
-/// address a listener chose — no root required to read it on macOS or
-/// Linux.
+/// probing `bindable` a second time because it names who is listening:
+/// `bindable` only says whether a port is free right now, while `lsof`
+/// reports the real socket table the kernel holds, with each listener's
+/// process — no root required to read it on macOS or Linux.
 pub fn probe_listening_ports() -> Result<Vec<ListeningPort>> {
     let output = Command::new("lsof")
         .args(["-nP", "-iTCP", "-sTCP:LISTEN"])

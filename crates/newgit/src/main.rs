@@ -45,10 +45,15 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Initialize .newgit/ in the current repository, or adopt one already there (giving `root` its history)
+    ///
+    /// Where a committed `.newgit/config.toml` names a `[remote]` project (a
+    /// clone of its mirror, say), init joins that project when you are logged
+    /// in and a member, and otherwise leaves a local copy marked not linked.
     Init(InitArgs),
     /// Create a branch instance: source branch + workspace + binding record
     Spawn(SpawnArgs),
-    /// Show branch instances
+    /// Show branch instances: whether each is ready, starting, or not
+    /// ready, and why
     Status {
         /// Instance to show (defaults to all)
         name: Option<String>,
@@ -144,6 +149,7 @@ enum Command {
     Checkpoint {
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
+        /// What this checkpoint is, shown by `newgit checkpoints`
         #[arg(short, long)]
         message: Option<String>,
         /// Prove this checkpoint's restore actually works: checkpoint,
@@ -220,8 +226,8 @@ enum Command {
     /// Print the definition format reference: every key in a tracker or
     /// resource definition, and the template variables each hook may use
     Reference {
-        /// Section to print, e.g. `tracker`, `resource`, `render`, `ports`.
-        /// Omit for a table of contents; `all` for the whole document.
+        /// Section to print, e.g. `agents`, `tracker`, `resource`, `render`,
+        /// `export`. Omit for a table of contents; `all` for the whole document.
         section: Option<String>,
     },
     /// Receiving side of a `git push` from a workspace, run by Git as that
@@ -249,13 +255,16 @@ enum Command {
     },
     /// Log out of a newgit remote and revoke the saved token
     Logout {
+        /// The remote (default: this project's, else https://newgit.dev)
         #[arg(long)]
         url: Option<String>,
     },
     /// Show who you are logged in as
     Whoami {
+        /// The remote (default: this project's, else https://newgit.dev)
         #[arg(long)]
         url: Option<String>,
+        /// Print it as JSON
         #[arg(long)]
         json: bool,
     },
@@ -268,10 +277,13 @@ enum Command {
         #[arg(long, default_value = "main")]
         into: String,
     },
-    /// Move a mounted tracker's pin to its `follow` ref (default `main`): one
-    /// commit, `Pull <tracker>: N commits from <ref>`, holding its files at
-    /// the new pin; its history stays in its own repo. Nothing else moves a
-    /// pin on anyone's behalf
+    /// Move a mounted tracker's pin to its `follow` ref, or bring back what was
+    /// merged on an export target (--remote)
+    ///
+    /// `newgit pull <tracker>` moves the pin to its `follow` ref (default
+    /// `main`): one commit, `Pull <tracker>: N commits from <ref>`, holding its
+    /// files at the new pin; its history stays in its own repo. Nothing else
+    /// moves a pin on anyone's behalf.
     ///
     /// With no tracker, every tracker in Git root mounts moves to its
     /// `follow` ref, in one commit: `Update trackers: t3code (14 commits),
@@ -371,7 +383,12 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum TrackerCommand {
-    /// Bind a tracker that lives in another project into this one: one tracker in two roots, the second mount a symlink. Its history stays its home's
+    /// Mount a tracker in Git that lives in another project on the remote
+    ///
+    /// One commit on the project root mounts it at --mount, and `newgit merge
+    /// main` publishes it. Its history, repo, and policy stay its home's; this
+    /// project pins its own commit of it. Needs a linked project and read
+    /// access to the home.
     Link {
         /// What this project calls it
         name: String,
@@ -383,14 +400,19 @@ enum TrackerCommand {
     },
     /// Create a tracker: outside Git (captured, never committed) unless --git
     Create {
+        /// Its name. A tracker in Git carved inside another one's mount is
+        /// that tracker's child (`t3code/repos`), placed by --path
         name: String,
-        /// Who may read this tracker's content
+        /// Who may read this tracker's content: `public`, `project-devs`,
+        /// `user` (each user their own copy), or `user:<login>`
         #[arg(long, default_value = "project-devs")]
         audience: String,
-        /// Carry this tracker when source changes are merged
+        /// Write `merge_with_source = true`. Nothing reads it yet: `newgit
+        /// merge` merges every tracker the instance changed
         #[arg(long)]
         merge_with_source: bool,
-        /// Where synced state lives: local or remote
+        /// Where synced state lives: `local`, or `remote` (needs a `[remote]`
+        /// in .newgit/config.toml)
         #[arg(long, default_value = "local")]
         storage: String,
         /// A tracker in Git: committed content with its own history, carved out
@@ -398,7 +420,8 @@ enum TrackerCommand {
         /// --from, brought in from another repository
         #[arg(long, requires = "place")]
         git: bool,
-        /// A path a tracker in Git owns (repeatable; set at creation)
+        /// With --git: the one directory to carve out and mount the new tracker
+        /// at. Paths of a tracker outside Git are added with `tracker track`
         #[arg(long = "path", value_name = "PATH", group = "place")]
         path: Vec<Utf8PathBuf>,
         /// Where an imported tracker is mounted (with --from): an empty
@@ -420,7 +443,8 @@ enum TrackerCommand {
     },
     /// Delete a tracker definition
     Remove { name: String },
-    /// List defined trackers
+    /// List defined trackers, as a tree by ownership, with what this
+    /// instance binds
     List {
         /// Print every tracker as JSON, with what a new instance binds by
         /// default and what this instance binds — for tools that offer the
@@ -482,9 +506,12 @@ enum TrackerCommand {
         #[arg(long)]
         discard: bool,
     },
-    /// Move a project laid out before mounts — a `project` tracker holding
-    /// `.newgit/`, `access` unmounted, histories carved by date — onto roots
-    /// and mounts: `project` and `access` fold into root, whose history
+    /// Move a project laid out before mounts onto roots and mounts, once,
+    /// after upgrading
+    ///
+    /// A project laid out before mounts has a `project` tracker holding
+    /// `.newgit/`, `access` unmounted, and histories carved by date. This moves
+    /// it onto roots and mounts: `project` and `access` fold into root, whose history
     /// becomes the view's history commit for commit, and `access` is carved
     /// again at the tip of `main`, mounted at `.newgit/trackers`. Every
     /// branch and checkpoint is recomposed in a fresh repository first, and
@@ -506,13 +533,17 @@ struct InitArgs {
 
 #[derive(Debug, Args)]
 struct SpawnArgs {
+    /// Instance name, and the source branch it works on: an existing
+    /// branch as it is, or a new one from --from
     name: String,
     /// Base revision when creating a new source branch (defaults to HEAD)
     #[arg(long, conflicts_with = "from_checkpoint")]
     from: Option<String>,
-    /// Spawn a checkpoint from the project's remote, `<instance>/<checkpoint>`
-    /// (the id `newgit checkpoints` shows where it was made): source, trackers
-    /// you may read, and resource state, with your own per-user tracker content
+    /// Spawn a checkpoint, `<instance>/<checkpoint>` (the id `newgit
+    /// checkpoints` shows where it was made): source, trackers, and resource
+    /// state. One on this machine is used as it is; any other comes from the
+    /// project's remote, with the trackers you may read and your own per-user
+    /// tracker content
     #[arg(long, value_name = "INSTANCE/CHECKPOINT")]
     from_checkpoint: Option<String>,
     /// Bind this tracker (repeatable): over its role's default, or one that
@@ -545,6 +576,7 @@ enum ResourceCommand {
     /// Create a resource definition from a starter template
     Add {
         name: String,
+        /// The starter template (`newgit resource templates` lists them)
         #[arg(long)]
         template: String,
     },
@@ -586,7 +618,9 @@ struct ExportArgs {
     #[arg(long, value_name = "DIR")]
     to: Option<Utf8PathBuf>,
     /// Push the trackers' `main`s, history and all, to target NAME, which a
-    /// tracker's `export` declares (a GitHub mirror, say)
+    /// tracker's `export` declares (a GitHub mirror, say). A target is named
+    /// after its repository (`widget` for github.com/acme/widget) unless its
+    /// `export` gives a `name`
     #[arg(long, value_name = "NAME", conflicts_with_all = ["instance", "includes", "excludes"])]
     remote: Option<String>,
     /// Include this path regardless of tracker audience; repeatable
@@ -1167,9 +1201,12 @@ fn spawn_from_checkpoint(
         format!("`{spec}` is not `<instance>/<checkpoint>`, e.g. `fix-login/ckpt_003`")
     })?;
     let outcome = manager.spawn_from_checkpoint(name, instance, checkpoint)?;
-    let by = match &outcome.agent {
-        Some(agent) => format!("{} (agent {agent})", outcome.author),
-        None => outcome.author.clone(),
+    // A checkpoint from the remote says who took it; one from this machine
+    // was taken here.
+    let by = match (&outcome.author, &outcome.agent) {
+        (Some(author), Some(agent)) => format!("taken by {author} (agent {agent})"),
+        (Some(author), None) => format!("taken by {author}"),
+        (None, _) => "taken on this machine".to_owned(),
     };
     if json {
         // Each resource the instance ended up with, as `spawn --json` reports
@@ -1239,13 +1276,10 @@ fn spawn_from_checkpoint(
     // alone reads as a clean spawn, and the lines below only say otherwise
     // if each carries its own verdict.
     if outcome.is_complete() {
-        println!(
-            "Spawned `{}` from {spec}, taken by {by}",
-            outcome.branch.name
-        );
+        println!("Spawned `{}` from {spec}, {by}", outcome.branch.name);
     } else {
         println!(
-            "Spawned `{}` from {spec}, taken by {by} — but {} did not come up (see below)",
+            "Spawned `{}` from {spec}, {by} — but {} did not come up (see below)",
             outcome.branch.name,
             not_ready
                 .iter()
@@ -4778,7 +4812,8 @@ struct ServeArgs {
     /// (behind a proxy that terminates TLS, say)
     #[arg(long)]
     url: Option<String>,
-    /// Who may log in: GitHub logins, comma-separated, or `*` for anyone
+    /// Who may log in: GitHub logins, comma-separated, or `*` for anyone.
+    /// Empty, the default, admits no one
     #[arg(long, default_value = "")]
     allow: String,
     /// GitHub logins shut out, whatever `--allow` says
@@ -4793,8 +4828,9 @@ struct ServeArgs {
     /// The GitHub OAuth app's client id, for `newgit login` (device flow)
     #[arg(long, env = "NEWGIT_SERVE_GITHUB_CLIENT_ID")]
     github_client_id: Option<String>,
-    /// Let a caller holding this secret log in as anyone invited, without
-    /// GitHub (`POST /v1/dev/login`): for tests and trying changes locally
+    /// Let a caller holding this secret log in as any login `--allow` admits,
+    /// without GitHub (`POST /v1/dev/login`): for tests and trying changes
+    /// locally
     #[arg(long, env = "NEWGIT_SERVE_DEV_LOGIN_SECRET", hide_env_values = true)]
     dev_login_secret: Option<String>,
     /// How many Git processes may run at once

@@ -414,7 +414,13 @@ leaves trackers out is copied from a template of its own binding,
 `<workspace root>/.source-template-<key>`, sparse from before its first
 checkout: nothing it leaves out is written, so leaving files out makes a spawn
 faster, not slower. The same goes for a plain `git clone`, where there is no
-template. `newgit cleanup` removes a template no live binding uses. Then the copy
+template. On a remote, the template also fetches each export target's
+branch the workspace will get as `refs/remotes/<target>/<branch>` (a
+rooted target's is its tracker's whole history), under
+`refs/newgit-template/`. The copy drops those refs but keeps their
+objects, so the workspace's own fetch of that branch moves nothing; fetched
+into each workspace, t3code's was 17s of a 21s spawn.
+`newgit cleanup` removes a template no live binding uses. Then the copy
 gets its own branch, with the upstream `git clone --branch` would set, and
 `core.checkStat=minimal` plus `core.trustctime=false`. Without those two
 settings Git would re-hash every file on the first `git status`, because
@@ -955,6 +961,65 @@ per instance. The reference has the table, and the `pnpm` template ships a
 `user`-owned `pnpm-store` resource so newgit never touches the shared
 store.
 
+#### Every key gets an entry, and a miss costs disk only once (planned, #421)
+
+Two gaps in the store as built, and one rule that closes both: **every key
+an instance reaches gets an entry, and every entry shares what it can with
+the entries before it.**
+
+**A key that moves inside a live instance stores an entry.** Today an entry
+is published only when `prepare` finishes. An agent that runs `npm install
+zod` changes the lockfile and the tree, and the store never learns of it:
+the next instance at that lockfile runs a full `npm ci`. So a checkpoint
+whose instance has moved to a key the store has no entry for publishes the
+workspace's tree for it, through the same admission as any other entry.
+That tree is whatever the workspace holds, not a fresh `prepare`'s output,
+and that is the decision, made loudly: an instance that edited its
+`node_modules` by hand publishes the edit. The way back is the one that
+already exists: `newgit action <resource>.prepare` runs the command and
+replaces the entry, and `undo --force-recompute` drops it.
+
+**A miss is deduplicated against the store.** A miss still runs `prepare`
+in full, so `npm ci` stays `npm ci` and its output stays exactly what it
+would have been. What changes is what newgit keeps. Most of a new tree is
+byte-identical to an entry already in the store: a fresh `npm ci` of
+`remote/` matched the existing `node_modules` on 100% of its 290 MB at the
+same paths, apart from two binaries an install script swaps in. So after
+`prepare` finishes, and before the tree is published, newgit walks it, and
+every regular file whose relative path, size, and content hash match a file
+in another entry of the same resource is replaced by a copy-on-write clone
+of that file. The workspace and the new entry then share those blocks with
+every entry before them; only what actually changed takes new disk.
+
+- **Each entry carries a manifest** (path, size, hash) written when it is
+  published, so a dedup pass hashes only the new tree, never the store.
+  Candidates are found by path and size, and confirmed by hash.
+- **The replacement cannot change a byte.** On btrfs and XFS it is
+  `FIDEDUPERANGE`, which compares the ranges itself and shares them
+  atomically. APFS has no such call, so newgit clones the stored file
+  beside the target and renames it over, after checking that the target's
+  size and mtime still match what was hashed; a file that changed is
+  skipped. Hardlinked files (pnpm's) and symlinks are left alone.
+- **It never fails the bind.** It runs after `prepare` succeeded, and a file
+  it cannot replace is simply not shared. Where the filesystem cannot clone
+  at all, there is nothing to do, and newgit says so once.
+
+Together they make the store a set of independent entries, one per key,
+that share blocks as far back as their content agrees. There is no lineage
+to track: the filesystem counts references to each block, so dropping an
+old entry frees only what nothing else uses. Pruning stays what it is,
+entries no live instance keys to.
+
+**Build output is not an install, and this does not reach it.** Measured on
+this repository, a workspace's 5.6 GB `target/` is 2.0 GB of integration
+test executables, 2.2 GB of debug objects, 2.4 GB of `incremental/`, and
+about 0.3 GB of third-party crates. Two workspaces on the same toolchain
+share 5% of `target/debug/deps` byte for byte. The rest is the branch's
+own code compiled for that branch, which no store, clone, or dedup pass can
+share. Its disk comes back by removing instances whose work has landed (see
+*Cleanup*), and by building less of it per branch, which is the project's
+build configuration, not newgit's.
+
 ---
 
 ## An instance's life
@@ -976,12 +1041,15 @@ reported per resource, and a dependent of a resource that did not start is
 not started against it. Starting is not waiting: the dependent starts once
 its dependency's process exists, not once that process answers (#54).
 
-`spawn --from-checkpoint <instance>/<checkpoint>` brings up someone else's
-checkpoint, from the remote: their source and uncommitted work, the
-trackers you may read (your own copy of per-user ones), and resources
-restored from the checkpoint, such as a database loaded from its dump. It
-is built from parts that already exist: fetch, spawn at the checkpoint's
-head, then undo to the checkpoint. Its `autostart` actions start after the
+`spawn --from-checkpoint <instance>/<checkpoint>` brings up a checkpoint
+as a new instance: its source and uncommitted work, its trackers, and
+resources restored from the checkpoint, such as a database loaded from its
+dump. Like a bare branch name in Git, the name means this machine's first:
+a checkpoint taken here (even of an instance since removed) is used as it
+is, with no remote involved. Only one this machine does not have comes from
+the remote, which gives the trackers you may read and your own copy of
+per-user ones. It is built from parts that already exist: (fetch,) spawn at
+the checkpoint's head, then undo to the checkpoint. Its `autostart` actions start after the
 undo, since the restore stops and restarts processes to match the
 checkpoint. The new instance's workspace comes up on its own branch, made
 at the checkpoint's commit, even when the author's was on another branch
@@ -1179,6 +1247,20 @@ binding record, so their checkpoints can never be restored, yet they pin
 revisions forever. `cleanup --purge-archived` discards them, with their
 checkpoint refs. It is opt-in and never touches a live instance. The
 ordinary report says how many retained revisions it would free.
+
+**Landed instances are most of the disk, and cleanup should name them
+(planned, #422).** Workspaces are disposable, but nothing disposes of
+them: instances accumulate after their work merges, each holding a full
+build tree. On this project's own machine, 90 of 122 instances held 321 GB
+of `target/` alone, with the disk 98% full; removing the 61 whose work had
+landed freed 150 GB. An instance has **landed** when its workspace has
+nothing uncommitted and its tip is on the project's default branch or on a
+branch the remote has, or its branch's pull request merged. `cleanup`
+lists landed instances with what each holds on disk, and `cleanup
+--landed` removes them as `remove` would: branch kept when unique,
+checkpoints kept. It stays opt-in, because newgit cannot see what else is
+attached to a workspace: a T3 Code thread or an editor still pointed at
+it.
 
 ### One command per instance at a time
 
