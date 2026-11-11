@@ -12,6 +12,31 @@ time by `scripts/release-changelog.sh`, which then deletes the fragments.
 Two changes never touch the same lines, so nothing queues behind whichever
 branch landed first.
 
+## [0.10.1] — 2026-11-10
+
+A documentation release: what ships inside the binary (`newgit reference`,
+every `--help`, and the wiki) now matches what 0.10.0 does. Nothing about
+how newgit behaves changed, and no migration is needed.
+
+### Documentation
+
+- `newgit reference`, `--help`, and the wiki say what 0.10.0 actually does.
+
+  An agent setting newgit up reads these cold, and several of them were
+  wrong in ways it would act on. They called newgit.dev invite-only, when it
+  has taken any GitHub account since 2026-11-02 (up to 5 projects each,
+  paused while over its weekly budget). They counted three built-in trackers
+  where `init` makes two, and never said that trackers nest or are named by
+  path (`t3code/repos`, `..`, `/remote/<owner>/<project>/...`). They said
+  `tracker link` makes a symlink, which it does not, and that
+  `--merge-with-source` carries a tracker through a merge, when nothing reads
+  it. In the resource sections: the port probe was said to check only
+  `127.0.0.1` (it checks all four addresses), the `external` template's
+  captures had the wrong names, `key_command`'s environment and working
+  directory were missing, and the lists of commands that take the instance
+  lock or refuse a broken graph were short. Arguments that printed no help
+  now have some.
+
 ## [0.10.0] — 2026-11-10
 
 `newgit serve` runs a newgit remote as one binary, with Git repositories on
@@ -4165,7 +4190,8 @@ themselves and neither of which is a reason to re-spawn:
   fresh field it has not. One successful `undo`, or one `newgit checkpoint
   --verify`, clears it for good.
 
-[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/Spheroman/newgit/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/Spheroman/newgit/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/Spheroman/newgit/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/Spheroman/newgit/compare/v0.8.0...v0.8.1
