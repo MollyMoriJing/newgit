@@ -11598,9 +11598,11 @@ impl BranchManager {
     /// Only a pin its `follow` ref fast-forwards moves. One with commits
     /// that ref lacks (the instance's own work on that tracker, say) stays
     /// where it is, and is listed: moving it would drop them. One the
-    /// remote will not let the caller read (403) is listed and passed
-    /// over. Trackers outside Git have no pins and are left alone, as are trackers
-    /// mounted deeper than root (pulled in the tracker that mounts them).
+    /// remote will not let the caller read (403) is listed and passed over,
+    /// unless every one tried was refused: then nothing is known to be up
+    /// to date, so it fails with the remote's reasons. Trackers outside Git
+    /// have no pins and are left alone, as are trackers mounted deeper than
+    /// root (pulled in the tracker that mounts them).
     pub fn pull_all(&self, instance: Option<&str>) -> Result<PullAllOutcome> {
         self.require_migrated()?;
         let (slug, workspace, base) = self.pull_base(instance)?;
@@ -11668,6 +11670,27 @@ impl BranchManager {
             })
             .map(|definition| definition.name.clone())
             .collect();
+        // Every read refused (a token used in the wrong project, a member
+        // removed): whether anything is behind is unknown, so say so
+        // instead of reporting success.
+        let read = outcome.pulled.len()
+            + outcome.up_to_date.len()
+            + outcome.diverged.len()
+            + outcome.no_follow.len();
+        if read == 0 && !outcome.unreadable.is_empty() {
+            return Err(NewgitError::Remote {
+                status: 403,
+                message: format!(
+                    "no mounted tracker could be read on the remote: {}",
+                    outcome
+                        .unreadable
+                        .iter()
+                        .map(|(tracker, reason)| format!("`{tracker}` ({reason})"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
         if moved.is_empty() {
             return Ok(outcome);
         }

@@ -796,9 +796,11 @@ pin holding commits its `follow` ref lacks (the instance's own work on it;
 moving the pin would drop them, so merge first), a tracker mounted deeper
 than root (pulled in the tracker that mounts it), a tracker the remote will
 not let the caller read (a 403 on its repo; `newgit pull <tracker>` on it
-fails instead), and a tracker outside Git, which has no pin (`newgit tracker
-pull` updates its files, and can overwrite an instance's). With a remote, it
-resolves each `follow` ref there, one fetch per tracker. It moves pins to
+fails instead, and so does plain `newgit pull` when it can read none of
+them, since then nothing is known to be up to date), and a tracker outside
+Git, which has no pin (`newgit tracker pull` updates its files, and can
+overwrite an instance's). With a remote, it resolves each `follow` ref
+there, one fetch per tracker. It moves pins to
 the tracker's `follow` ref, not to what is newest on an export target:
 `newgit pull --remote <target>` stays a separate step. Updating from rooted
 export targets as part of it, pulling child trackers mounted deeper, and

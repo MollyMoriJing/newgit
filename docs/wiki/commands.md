@@ -112,7 +112,8 @@ Remote:
   commits)`; in the project root, its own instance branch, which `newgit
   merge main` publishes); no commit when none is behind. A pin holding
   commits its ref lacks stays put, a tracker you can't read on the remote is
-  skipped, and trackers outside Git are left alone (`newgit tracker pull`)
+  skipped (it fails when none can be read), and trackers outside Git are
+  left alone (`newgit tracker pull`)
 - `newgit pull --remote <target>` — bring back what was merged on an export
   target (a pull request on GitHub); `newgit merge main` publishes it
 - `newgit members add|remove <github-login>` / `members list [--json]`

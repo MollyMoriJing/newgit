@@ -290,8 +290,9 @@ enum Command {
     /// ui-kit (2 commits)`, on this instance's branch (the project root's
     /// own instance branch outside one, which `newgit merge main`
     /// publishes). A pin holding commits its ref does not stays where it
-    /// is, and a tracker the remote won't let you read is skipped. Trackers
-    /// outside Git have no pins and are left alone
+    /// is, and a tracker the remote won't let you read is skipped (it fails
+    /// when it can read none of them). Trackers outside Git have no pins and
+    /// are left alone
     /// (`newgit tracker pull`)
     ///
     /// With --remote <target>, bring the commits on an export target's branch
@@ -4592,9 +4593,14 @@ fn pull_all() -> Result<()> {
         None => "the project root".to_owned(),
     };
     match &outcome.view {
-        None => {
+        None if outcome.unreadable.is_empty() => {
             println!("Nothing to pull: no mounted tracker is behind its `follow` ref in {place}")
         }
+        None => println!(
+            "The trackers you can read are up to date in {place}; {} could not be read on the \
+             remote:",
+            plural(outcome.unreadable.len(), "tracker")
+        ),
         Some(view) => {
             println!(
                 "Updated {} in {place}, one commit ({}):",
