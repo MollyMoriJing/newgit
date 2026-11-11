@@ -30,20 +30,30 @@ inside a workspace):
 - `newgit export --remote <name> [--dry-run] [--force]` — push the trackers'
   `main`s, history and all, to target `<name>` (a GitHub mirror, say), which
   a tracker's `export` declares: that tracker and every tracker inheriting
-  its export ship, nothing else
+  its export ship, nothing else. A target is named after its repository
+  unless its `export` gives a `name`
 - `newgit cleanup [--dry-run] [--purge-archived]`
 - `newgit ports [--check]` — claimed ports, or detect a listening one nothing
   claims
 - `newgit render [--check]` — resolve every `[[render]]`; `--check` tests
   each `find` against the working tree without spawning, for adoption and CI
 
-Definition management (noun subcommands):
+Definition management (noun subcommands). Wherever a command takes a
+tracker, it takes a path, read from where it runs: `t3code/repos` at the top
+of the project, `repos` inside `apps/t3code`, `..` to go up:
 
 - `newgit tracker create <name> [--audience <a>] [--storage <s>]
   [--merge-with-source]`
 - `newgit tracker create <name> --git --path <path>` — a tracker in Git,
   mounted at that path by one commit; history before it stays in whichever
-  tracker held the files
+  tracker held the files. Inside another tracker's mount it is that
+  tracker's child
+- `newgit tracker create <name> --git --mount <dir> --from <repo>
+  [--from-branch <branch>]` — bring in another repository's history
+  unchanged, mounted at an empty directory
+- `newgit tracker link <name> <owner>/<project>[/<path>] --mount <dir>` —
+  mount a tracker in Git that lives in another project on the remote; its
+  history and policy stay its home's
 - `newgit tracker track <tracker> <path>...` — trackers outside Git only
 - `newgit tracker remove <name>`
 - `newgit tracker capture|merge|pull|checkout <tracker> [instance]`
@@ -83,9 +93,10 @@ Remote:
 - `newgit serve --data <dir> [--listen <addr>] [--url <url>] [--allow <logins>]
   [--github-client-id <id>]` — run a remote on this machine ([your own
   remote](serve.md)); `newgit serve --help` lists the rest
-- `newgit remote add [--url <url>] [--project <name> | <owner>/<name>]
-  [--json]` / `remote show [--json]` — a bare name creates the project under
-  your account; `owner/name` joins one that exists
+- `newgit remote add [--url <url>] [--project <name> | --project
+  <owner>/<name>] [--json]` / `remote show [--json]` — a bare name creates
+  the project under your account; `owner/name` joins one that exists.
+  `remote show` also says what the remote has not caught up on yet
 - `newgit remote delete <owner>/<name>` — the owner deletes the project
   from the remote: every repo, record, and token pinned to it. Not undoable
 - `newgit clone <owner>/<name> [dir] [--url <url>] [--full]` — root's whole
@@ -96,6 +107,8 @@ Remote:
   project root
 - `newgit pull <tracker> [instance]` — one commit moving a mounted tracker's
   pin to its `follow` ref; spawn says when a tracker is behind
+- `newgit pull --remote <target>` — bring back what was merged on an export
+  target (a pull request on GitHub); `newgit merge main` publishes it
 - `newgit members add|remove <github-login>` / `members list [--json]`
 - `newgit spawn <name> --from-checkpoint <instance>/<checkpoint>`
 

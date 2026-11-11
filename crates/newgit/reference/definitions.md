@@ -28,7 +28,7 @@ whether a lane travels with a merge — both by defaulting, silently.
   trackers/<name>.toml   tracker definitions       committed; the `access` tracker
   resources/<name>.toml  resource definitions      committed
   scripts/<name>         scripts hooks call        committed
-  pins/<name>            a mounted tracker's commit; in root's history only, never in a workspace
+  pins/<name>            a mounted tracker's commit; in its parent's history only, never in a workspace
   branches/ checkpoints/ logs/ state/ local/   local, gitignored
   local/trackers.git     every tracker's history   local, gitignored
   installs/              built trees, shared       local, gitignored
@@ -42,14 +42,14 @@ You are probably here because someone installed newgit and asked you to set
 it up. Assume they know nothing about it beyond the name. They are relying on
 you to find out what newgit can do for *their* project and to show them.
 
-**`newgit init` is not the setup.** On its own it leaves the three built-in
-trackers and no resources. Every spawn then gets the code and nothing else:
-no `.env.local`, no installed dependencies, no dev server, no database. That
-is `git worktree` with extra steps, and anyone who only sees that will
-reasonably decide newgit isn't worth keeping. A useful setup gives every
-instance what the project needs to run. Spawn should give them a branch they
-can run right away, and undo should put back the env and data as well as the
-code.
+**`newgit init` is not the setup.** On its own it leaves the two built-in
+trackers (`root` and `access`) and no resources. Every spawn then gets the
+code and nothing else: no `.env.local`, no installed dependencies, no dev
+server, no database. That is `git worktree` with extra steps, and anyone who
+only sees that will reasonably decide newgit isn't worth keeping. A useful
+setup gives every instance what the project needs to run. Spawn should give
+them a branch they can run right away, and undo should put back the env and
+data as well as the code.
 
 ### Look before you ask
 
@@ -155,10 +155,10 @@ they understand newgit and the questions read as busywork.
 Start with what newgit is, in a few sentences. Each branch becomes an
 *instance*: its own workspace with everything it needs to run. *Trackers*
 hold the files Git shouldn't, like env files and local config. Each has its
-own history and is never committed. *Resources* are what each branch has to
-rebuild or run, like installs, dev servers and databases. A *checkpoint*
-saves all of it, and `undo` puts it all back. Use these words. The user will
-see them in every command, so this is when to learn them.
+own history, and by default is never committed. *Resources* are what each
+branch has to rebuild or run, like installs, dev servers and databases. A
+*checkpoint* saves all of it, and `undo` puts it all back. Use these words.
+The user will see them in every command, so this is when to learn them.
 
 Then tell them what you found and what each piece gets them. Keep it short.
 For example:
@@ -249,8 +249,11 @@ worse than not setting it up at all.
   T3 Code.
 - **A newgit remote** (`newgit login`, `newgit remote add`) lets checkpoints
   travel, so a teammate's or cloud agent's branch comes up locally with its
-  uncommitted work. The hosted one is invite-only, so offer it but don't
-  assume they have access.
+  uncommitted work. The hosted one, `https://newgit.dev`, takes any GitHub
+  account, with up to 5 projects each. It pauses for everyone while the last
+  week's bill is over its budget and reopens on its own, so don't promise it
+  is always up. `newgit serve` runs a remote on their own machine instead
+  (`newgit serve --help`). Offer one; don't link without asking.
 
 ### Show them
 
@@ -286,8 +289,9 @@ Two trackers always exist: `root` owns `.` — every path no more specific
 tracker claims, `.newgit/` (resources, scripts, config) included — and its
 history starts as the project's Git history; `access` is mounted at
 `.newgit/trackers` with `paths = ["."]`, so it holds every tracker's
-definition, with `maintainers = "owner"`. A tracker is *mounted* at a path
-inside its parent and claims paths relative to its mount. Ownership nests:
+definition but a child's (see below), with `maintainers = "owner"`. A
+tracker is *mounted* at a path inside its parent and claims paths relative
+to its mount. Ownership nests:
 the deepest mount wins, then the longest claim, so `root` owning `.` and
 `runtime-env` owning `.env.local` do not conflict. Two trackers claiming the
 identical path at the same mount is an error. A claim starting with `!`
@@ -296,31 +300,51 @@ changing it is refused when it leaves the machine.
 
 Every tracker has a history, and `git` says where it lives. By default
 (`git = false`) a tracker is outside Git: its files are never committed, and
-newgit captures them into the tracker's own history. That is where a `.env`
-belongs, and also where content that is not sensitive but is not source
-either (agent notes, db snapshots) goes. A tracker with `git = true` is
-committed with Git, as ordinary source with its own history, stored relative
-to its own root — `root`, `access`, and anything made with `newgit tracker
-create <name> --git --path <path>`, which mounts a new tracker at that path
-in one commit: the files move into it and root *pins* its first commit
-(`.newgit/pins/<name>`, a gitlink in root's history). History before the
-carve stays in root, so no commit id changes. You commit to a tracker in Git
-with Git; `newgit tracker capture` and `track` refuse it.
-`newgit tracker create <name> --git --mount <dir> --from <repo>
-[--from-branch <branch>]` brings in another repository's history instead:
-the branch (its `HEAD` by default) becomes the tracker's `main` unchanged,
-ids and signatures intact, and one commit mounts it at `<dir>`, an empty
-directory: one ordinary commit holding its files. Its history stays in its
-own repository and never enters this project's, so `git log` under the mount
-starts there. A `--from` path
-is relative to where you run it. `newgit pull <tracker>` moves its pin to
-its `follow` ref in one commit; nothing else moves a pin on your behalf.
-`newgit clone` fetches only the commits root pins of a mounted tracker, and
-its history the first time something needs it, once; `newgit clone --full`
-fetches every history up front. How sensitive a tracker's content is has nothing
-to do with this; that is its `audience`. A project laid out before mounts
-(a `project` tracker owning `.newgit`) is moved onto them by `newgit tracker
-migrate`.
+newgit captures them into the tracker's own history. That is where a `.env` belongs,
+and also where content that is not sensitive but is not source either (agent
+notes, db snapshots) goes. A tracker with `git = true` is committed with Git,
+as ordinary source with its own history, stored relative to its own root —
+`root`, `access`, and anything made with `newgit tracker create <name> --git
+--path <path>`, which mounts a new tracker at that path in one commit: the
+files move into it and the tracker that held them (usually root) *pins* its
+first commit (`.newgit/pins/<name>`, a gitlink in that tracker's own
+history). History before the carve stays where it was, so no commit id
+changes. You commit to a tracker in Git with Git; `newgit tracker capture`
+and `track` refuse it. `newgit tracker create <name> --git --mount <dir>
+--from <repo> [--from-branch <branch>]` brings in another repository's
+history instead: the branch (its `HEAD` by default) becomes the tracker's
+`main` unchanged, ids and signatures intact, and one commit mounts it at
+`<dir>`, an empty directory: one ordinary commit holding its files. Its
+history stays in its own repository and never enters this project's, so
+`git log` under the mount starts there. A `--from` path is relative to where you
+run it. `newgit pull <tracker>` moves its pin to its `follow` ref in one
+commit; nothing else moves a pin on your behalf. `newgit clone` fetches only
+the commits root pins of a mounted tracker, and its history the first time
+something needs it, once; `newgit clone --full` fetches every history up
+front. How sensitive a tracker's content is has nothing to do with this; that
+is its `audience`. A project laid out before mounts (a `project` tracker
+owning `.newgit`) is moved onto them by `newgit tracker migrate`.
+
+A tracker carved inside the mount of another tracker in Git is that
+tracker's *child*. `newgit tracker create repos --git --path
+apps/t3code/.repos` defines it in `apps/t3code/.newgit/trackers/repos.toml`,
+with its `mount` and `paths` relative to `t3code`, and `t3code`'s commits pin
+it, so it goes wherever `t3code` goes. A child is bound only where its parent
+is: dropping the parent drops it, and asking for it binds the parent too.
+With the parent bound, its own `priority` decides, so `priority = -1` keeps a
+large directory out of workspaces until someone asks for it. A tracker cannot
+be carved around one that is already mounted.
+
+Trackers are named by path, the way files are. A child's name is local to its
+parent, so two parents can each have a `docs`. The child above is
+`t3code/repos` from the top of the project and `repos` from inside
+`apps/t3code`; `..` goes up, and a leading `/` starts from the top of the one
+namespace: `/remote/<owner>/<project>/t3code/repos`, or
+`/user/<project>/t3code/repos` for a project on no remote. Every command that
+takes a tracker (`tracker use`, `drop`, `capture`, `log`, `pull`, `spawn
+--use`, …) reads it from the directory it runs in, and never looks further
+up, so a name means one thing wherever it is typed. `newgit tracker list`
+shows the tree. A name may not contain `__` or start or end with `_`.
 
 ```toml
 # .newgit/trackers/runtime-env.toml — outside Git: each user's own .env.local
@@ -349,11 +373,11 @@ resources = ["staging-tunnel"]
 | `role` | string | no | — | the slot it fills: trackers sharing a role are alternatives (`dev-db`, `staging-db`) and may claim the same paths; an instance binds one of them. |
 | `priority` | integer | no | `0` | which tracker of a role an instance binds by default (the highest), unless your own default says otherwise (`[projects.<project>.roles]` in `~/.newgit/config.toml`). Negative means only when asked for (`--use`), for a role-less tracker too. |
 | `pinned` | boolean | no | `false` | whether the parent that mounts it holds it where it is on the remote: a change landing at it never rolls up into the parent, and moving the parent's pin is a change to the parent, its maintainers' to approve (rollback is a revert). For what must not move by itself: a private dependency, an environment. |
-| `link` | string | no | — | where it lives when it lives in another project on the remote: `"<owner>/<project>"` for that project's root, `"<owner>/<project>/<path>"` for a tracker there. Its history, heads, repo, and policy (audience, maintainers, judged by membership there) are its home's; each root that links it pins its own commit, and a change merged from any of them reaches all of them. Only with `git = true`. Written by `newgit tracker link <name> <home> --mount <path>`. |
-| `requires` | array of strings | no | `[]` | trackers or roles it cannot do without: binding it binds them, and they cannot be dropped while it is bound. |
+| `link` | string | no | — | where it lives when it lives in another project on the remote: `"<owner>/<project>"` for that project's root, `"<owner>/<project>/<path>"` for a tracker there. Its history, heads, repo, and policy (audience, maintainers, judged by membership there) are its home's; each root that links it pins its own commit, and a change merged from any of them reaches all of them. Only with `git = true`. Written by `newgit tracker link <name> <home> --mount <dir>`, which needs a linked project and read access to the home; `newgit merge main` publishes the link. |
+| `requires` | array of strings | no | `[]` | trackers or roles it cannot do without: binding it binds them, and they cannot be dropped while it is bound. In a child's definition, a tracker is a path from its parent (`vendor` is a sibling, `../site` goes up). |
 | `resources` | array of strings | no | `[]` | resources it brings: they bind only while it is bound. `newgit tracker use` binds and prepares them and starts their `autostart` action; `drop` stops them and releases their binding. |
-| `export` | string, table, or array of those | no | — | where a tracker in Git ships through `newgit export --remote`: a URL it declares (`"github.com/acme/widget"`, or `{ url = …, branch = …, branches = … }`), the target rooted at it; `"inherit"`, wherever its parent ships; or a list of those. Left out, it never ships. `tracker create --git --path` writes `"inherit"`. A tracker outside Git may not have one. See *Export*. |
-| `maintainers` | string | no | its `audience` | who may merge changes to it on a remote: `owner` (the project's owner), `project-devs`, or `user:<login>`. Changing a tracker's definition is changing the tracker that owns its file in `.newgit/trackers/` — `access` unless a tracker in Git mounted beside it at `.newgit/trackers` claims the file — so governance layers: an `admin` tracker with `mount = ".newgit/trackers"` and `paths = ["web.toml"]` decides who changes `web`'s paths, audience, and maintainers. Governance only delegates downward: a claim on `<T>.toml` counts only when the claiming tracker's own definition is held by whoever holds `<T>.toml`, and no tracker may claim `access.toml` or its own definition (refused here; ignored by the remote). |
+| `export` | string, table, or array of those | no | — | where a tracker in Git ships through `newgit export --remote`: a URL it declares (`"github.com/acme/widget"`, or `{ url = …, branch = …, branches = …, name = … }`), the target rooted at it; `"inherit"`, wherever its parent ships; or a list of those. Left out, it never ships. `tracker create --git --path` writes `"inherit"`. A tracker outside Git may not have one. See *Export*. |
+| `maintainers` | string | no | its `audience` | who may merge changes to it on a remote: `owner` (the project's owner), `project-devs`, or `user:<login>`. Changing a tracker's definition is changing the tracker that owns its file in `.newgit/trackers/` — `access` unless a tracker in Git mounted beside it at `.newgit/trackers` claims the file — so governance layers: an `admin` tracker with `mount = ".newgit/trackers"` and `paths = ["web.toml"]` decides who changes `web`'s paths, audience, and maintainers. Governance only delegates downward: a claim on `<T>.toml` counts only when the claiming tracker's own definition is held by whoever holds `<T>.toml`, and no tracker may claim `access.toml` or its own definition (refused here; ignored by the remote). A child's definition is in its parent's own `.newgit/trackers/`, so the parent's maintainers govern it. |
 
 The paths of a tracker outside Git stay out of Git: `newgit tracker track` adds them to
 the store's `.gitignore`, and each workspace's Git is told to ignore them too,
@@ -390,7 +414,7 @@ other ledger: a port is free the moment nothing claims it).
 | --- | --- | --- | --- | --- |
 | `ownership` | string | yes | — | `branch`, `workspace`, `project`, `user`, or `external`. See *Ownership*. |
 | `depends_on` | array of strings | no | `[]` | resource or tracker names whose *lifecycle* this one depends on. Orders `prepare` at spawn and cleanup hooks in reverse. A name that is neither is an error the graph reports. Needing another resource's *value* is not this — see *Data edges*. |
-| `workdir` | string | no | workspace root | where every command this resource runs is spawned, relative to the workspace root. Overridable per action — see `[actions.<name>]`. |
+| `workdir` | string | no | workspace root | where every command this resource runs is spawned, relative to the workspace root (no `..`), except `[identity] key_command`, which always runs at the workspace root. Overridable per action — see `[actions.<name>]`. |
 | `reads` | array of strings | no | unset | files and directories this resource's running process reads, workspace-relative (a directory covers everything in it). When `tracker use` or `drop` changes the bytes of a rendered file it covers, the process is restarted. See *Rendered files under a running process*. |
 
 `workdir` is applied as the spawned process's working directory, never as a
@@ -495,10 +519,13 @@ One entry per port the resource needs. `<name>` is yours (`app`, `db`).
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
 | `start` | integer | yes | — | where to start scanning. The allocated port is the first one from `start` upward that is neither promised to another instance nor claimed on 127.0.0.1, 0.0.0.0, ::1, or :: right now (checked with `SO_REUSEADDR` off, so a wildcard bind — e.g. a Docker-published container port — can't hide behind a loopback-only check; see #93). A family the OS doesn't support at all is skipped, not counted as free. This does not see a UDP-only listener on the same port number, and is a point-in-time check like any bind probe: nothing stops another process from claiming the port in the gap before it's actually used. |
-| `env` | string | no | none | environment variable the port is published as to every command newgit runs — `newgit run`, actions, and the `[checkpoint]`, `[restore]` and `[cleanup]` hooks (e.g. `PORT`). |
+| `env` | string | no | none | environment variable the port is published as to every command newgit runs — `newgit run`, actions, `key_command`, and the `[checkpoint]`, `[restore]` and `[cleanup]` hooks (e.g. `PORT`). |
 
-A port is allocated once, at `spawn`, and recorded in the binding record. It
-never changes for the life of the instance; removing the instance frees it.
+A port is allocated when the resource binds, usually at `spawn` (at
+`tracker use` for a resource a tracker brings), and recorded in the binding
+record. It stays the same through `stop`, `start`, `tracker drop` and `use`.
+Removing the instance frees it, and `newgit resource rebind` allocates
+again.
 Use it in templates as `{{ports.<name>}}`.
 
 Unlike `[exports]`, order here does matter: `[ports]` is also a map, not a
@@ -529,13 +556,10 @@ FAIL  `newgit-trial` publishes 54324, 54327 — claimed by no binding record
       undeclared ports are not allocated, so another instance may be handed them
 ```
 
-This is a cheaper mitigation than fixing the bind probe: `bindable` (the
-check `allocate` uses to decide whether a port is free) only tries binding
-`127.0.0.1`, so a container Docker Desktop has published on `0.0.0.0` is
-invisible to it — that is a separate bug in the allocator itself. `lsof`
-sees the real socket table regardless of which address a listener chose, so
-`--check` catches the drift after the fact even when `spawn` could not have
-caught it in the moment.
+The bind probe `spawn` uses only asks whether a port is free at that
+moment. `lsof` sees the real socket table, so `--check` catches the drift
+after the fact: a port something started listening on later, with no
+binding record claiming it.
 
 Naming *which* instance publishes an unclaimed port is done honestly, not
 confidently: an instance is named only when its name or workspace path
@@ -556,10 +580,10 @@ clean pass.
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
 | `command` | string | yes, unless `signal` is set | — | shell command, run in the workspace (or `workdir`, below). |
-| `workdir` | string | no | the resource's `workdir` | replaces — does not nest under — the resource-level `workdir` for this action only. |
+| `workdir` | string | no | the resource's `workdir` | replaces — does not nest under — the resource-level `workdir` for this action only. Workspace-relative, no `..`. |
 | `long_running` | bool | no | `false` | supervise it: `newgit action` returns once started, output goes to a log, and the process group is tracked. Requires `command`. |
 | `autostart` | bool | no | `false` | start it at `newgit spawn`, once every `prepare` has run. Requires `long_running`; at most one action per resource. See below. |
-| `signal` | string | no | `term` for a `stop` action | makes an action signal-only. An action with `signal` and no `command` stops this resource's supervised process. The default applies to the literal name `stop` — see below, where that name is the one thing newgit reads. |
+| `signal` | string | no | `term` for a `stop` action | a signal name (`term`, `int`, `SIGKILL`; any case, `SIG` optional), checked when the stop runs. Makes an action signal-only. An action with `signal` and no `command` stops this resource's supervised process. The default applies to the literal name `stop` — see below, where that name is the one thing newgit reads. |
 | `captures` | array of strings | no | `[]` | names to read out of the command's stdout and publish as this resource's exports. See *Captures*. |
 
 **Actions are not lifecycle hooks.** Only `prepare` runs on its own — at
@@ -738,7 +762,8 @@ rebuilds from the restored source and ignores the ref.
 
 A `recompute` restore skips when this resource's `[identity]` hash is the same
 now as at the checkpoint and, for a resource that declares `[identity]
-produces`, the undo did not move the part of the binding its store key holds:
+produces`, every `produces` path is still there and the undo did not move the
+part of the binding its store key holds:
 the tree was already built from those inputs, so the rebuild would change
 nothing. That part counts because the install store keys a tree on it (see
 *Installs: use a content-addressed store*); an undo that drops or brings back
@@ -747,7 +772,7 @@ only rebinds a tracker outside Git does not. It says so rather than passing
 silently:
 
 ```
-resource: deps recompute(prepare) skipped: identity unchanged
+resource: deps recompute(prepare) skipped: identity unchanged ok
 ```
 
 Identity describes the *inputs*, not the tree. Delete half of `node_modules`
@@ -807,7 +832,7 @@ resource: db MISMATCH  before: tracker:db-snapshots@a71acd9dcafa  after: tracker
           db.sql: -1 +1 lines (of 3300)
             -\restrict 4fQx9ZkTmB2vLr7HcWn0aYdE8sJpU3gNi6KoVbXt1RzA5yCeqM
             +\restrict Ty7Nw2cLpQ8vZk0RbJmX4hSaFe6UdG1oYi9KtrWnE3sDx5HjBu
-          full diff: git diff --no-index .newgit/snapshots/db-snapshots/f5b2685a1347 .newgit/snapshots/db-snapshots/00f1294c80fb
+          full diff: git diff --no-index .newgit/local/tracker-checkouts/db-snapshots/f5b2685a1347 .newgit/local/tracker-checkouts/db-snapshots/00f1294c80fb
 ```
 
 The comparison stays bounded however large the dump: one `git diff
@@ -997,14 +1022,14 @@ Repeatable: one `[[render]]` per file.
 
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
-| `path` | string | yes | — | workspace-relative path to the file. Must be tracked by Git or owned by a tracker: a render substitutes into committed content, so there has to be some. The exception is a file inside this resource's own `[identity] produces` — see *Rendering into a built tree*. Several resources may render one path, each with its own rules — see *Several resources, one file*. |
-| `replace` | array of tables | yes | — | the substitutions, below. |
+| `path` | string | yes | — | workspace-relative path to the file: no `..`, and not under `.newgit`. Must be tracked by Git or owned by a tracker: a render substitutes into committed content, so there has to be some. The exception is a file inside this resource's own `[identity] produces` — see *Rendering into a built tree*. Several resources may render one path, each with its own rules — see *Several resources, one file*. |
+| `replace` | array of tables | yes | — | the substitutions, below. At least one. |
 
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
-| `find` | string | yes | — | **a literal string, never a regex.** May span lines. |
+| `find` | string | yes | — | **a literal string, never a regex.** May span lines; may not be empty. |
 | `with` | string | yes | — | what to put there; rendered with the variables below. |
-| `count` | integer | no | `1` | how many times `find` is expected to occur. Refused on a render into a built tree. |
+| `count` | integer | no | `1` | how many times `find` is expected to occur, at least 1. Refused on a render into a built tree. |
 
 ```toml
 [[render]]
@@ -1250,7 +1275,8 @@ relocatable, naming the file:
 
 ```
   install store: not stored — the built tree names its own workspace in
-  `.../node_modules/sharp/config.json`, so it cannot be shared (key 3ec46aa385bb)
+  `.../node_modules/sharp/config.json`, so it cannot be shared (key 3ec46aa385bb);
+  a `[[render]]` with `with = "{{workspace}}"` on that file lets the store rewrite it per instance
 ```
 
 That resource just keeps installing per instance, exactly as it did before.
@@ -1384,10 +1410,10 @@ still worth making here.
 Two more things matter when you wire an install up:
 
 - Give the shared store its own resource with **`ownership = "user"`**, and
-  have the install `depends_on` it. `user` is the one ownership newgit never
-  deletes, at `remove` or at `cleanup` — correct, because that store is shared
-  with every other project on the machine. The `pnpm` template ships this pair
-  already.
+  have the install `depends_on` it. Like `project`, `user` is never torn
+  down at `remove` or at `cleanup`, and `user` is the right one here because
+  that store is shared with every other project on the machine. The `pnpm`
+  template ships this pair already.
 - Point the install's **`[identity] paths`** at the lockfile *and* the
   manifest, so a `recompute` restore reinstalls exactly what the checkpoint
   described.
@@ -1400,8 +1426,9 @@ keys to any more.
 `newgit resource templates --show pnpm` is the worked example above, wired
 for pnpm specifically. For anything else — npm, uv, Cargo, or a package
 manager not listed here — start from `newgit resource templates --show
-install` instead: the same shape with no `depends_on` and no store, and its
-lockfile and install command marked `EDIT ME` rather than guessed wrong.
+install` instead: the same shape with no shared package store beside it,
+and its lockfile, `produces`, and install command marked `EDIT ME` rather
+than guessed wrong.
 
 ---
 
@@ -1421,7 +1448,7 @@ environment variable handed to every later process.
 | `{{workspace}}` | absolute path to the workspace |
 | `{{scripts}}` | absolute path to `.newgit/scripts/` in the store — use `{{scripts}}/<name>` so a hook's script is read from the store, like the definition calling it |
 | `{{ports.<name>}}` | an allocated port |
-| `{{exports.<name>}}` | a rendered export from this resource's binding |
+| `{{exports.<name>}}` | a rendered export: in `[exports]` and `[[render]]`, any bound so far; in hooks, this resource's own |
 | `{{snapshot.path}}` | directory to write checkpoint output into |
 | `{{state_ref}}` | the handle the last checkpoint recorded, or the path of the snapshot it deposited. A `hash` checkpoint records neither, so it has no value |
 | `{{bound.trackers}}` | the trackers the instance binds, space-separated — every selectable tracker it has not dropped (`root` and `access` are always bound and not listed) |
@@ -1463,8 +1490,8 @@ An action with `captures` publishes values its command printed as this
 resource's exports — how a resource that mints an external handle (a preview
 id, a tunnel URL) hands it to everything downstream. The `external` template
 (`newgit resource templates --show external`) is built around this: its
-`prepare` action captures `PREVIEW_ID` and `PREVIEW_URL` from a provisioning
-command's JSON output.
+`prepare` action captures `<NAME>_ID` and `<NAME>_URL`, named after the
+resource, from a provisioning command's JSON output.
 
 Two stdout shapes are accepted, because they are what real commands already
 emit:
@@ -1497,6 +1524,7 @@ commands, and they get the same environment an action gets:
 | --- | --- | --- | --- |
 | `newgit run` | yes | yes | yes |
 | action `command` | yes | yes | yes |
+| `[identity] key_command` | yes | yes | yes |
 | `[checkpoint] command` | yes | yes | yes |
 | `[restore] command` | yes | yes | yes |
 | `[cleanup] command` | yes | yes | yes |
@@ -1514,9 +1542,9 @@ with the declaration it came from, so a destructive hook's inputs can be read
 instead of discovered by running it:
 
 ```
+export DATABASE_URL=postgres://...:5434/feat-x # db [exports]
 export DB_PORT=5434                            # db [ports.pg]
 export DB_TOKEN=tok_123                        # db [actions.mint] captures
-export DATABASE_URL=postgres://...:5434/feat-x # db [exports]
 export NEWGIT_BRANCH=feature/x                 # newgit
 export NEWGIT_WORKSPACE=/Users/.../feature-x   # newgit
 ```
@@ -1529,7 +1557,8 @@ newgit sets it for the hook's `sh`, but whether the programs that `sh`
 starts see it depends on the shell (bash passes it on, dash drops it), so
 use names a shell can assign. One case it cannot show in advance: during an
 `undo`, a `recompute` restore that captures a new value hands it to the
-`[restore]` hooks after it in the same undo. Values are printed verbatim: a
+`[restore]` hooks after it in the same undo. Lines are sorted by name.
+Values are not redacted, only single-quoted where the shell needs it: a
 credential a resource exports appears in plain text, exactly as a hook
 receives it. What it leaves out is the environment of whoever runs newgit,
 which every command inherits underneath these variables. The command itself
@@ -1548,8 +1577,9 @@ environment; it reads the same values through `{{...}}` instead.
 **A name has exactly one owner.** Three things declare an environment
 variable — an `[exports]` key, an action's `captures` entry, and a port's
 `env` — and the same name appearing in two of them is a graph problem,
-reported by `newgit resource list` and `newgit render --check`, and refused by `spawn`, `run`, `action`,
-`checkpoint`, and `undo`, like a missing dependency or a cycle:
+reported by `newgit resource list` and `newgit render --check`, and refused
+by `spawn`, `run`, `env`, `action`, `start`, `checkpoint`, `undo`, `merge`,
+and `resource rebind`, like a missing dependency or a cycle:
 
 ```
 environment variable `EXPO_URL` is declared more than once (`metro` [exports],
@@ -1569,8 +1599,10 @@ reach the process is a mistake worth naming, not a silent no-op. newgit sets
 the first two for every command it runs; `NEWGIT_LOCKED` it sets only for a
 hook run under an instance's lock.
 
-Every command that changes an instance (`spawn`, `action`, `checkpoint`,
-`undo`, `merge`, `tracker` binding changes, `remove`, `cleanup`) holds that
+Every command that changes an instance (`spawn`, `action`, `stop`, `start`,
+`checkpoint`, `undo`, `merge`, every `tracker` command that changes an
+instance, `resource rebind`, `resource remove --force`, a push from its
+workspace, `remove`, `cleanup`) holds that
 instance's lock, `.newgit/local/locks/<slug>.lock`, from start to finish,
 so two of them on one instance run one after the other rather than over
 each other; the second says it is waiting. A hook it runs gets
@@ -1711,7 +1743,9 @@ pull --remote` to run. Any other branch is refused: spawn an instance.
 A tag pushed with it (`git push origin main v1.0`) is made on the remote,
 then on the target root declares, at its view of the commit. A target
 declared by any other tracker gets no tags: it is that tracker's own
-history, with versions of its own, and a tag never moves.
+history, with versions of its own, and a tag never moves. A tag pushed from
+a workspace is refused: tag from the project root once the work is on
+`main`.
 
 ### Rooted at a tracker
 

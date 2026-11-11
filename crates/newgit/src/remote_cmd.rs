@@ -21,14 +21,19 @@ pub enum RemoteCommand {
         /// The remote (default: https://newgit.dev)
         #[arg(long)]
         url: Option<String>,
-        /// The project's name on the remote (default: [project] name)
+        /// The project on the remote: a name creates `<you>/<name>`, and
+        /// `<owner>/<name>` joins a project you are a member of (default:
+        /// [project] name)
         #[arg(long)]
         project: Option<String>,
+        /// Print the result as JSON
         #[arg(long)]
         json: bool,
     },
-    /// Show the remote this project syncs to, and its members
+    /// Show the remote this project syncs to, its members, and what the
+    /// remote has not caught up on yet (roll-ups, webhook pulls)
     Show {
+        /// Print it as JSON
         #[arg(long)]
         json: bool,
     },
@@ -38,6 +43,7 @@ pub enum RemoteCommand {
     Delete {
         /// The project's `<owner>/<name>`, typed out to confirm
         project: String,
+        /// Print the result as JSON
         #[arg(long)]
         json: bool,
     },
@@ -51,6 +57,7 @@ pub enum MembersCommand {
     Remove { login: String },
     /// List the project's members
     List {
+        /// Print them as JSON
         #[arg(long)]
         json: bool,
     },
